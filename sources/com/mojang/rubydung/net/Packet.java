@@ -6,6 +6,7 @@ public final class Packet {
     public static final byte WELCOME     = 0x04;
     public static final byte PING        = 0x05;
     public static final byte PLAYER_NAME = 0x06;
+    public static final byte CHAT        = 0x07;
 
     private Packet() {}
 }

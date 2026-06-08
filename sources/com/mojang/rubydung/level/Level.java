@@ -36,7 +36,15 @@ public class Level {
         return chunks.computeIfAbsent(chunkKey(cx, cz), k -> {
             WorldChunk chunk = new WorldChunk(cx, cz, this);
             generator.generate(chunk);
-            chunk.scheduleBuild(); // start mesh build immediately, not at first render
+            chunk.scheduleBuild();
+            // wake all water blocks so fluid simulation starts immediately on load
+            int bx0 = cx * WorldChunk.SIZE, bz0 = cz * WorldChunk.SIZE;
+            for (int lx = 0; lx < WorldChunk.SIZE; lx++)
+                for (int lz = 0; lz < WorldChunk.SIZE; lz++)
+                    for (int y = 0; y < WorldChunk.HEIGHT; y++) {
+                        byte b = chunk.getBlock(lx, y, lz);
+                        if (Tile.isWater(b)) fluidPending.add(packPos(bx0 + lx, y, bz0 + lz));
+                    }
             return chunk;
         });
     }

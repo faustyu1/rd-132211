@@ -33,8 +33,8 @@ public class RubyDung implements Runnable {
     private long fpsLastTime = System.currentTimeMillis();
     private int displayFps = 0;
 
-    // screens: -1=main menu, 0=game, 1=pause, 2=settings, 3=multiplayer lobby, 4=enter IP,
-    //          6=inventory, 7=crafting, 8=world select, 9=create world
+    // screens: -1=main menu, 0=game, 1=pause, 2=settings, 3=mp host, 4=direct connect,
+    //          5=server list, 6=inventory, 7=crafting, 8=world select, 9=create world, 10=add/edit server
     private int screen = -1;
     private boolean shouldQuit = false;
     private int menuCooldown = 0; // frames to skip menu clicks (prevents focus-click firing buttons)
@@ -59,6 +59,16 @@ public class RubyDung implements Runnable {
     private String mpStatus   = "";
     private boolean editingPort = false;
     private boolean editingName = false;
+
+    // server list (screen 5 / 10)
+    private static final java.io.File SERVERS_FILE = new java.io.File("servers.properties");
+    private java.util.List<String[]> serverList = new java.util.ArrayList<>(); // [name, address]
+    private int serverScroll = 0;
+    private int serverSelected = -1;
+    private String addServerName = "";
+    private String addServerAddr = "";
+    private boolean editAddName = true;
+    private int editServerIdx = -1; // -1 = adding new
 
     private final Settings settings = new Settings();
 
@@ -145,6 +155,13 @@ public class RubyDung implements Runnable {
         glfwSwapInterval(settings.vsync ? 1 : 0);
         glfwShowWindow(window);
 
+        // read actual sizes after window creation (Retina: fb != window size)
+        int[] fbw = new int[1], fbh = new int[1], ww = new int[1], wh = new int[1];
+        glfwGetFramebufferSize(window, fbw, fbh);
+        glfwGetWindowSize(window, ww, wh);
+        if (fbw[0] > 0) { width = fbw[0]; height = fbh[0]; }
+        if (ww[0] > 0)  { winWidth = ww[0]; winHeight = wh[0]; }
+
         GL.createCapabilities();
 
         GL11.glEnable(GL11.GL_TEXTURE_2D);
@@ -187,12 +204,15 @@ public class RubyDung implements Runnable {
                 timer.advanceTime();
                 if (screen == 0) {
                     for (int i = 0; i < timer.ticks; i++) tick();
+                } else if (screen == 1 && (server != null || client != null)) {
+                    // multiplayer: keep ticking physics+network even while paused so player doesn't float
+                    for (int i = 0; i < timer.ticks; i++) tick();
                 } else if (screen == -1 || screen == 8 || screen == 9) {
                     for (int i = 0; i < timer.ticks; i++) timeOfDay = (timeOfDay + 1f / (20 * 60 * 10)) % 1f;
                 }
                 render(timer.a);
                 while (System.currentTimeMillis() >= lastTime + 1000) {
-                    System.out.printf("%d fps, %d chunk updates%n", displayFps, WorldChunk.updates);
+                    System.out.printf("%d fps, %d chunk updates, fb=%dx%d win=%dx%d%n", displayFps, WorldChunk.updates, width, height, winWidth, winHeight);
                     WorldChunk.updates = 0;
                     lastTime += 1000;
                 }
@@ -214,6 +234,8 @@ public class RubyDung implements Runnable {
 
         if (server != null) {
             server.tick(player.x, player.y, player.z, player.yRot, player.xRot);
+            String cm;
+            while ((cm = server.pollChat()) != null) addChat(cm);
             // host renders clients using server's stored positions
             var posMap   = server.getClientPos();
             var nameMap  = server.getClientNames();
@@ -228,6 +250,8 @@ public class RubyDung implements Runnable {
         }
         if (client != null && client.isAlive()) {
             client.tick(player.x, player.y, player.z, player.yRot, player.xRot);
+            String cm;
+            while ((cm = client.pollChat()) != null) addChat(cm);
             var posMap  = client.getRemotePlayers();
             var nameMap = client.getRemoteNames();
             for (var entry : posMap.entrySet()) {
@@ -335,7 +359,10 @@ public class RubyDung implements Runnable {
                                 }
                             } else {
                                 String name = nameInput.isEmpty() ? "Player" : nameInput;
-                                addChat("<" + name + "> " + msg);
+                                String formatted = "<" + name + "> " + msg;
+                                addChat(formatted);
+                                if (server != null) server.broadcastChat(formatted);
+                                else if (client != null) client.sendChat(formatted);
                             }
                         }
                         chatInput = ""; chatOpen = false; continue;
@@ -352,7 +379,9 @@ public class RubyDung implements Runnable {
                     else if (screen == -1) { /* stay on main menu */ }
                     else if (screen == 9) { refreshWorldList(); screen = 8; menuCooldown = 2; }
                     else if (screen == 8) { screen = -1; menuCooldown = 2; }
-                    else if (screen == 4) { screen = 3; ipInput = ""; mpStatus = ""; }
+                    else if (screen == 4) { screen = 5; ipInput = ""; mpStatus = ""; }
+                    else if (screen == 10) { screen = 5; }
+                    else if (screen == 5) { screen = (level == null) ? -1 : 1; serverSelected = -1; mpStatus = ""; }
                     else if (screen == 3) { screen = (level == null) ? -1 : 1; }
                     else if (screen == 2) { screen = (level == null) ? -1 : 1; glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL); Input.consumeMouseDelta(); }
                     else if (screen == 1) { screen = 0; glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED); Input.consumeMouseDelta(); }
@@ -372,6 +401,17 @@ public class RubyDung implements Runnable {
                     }
                 } else if (screen == 3 && editingPort) {
                     // port-only input handled via char events below
+                } else if (screen == 10) {
+                    if (key == GLFW_KEY_BACKSPACE) {
+                        if (editAddName && !addServerName.isEmpty())
+                            addServerName = addServerName.substring(0, addServerName.length() - 1);
+                        else if (!editAddName && !addServerAddr.isEmpty())
+                            addServerAddr = addServerAddr.substring(0, addServerAddr.length() - 1);
+                    } else if (key == GLFW_KEY_TAB) {
+                        editAddName = !editAddName;
+                    } else if (key == GLFW_KEY_ENTER && !addServerAddr.isEmpty()) {
+                        saveServer();
+                    }
                 } else if (screen == 4) {
                     if (key == GLFW_KEY_BACKSPACE) {
                         if (editingName && !nameInput.isEmpty())
@@ -416,6 +456,12 @@ public class RubyDung implements Runnable {
                 } else {
                     if (createSeed.length() < 20 && c >= 0x20 && c < 0x7F) createSeed += c;
                 }
+            } else if (screen == 10) {
+                if (editAddName) {
+                    if (addServerName.length() < 32 && c >= 0x20 && c < 0x7F) addServerName += c;
+                } else {
+                    if (addServerAddr.length() < 64 && c >= 0x20 && c < 0x7F) addServerAddr += c;
+                }
             } else if (screen == 4) {
                 if (editingName) {
                     if (nameInput.length() < 16 && c >= 0x20 && c < 0x7F)
@@ -455,25 +501,27 @@ public class RubyDung implements Runnable {
                 selectedSlot = ((selectedSlot - (int)Math.signum(scroll)) % 9 + 9) % 9;
             }
 
-            // consume discrete events (place = right click; creative break = left click press event)
+            // mouse events: creative break on LMB press, place on RMB press
             for (var e : Input.pollMouseEvents()) {
-                int button = e[0], action = e[1];
-                if (button == GLFW_MOUSE_BUTTON_2 && action == GLFW_PRESS) {
-                    tryPlaceBlock();
-                }
-                if (button == GLFW_MOUSE_BUTTON_1 && action == GLFW_PRESS
-                        && player.mode == Player.GameMode.CREATIVE
-                        && hitResult != null) {
+                if (e[0] == GLFW_MOUSE_BUTTON_1 && e[1] == GLFW_PRESS
+                        && player.mode == Player.GameMode.CREATIVE && hitResult != null) {
                     breakBlock(hitResult.x(), hitResult.y(), hitResult.z());
+                }
+                if (e[0] == GLFW_MOUSE_BUTTON_2 && e[1] == GLFW_PRESS) {
+                    tryPlaceBlock();
                 }
             }
 
-            // continuous breaking while LMB held — survival only
-            boolean mining = Input.isMouseDown(GLFW_MOUSE_BUTTON_1)
-                && hitResult != null
-                && player.mode == Player.GameMode.SURVIVAL;
+            // continuous LMB in survival
+            boolean lmbHeld = Input.isMouseDown(GLFW_MOUSE_BUTTON_1) && hitResult != null;
+            boolean mining = lmbHeld && player.mode == Player.GameMode.SURVIVAL;
             miningHeld = mining;
             if (!mining) resetBreaking();
+
+            // continuous RMB placing
+            if (Input.isMouseDown(GLFW_MOUSE_BUTTON_2) && hitResult != null && placeCooldown == 0) {
+                tryPlaceBlock();
+            }
 
             if (placeCooldown > 0) placeCooldown--;
         } else {
@@ -496,6 +544,7 @@ public class RubyDung implements Runnable {
             level.setTile(x, y, z, tileType);
             if (client != null) client.sendSetTile(x, y, z, tileType);
             else if (server != null) server.broadcastTile(x, y, z, tileType);
+            placeCooldown = 6;
         }
     }
 
@@ -559,6 +608,22 @@ public class RubyDung implements Runnable {
             glfwSwapBuffers(window);
             return;
         }
+        if (screen == 2 || screen == 3 || screen == 4 || screen == 5 || screen == 10) {
+            if (player == null) {
+                float sa = (float)(Math.cos(timeOfDay * Math.PI * 2));
+                float br = Math.max(0.05f, (sa + 1) * 0.5f);
+                GL11.glClearColor(0.5f * br, 0.8f * br, 1.0f * br, 0);
+                GL11.glClear(GL11.GL_COLOR_BUFFER_BIT | GL11.GL_DEPTH_BUFFER_BIT);
+                if      (screen == 2)  renderSettingsMenu();
+                else if (screen == 5)  renderServerList();
+                else if (screen == 10) renderAddServer();
+                else if (screen == 3)  renderMultiplayerMenu();
+                else                   renderJoinScreen();
+                glfwSwapBuffers(window);
+                return;
+            }
+            // fall through to full 3D render path so game world shows behind menu
+        }
         if (screen == 8 || screen == 9) {
             // world-select / create-world share the animated menu backdrop
             float sa = (float)(Math.cos(timeOfDay * Math.PI * 2));
@@ -607,8 +672,10 @@ public class RubyDung implements Runnable {
         else if (screen == 2) renderSettingsMenu();
         else if (screen == 3) renderMultiplayerMenu();
         else if (screen == 4) renderJoinScreen();
+        else if (screen == 5) renderServerList();
         else if (screen == 6) renderInventory();
         else if (screen == 7) renderCrafting();
+        else if (screen == 10) renderAddServer();
 
         glfwSwapBuffers(window);
     }
@@ -625,14 +692,21 @@ public class RubyDung implements Runnable {
             int w = (mode != null) ? mode.width()  : res[0];
             int h = (mode != null) ? mode.height() : res[1];
             glfwSetWindowMonitor(window, monitor, 0, 0, w, h, GLFW_DONT_CARE);
+            winWidth = w; winHeight = h;
         } else {
-            // center window on monitor
             var mode = glfwGetVideoMode(monitor);
             int ox = (mode != null) ? (mode.width()  - res[0]) / 2 : 100;
             int oy = (mode != null) ? (mode.height() - res[1]) / 2 : 100;
             glfwSetWindowMonitor(window, 0, ox, oy, res[0], res[1], GLFW_DONT_CARE);
+            winWidth = res[0]; winHeight = res[1];
         }
-        // size is updated via framebufferSizeCallback
+        // On macOS the framebufferSizeCallback may not fire synchronously — read it explicitly
+        int[] fbw = new int[1], fbh = new int[1];
+        glfwGetFramebufferSize(window, fbw, fbh);
+        if (fbw[0] > 0 && fbh[0] > 0) {
+            width = fbw[0]; height = fbh[0];
+            GL11.glViewport(0, 0, width, height);
+        }
     }
 
     private void stopMultiplayer() {
@@ -759,7 +833,7 @@ public class RubyDung implements Runnable {
         renderOverlay();
         drawTitle("MULTIPLAYER", height / 2 - 160);
 
-        int btnW = 320, btnH = 46, portH = 30, gap = 12;
+        int btnW = 380, btnH = 60, portH = 30, gap = 12;
         int bx = (width - btnW) / 2;
 
         // layout: HOST btn, port field (if not hosting), JOIN btn, BACK btn
@@ -866,6 +940,227 @@ public class RubyDung implements Runnable {
         endOrtho();
     }
 
+    // ── Server List helpers ──────────────────────────────────────────────────
+
+    private void refreshServerList() {
+        serverList.clear();
+        if (!SERVERS_FILE.exists()) return;
+        try (var br = new java.io.BufferedReader(new java.io.FileReader(SERVERS_FILE))) {
+            String line;
+            while ((line = br.readLine()) != null) {
+                int idx = line.indexOf('=');
+                if (idx > 0) serverList.add(new String[]{line.substring(0, idx), line.substring(idx + 1)});
+            }
+        } catch (java.io.IOException ignored) {}
+    }
+
+    private void saveServerList() {
+        try (var pw = new java.io.PrintWriter(new java.io.FileWriter(SERVERS_FILE))) {
+            for (var s : serverList) pw.println(s[0] + "=" + s[1]);
+        } catch (java.io.IOException ignored) {}
+    }
+
+    private void saveServer() {
+        String name = addServerName.trim().isEmpty() ? addServerAddr : addServerName.trim();
+        if (editServerIdx >= 0 && editServerIdx < serverList.size()) {
+            serverList.set(editServerIdx, new String[]{name, addServerAddr});
+        } else {
+            serverList.add(new String[]{name, addServerAddr});
+        }
+        saveServerList();
+        screen = 5;
+        editServerIdx = -1;
+    }
+
+    private void renderServerList() {
+        beginOrtho();
+        renderOverlay();
+        drawTitle("MULTIPLAYER", height / 2 - 160);
+
+        int listW = 400, entryH = 40, gap = 6;
+        int lx = (width - listW) / 2;
+        int listTop = height / 2 - 100;
+        int visCount = 4;
+
+        int mx = mouseScreenX(), my = mouseScreenY();
+
+        // draw server entries
+        for (int i = 0; i < visCount; i++) {
+            int idx = i + serverScroll;
+            if (idx >= serverList.size()) break;
+            String[] s = serverList.get(idx);
+            int ey = listTop + i * (entryH + gap);
+            boolean hov = hover(mx, my, lx, ey, listW, entryH);
+            boolean sel = idx == serverSelected;
+
+            GL11.glEnable(GL11.GL_BLEND);
+            GL11.glBlendFunc(GL11.GL_SRC_ALPHA, GL11.GL_ONE_MINUS_SRC_ALPHA);
+            GL11.glColor4f(1f, 1f, 1f, sel ? 0.25f : hov ? 0.15f : 0.08f);
+            GL11.glBegin(GL11.GL_QUADS);
+            GL11.glVertex2f(lx, ey); GL11.glVertex2f(lx+listW, ey);
+            GL11.glVertex2f(lx+listW, ey+entryH); GL11.glVertex2f(lx, ey+entryH);
+            GL11.glEnd();
+            GL11.glColor4f(1f, 1f, 1f, sel ? 1f : 0.4f);
+            GL11.glLineWidth(1f);
+            GL11.glBegin(GL11.GL_LINE_LOOP);
+            GL11.glVertex2f(lx+0.5f,ey+0.5f); GL11.glVertex2f(lx+listW-0.5f,ey+0.5f);
+            GL11.glVertex2f(lx+listW-0.5f,ey+entryH-0.5f); GL11.glVertex2f(lx+0.5f,ey+entryH-0.5f);
+            GL11.glEnd();
+            GL11.glColor4f(1f, 1f, 1f, 1f);
+            String label = s[0];
+            for (int ci = 0; ci < Math.min(label.length(), 30); ci++)
+                drawChar(label.charAt(ci), lx + 10 + ci * 10, ey + 7, 8, 12);
+            GL11.glColor4f(0.7f, 0.7f, 0.7f, 1f);
+            String addr = s[1];
+            for (int ci = 0; ci < Math.min(addr.length(), 38); ci++)
+                drawChar(addr.charAt(ci), lx + 10 + ci * 8, ey + 22, 6, 10);
+        }
+
+        // empty list hint
+        if (serverList.isEmpty()) {
+            GL11.glColor4f(0.6f, 0.6f, 0.6f, 1f);
+            String hint = "NO SERVERS  ADD ONE BELOW";
+            int hw = hint.length() * 10;
+            for (int i = 0; i < hint.length(); i++)
+                drawChar(hint.charAt(i), (width - hw) / 2 + i * 10, listTop + 14, 8, 12);
+        }
+
+        int btnY = listTop + visCount * (entryH + gap) + 10;
+        int btnW = 190, btnH = 54, btnGap = 8;
+        int row1x = (width - btnW * 2 - btnGap) / 2;
+
+        boolean hJoin = serverSelected >= 0 && hover(mx, my, row1x,           btnY, btnW, btnH);
+        boolean hEdit = serverSelected >= 0 && hover(mx, my, row1x+btnW+btnGap, btnY, btnW, btnH);
+        drawButton(row1x,           btnY, btnW, btnH, "JOIN",  hJoin);
+        drawButton(row1x+btnW+btnGap, btnY, btnW, btnH, "EDIT", hEdit);
+
+        int btnY2 = btnY + btnH + btnGap;
+        int btnW2 = 155, btnGap2 = 8;
+        int row2x = (width - btnW2 * 2 - btnGap2) / 2;
+        boolean hAdd    = hover(mx, my, row2x,             btnY2, btnW2, btnH);
+        boolean hDirect = hover(mx, my, row2x+btnW2+btnGap2, btnY2, btnW2, btnH);
+        drawButton(row2x,               btnY2, btnW2, btnH, "ADD SERVER",     hAdd);
+        drawButton(row2x+btnW2+btnGap2, btnY2, btnW2, btnH, "DIRECT CONNECT", hDirect);
+
+        int btnY3 = btnY2 + btnH + btnGap;
+        boolean hBack = hover(mx, my, (width-380)/2, btnY3, 380, btnH);
+        drawButton((width-380)/2, btnY3, 380, btnH, "BACK", hBack);
+
+        // status
+        if (!mpStatus.isEmpty()) {
+            GL11.glEnable(GL11.GL_BLEND);
+            GL11.glBlendFunc(GL11.GL_SRC_ALPHA, GL11.GL_ONE_MINUS_SRC_ALPHA);
+            GL11.glColor4f(1f, 0.4f, 0.4f, 1f);
+            int sw = mpStatus.length() * 10;
+            for (int i = 0; i < mpStatus.length(); i++)
+                drawChar(mpStatus.charAt(i), (width - sw) / 2 + i * 10, btnY2 + btnH + 10, 8, 12);
+        }
+
+        GL11.glDisable(GL11.GL_BLEND);
+
+        for (var e : Input.pollMouseEvents()) {
+            if (e[0] == GLFW_MOUSE_BUTTON_1 && e[1] == GLFW_PRESS) {
+                // click on entry
+                for (int i = 0; i < visCount; i++) {
+                    int idx = i + serverScroll;
+                    if (idx >= serverList.size()) break;
+                    int ey = listTop + i * (entryH + gap);
+                    if (hover(mx, my, lx, ey, listW, entryH)) {
+                        if (serverSelected == idx) {
+                            // double-click → join
+                            connectToServer(serverList.get(idx)[1]);
+                        } else {
+                            serverSelected = idx;
+                        }
+                    }
+                }
+                if (hJoin && serverSelected >= 0)   connectToServer(serverList.get(serverSelected)[1]);
+                if (hAdd)  { editServerIdx = -1; addServerName = ""; addServerAddr = ""; editAddName = true; screen = 10; }
+                if (hEdit && serverSelected >= 0) {
+                    editServerIdx = serverSelected;
+                    addServerName = serverList.get(serverSelected)[0];
+                    addServerAddr = serverList.get(serverSelected)[1];
+                    editAddName = false;
+                    screen = 10;
+                }
+                if (hDirect) { ipInput = ""; portInput = "25565"; editingPort = false; editingName = false; mpStatus = ""; screen = 4; }
+                if (hBack)   { serverSelected = -1; screen = (level == null) ? -1 : 1; }
+            }
+        }
+
+        // scroll
+        double scroll = Input.consumeScroll();
+        if (scroll != 0) {
+            serverScroll = Math.max(0, Math.min(serverScroll - (int)scroll, Math.max(0, serverList.size() - visCount)));
+        }
+
+        endOrtho();
+    }
+
+    private void connectToServer(String address) {
+        String addr = address.trim();
+        String ip = addr; String port = "25565";
+        int colon = addr.lastIndexOf(':');
+        if (colon > 0) { ip = addr.substring(0, colon); port = addr.substring(colon + 1); }
+        ipInput = ip; portInput = port;
+        mpStatus = "";
+        doConnect();
+        if (client != null) mpStatus = "";
+    }
+
+    private void renderAddServer() {
+        beginOrtho();
+        renderOverlay();
+        drawTitle(editServerIdx >= 0 ? "EDIT SERVER" : "ADD SERVER", height / 2 - 140);
+
+        int fw = 360, fh = 40, gap = 10;
+        int fx = (width - fw) / 2;
+        int fy = height / 2 - 60;
+
+        int mx = mouseScreenX(), my = mouseScreenY();
+        boolean hName = hover(mx, my, fx, fy,       fw, fh);
+        boolean hAddr = hover(mx, my, fx, fy+fh+gap, fw, fh);
+
+        drawInputField(fx, fy,        fw, fh, "NAME  " + addServerName, editAddName);
+        drawInputField(fx, fy+fh+gap, fw, fh, "ADDR  " + addServerAddr, !editAddName);
+
+        int btnW = 200, btnH = 54, btnGap = 10;
+        int bx = (width - btnW * 2 - btnGap) / 2;
+        int by = fy + (fh + gap) * 2 + 8;
+        boolean hSave = hover(mx, my, bx,           by, btnW, btnH);
+        boolean hBack = hover(mx, my, bx+btnW+btnGap, by, btnW, btnH);
+        drawButton(bx,               by, btnW, btnH, "SAVE",   hSave);
+        drawButton(bx+btnW+btnGap,   by, btnW, btnH, "CANCEL", hBack);
+
+        // delete button if editing
+        if (editServerIdx >= 0) {
+            int dw = 120, dy = by + btnH + btnGap;
+            int dx = (width - dw) / 2;
+            boolean hDel = hover(mx, my, dx, dy, dw, btnH);
+            drawButton(dx, dy, dw, btnH, "DELETE", hDel);
+            for (var e : Input.pollMouseEvents()) {
+                if (e[0] == GLFW_MOUSE_BUTTON_1 && e[1] == GLFW_PRESS) {
+                    if (hName) editAddName = true;
+                    if (hAddr) editAddName = false;
+                    if (hSave && !addServerAddr.isEmpty()) saveServer();
+                    if (hBack) { screen = 5; editServerIdx = -1; }
+                    if (hDel)  { serverList.remove(editServerIdx); saveServerList(); serverSelected = -1; editServerIdx = -1; screen = 5; }
+                }
+            }
+        } else {
+            for (var e : Input.pollMouseEvents()) {
+                if (e[0] == GLFW_MOUSE_BUTTON_1 && e[1] == GLFW_PRESS) {
+                    if (hName) editAddName = true;
+                    if (hAddr) editAddName = false;
+                    if (hSave && !addServerAddr.isEmpty()) saveServer();
+                    if (hBack) { screen = 5; editServerIdx = -1; }
+                }
+            }
+        }
+        GL11.glDisable(GL11.GL_BLEND);
+        endOrtho();
+    }
+
     private void drawInputField(int x, int y, int w, int h, String text, boolean focused) {
         GL11.glEnable(GL11.GL_BLEND);
         GL11.glBlendFunc(GL11.GL_SRC_ALPHA, GL11.GL_ONE_MINUS_SRC_ALPHA);
@@ -889,12 +1184,19 @@ public class RubyDung implements Runnable {
         try {
             int p = portInput.isEmpty() ? GameServer.DEFAULT_PORT : Integer.parseInt(portInput);
             stopMultiplayer();
-            client = new GameClient(ipInput, p, level);
+            Level connLevel = (level != null) ? level : new Level(0);
+            client = new GameClient(ipInput, p, connLevel);
             client.sendName(nameInput.isEmpty() ? "Player" : nameInput);
+            if (level == null) {
+                level = connLevel;
+                levelRenderer = new LevelRenderer(level);
+                player = new Player(level);
+            }
             mpStatus = "";
             screen = 0;
             glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED); Input.consumeMouseDelta();
         } catch (Exception e) {
+            e.printStackTrace();
             mpStatus = e.getMessage() != null ? e.getMessage().toUpperCase() : "CONNECTION FAILED";
             client = null;
         }
@@ -1325,7 +1627,7 @@ public class RubyDung implements Runnable {
         for (int i = 0; i < logo.length(); i++)
             drawChar(logo.charAt(i), (width - tw) / 2 + i * (cw + sp), logoY, cw, ch);
 
-        int btnW = 320, btnH = 46, gap = 12;
+        int btnW = 380, btnH = 60, gap = 12;
         int bx = (width - btnW) / 2;
         int by0 = logoY + ch + 50;
 
@@ -1352,7 +1654,8 @@ public class RubyDung implements Runnable {
             if (e[0] == GLFW_MOUSE_BUTTON_1 && e[1] == GLFW_PRESS) {
                 if (h0) { refreshWorldList(); screen = 8; menuCooldown = 2; }
                 else if (h2) {
-                    screen = 3;
+                    refreshServerList();
+                    screen = 5;
                     glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
                     Input.consumeMouseDelta();
                 }
@@ -1471,7 +1774,7 @@ public class RubyDung implements Runnable {
 
         drawTitle("PAUSE", height / 2 - 140);
 
-        int btnW = 320, btnH = 46, gap = 16;
+        int btnW = 380, btnH = 60, gap = 16;
         int bx = (width - btnW) / 2;
         int by1 = height / 2 - 80;
         int by2 = by1 + btnH + gap;
@@ -1497,7 +1800,7 @@ public class RubyDung implements Runnable {
         for (var e : Input.pollMouseEvents()) {
             if (e[0] == GLFW_MOUSE_BUTTON_1 && e[1] == GLFW_PRESS) {
                 if (h1) { screen = 0; glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED); Input.consumeMouseDelta(); }
-                if (h2) { screen = 3; }
+                if (h2) { refreshServerList(); screen = 5; }
                 if (h3) { screen = 2; }
                 if (h4) { exitToMenu(); }
                 if (h5) { if (level != null && !worldName.isEmpty()) level.save(worldDir(worldName)); shouldQuit = true; }
@@ -1580,7 +1883,7 @@ public class RubyDung implements Runnable {
     }
 
     private void drawTitle(String title, int y) {
-        int cw = 22, ch = 30, sp = 4;
+        int cw = 30, ch = 42, sp = 5;
         int tw = title.length() * (cw + sp);
         GL11.glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
         for (int i = 0; i < title.length(); i++)
@@ -1612,7 +1915,7 @@ public class RubyDung implements Runnable {
         GL11.glEnd();
 
         // label
-        int charW = 14, charH = 20;
+        int charW = 18, charH = 26;
         int spacing = charW + 3;
         int textW = label.length() * spacing;
         GL11.glColor4f(1.0f, 1.0f, 1.0f, 1.0f);

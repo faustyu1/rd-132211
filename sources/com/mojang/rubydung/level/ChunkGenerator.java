@@ -191,10 +191,10 @@ public class ChunkGenerator {
                 int ncx = chunk.cx + ox, ncz = chunk.cz + oz;
                 long rseed = regionSeed(ncx, ncz);
                 Random rng = new Random(rseed);
-                // 0-3 tunnels per chunk (matching MC Alpha density)
-                int tunnels = rng.nextInt(4) == 0 ? 2 : (rng.nextInt(3) == 0 ? 1 : 0);
-                // also add room caves more rarely
-                if (rng.nextInt(7) == 0) {
+                // ~1 tunnel per 2 chunks (matching MC Alpha density)
+                int tunnels = rng.nextInt(6) == 0 ? 2 : (rng.nextInt(5) == 0 ? 1 : 0);
+                // room caves very rarely
+                if (rng.nextInt(16) == 0) {
                     float rx = ncx * S + rng.nextFloat() * S;
                     float ry = 8 + rng.nextFloat() * 40f;
                     float rz = ncz * S + rng.nextFloat() * S;

@@ -9,3 +9,4 @@ jdk-x64/
 .claude/
 
 dependency-reduced-pom.xml
+servers.properties

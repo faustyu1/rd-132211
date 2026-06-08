@@ -14,6 +14,7 @@ public class GameClient {
 
     private final Map<Integer, float[]>  remotePlayers = new ConcurrentHashMap<>();
     private final Map<Integer, String>   remoteNames   = new ConcurrentHashMap<>();
+    private final java.util.concurrent.ConcurrentLinkedQueue<String> pendingChat = new java.util.concurrent.ConcurrentLinkedQueue<>();
 
     public GameClient(String host, int port, Level level) throws IOException {
         this.level = level;
@@ -30,7 +31,7 @@ public class GameClient {
         var wis = new DataInputStream(new ByteArrayInputStream(welcomePkt));
         if (wis.readByte() != Packet.WELCOME) throw new IOException("Expected WELCOME");
         localId = wis.readInt();
-        byte[] blocks = new byte[level.getRawBlocks().length];
+        byte[] blocks = new byte[wis.available()];
         wis.readFully(blocks);
         level.setRawBlocks(blocks);
 
@@ -70,6 +71,11 @@ public class GameClient {
                     byte[] nb = new byte[nlen]; dis.readFully(nb);
                     remoteNames.put(id, new String(nb, java.nio.charset.StandardCharsets.UTF_8));
                 }
+                case Packet.CHAT -> {
+                    int mlen = dis.readShort() & 0xFFFF;
+                    byte[] mb = new byte[mlen]; dis.readFully(mb);
+                    pendingChat.add(new String(mb, java.nio.charset.StandardCharsets.UTF_8));
+                }
                 case Packet.PING -> conn.send(PacketWriter.ping());
             }
         } catch (IOException ignored) {}
@@ -78,6 +84,12 @@ public class GameClient {
     public void sendSetTile(int x, int y, int z, int type) {
         conn.send(PacketWriter.setTile(x, y, z, type));
     }
+
+    public void sendChat(String message) {
+        conn.send(PacketWriter.chat(message));
+    }
+
+    public String pollChat() { return pendingChat.poll(); }
 
     public Map<Integer, float[]> getRemotePlayers() { return remotePlayers; }
     public Map<Integer, String>  getRemoteNames()   { return remoteNames; }

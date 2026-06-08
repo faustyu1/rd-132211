@@ -25,6 +25,7 @@ public class GameServer {
     // host's own data visible to game thread for rendering
     private volatile float hx, hy, hz, hyr, hxr;
     private String hostName = "Host";
+    private final java.util.concurrent.ConcurrentLinkedQueue<String> pendingChat = new java.util.concurrent.ConcurrentLinkedQueue<>();
 
     public GameServer(Level level, int port) throws IOException {
         this.level        = level;
@@ -40,10 +41,15 @@ public class GameServer {
                     Socket sock = serverSocket.accept();
                     sock.setTcpNoDelay(true);
                     int id = nextId.getAndIncrement();
+                    // send WELCOME before creating Connection so its reader thread
+                    // doesn't race against the client's synchronous bootstrap read
+                    byte[] welcome = PacketWriter.welcome(id, level.getRawBlocks());
+                    var directOut = new DataOutputStream(new BufferedOutputStream(sock.getOutputStream()));
+                    directOut.writeInt(welcome.length);
+                    directOut.write(welcome);
+                    directOut.flush();
                     var conn = new Connection(id, sock);
                     clients.put(id, conn);
-                    // send world snapshot
-                    conn.send(PacketWriter.welcome(id, level.getRawBlocks()));
                 } catch (IOException e) {
                     if (running) e.printStackTrace();
                 }
@@ -88,6 +94,13 @@ public class GameServer {
         broadcast(PacketWriter.setTile(x, y, z, type), -1);
     }
 
+    public void broadcastChat(String message) {
+        pendingChat.add(message);
+        broadcast(PacketWriter.chat(message), -1);
+    }
+
+    public String pollChat() { return pendingChat.poll(); }
+
     private void handlePacket(int senderId, byte[] pkt, Connection sender) {
         if (pkt.length == 0) return;
         byte type = pkt[0];
@@ -104,6 +117,12 @@ public class GameServer {
                     int x = dis.readInt(), y = dis.readInt(), z = dis.readInt(), tile = dis.readInt();
                     level.setTile(x, y, z, tile);
                     broadcast(PacketWriter.setTile(x, y, z, tile), senderId);
+                }
+                case Packet.CHAT -> {
+                    int mlen = dis.readShort() & 0xFFFF;
+                    byte[] mb = new byte[mlen]; dis.readFully(mb);
+                    pendingChat.add(new String(mb, java.nio.charset.StandardCharsets.UTF_8));
+                    broadcast(pkt, senderId);
                 }
                 case Packet.PLAYER_NAME -> {
                     dis.readInt(); // skip id

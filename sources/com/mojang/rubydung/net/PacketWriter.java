@@ -38,6 +38,18 @@ public final class PacketWriter {
         } catch (IOException e) { throw new RuntimeException(e); }
     }
 
+    public static byte[] chat(String message) {
+        try {
+            byte[] mb = message.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            var bos = new ByteArrayOutputStream(3 + mb.length);
+            var dos = new DataOutputStream(bos);
+            dos.writeByte(Packet.CHAT);
+            dos.writeShort(mb.length);
+            dos.write(mb);
+            return bos.toByteArray();
+        } catch (IOException e) { throw new RuntimeException(e); }
+    }
+
     public static byte[] ping() {
         return new byte[]{Packet.PING};
     }
