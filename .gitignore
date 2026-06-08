@@ -1,0 +1,9 @@
+target/
+saves/
+world/
+world.bak*/
+*.dat
+*.log
+settings.properties
+jdk-x64/
+.claude/
