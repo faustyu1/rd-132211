@@ -37,14 +37,19 @@ public class Level {
             WorldChunk chunk = new WorldChunk(cx, cz, this);
             generator.generate(chunk);
             chunk.scheduleBuild();
-            // wake all water blocks so fluid simulation starts immediately on load
+            // wake only border water blocks (where water may flow to/from neighbours)
             int bx0 = cx * WorldChunk.SIZE, bz0 = cz * WorldChunk.SIZE;
-            for (int lx = 0; lx < WorldChunk.SIZE; lx++)
-                for (int lz = 0; lz < WorldChunk.SIZE; lz++)
-                    for (int y = 0; y < WorldChunk.HEIGHT; y++) {
-                        byte b = chunk.getBlock(lx, y, lz);
-                        if (Tile.isWater(b)) fluidPending.add(packPos(bx0 + lx, y, bz0 + lz));
-                    }
+            int S = WorldChunk.SIZE;
+            for (int y = 0; y < WorldChunk.HEIGHT; y++) {
+                for (int lx = 0; lx < S; lx++) {
+                    if (Tile.isWater(chunk.getBlock(lx, y, 0)))   fluidPending.add(packPos(bx0+lx, y, bz0));
+                    if (Tile.isWater(chunk.getBlock(lx, y, S-1))) fluidPending.add(packPos(bx0+lx, y, bz0+S-1));
+                }
+                for (int lz = 0; lz < S; lz++) {
+                    if (Tile.isWater(chunk.getBlock(0,   y, lz))) fluidPending.add(packPos(bx0, y, bz0+lz));
+                    if (Tile.isWater(chunk.getBlock(S-1, y, lz))) fluidPending.add(packPos(bx0+S-1, y, bz0+lz));
+                }
+            }
             return chunk;
         });
     }

@@ -43,7 +43,10 @@ public class Input {
         mouseX = x; mouseY = y;
     }
 
+    public static boolean blocked = false; // when true, movement keys return false
+
     public static boolean isKeyDown(int key) {
+        if (blocked) return false;
         return key >= 0 && key <= GLFW_KEY_LAST && keys[key];
     }
 

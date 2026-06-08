@@ -24,6 +24,7 @@ public class RubyDung implements Runnable {
     private Level level;
     private LevelRenderer levelRenderer;
     private Player player;
+    private FontRenderer fontRenderer;
     private final FloatBuffer fogColor = MemoryUtil.memAllocFloat(4);
     private final Timer timer = new Timer(60.0f);
     private HitResult hitResult = null;
@@ -103,7 +104,9 @@ public class RubyDung implements Runnable {
     private boolean chatOpen = false;
     private String chatInput = "";
     private final java.util.ArrayDeque<String> chatMessages = new java.util.ArrayDeque<>();
-    private static final int CHAT_MAX = 50;
+    private final java.util.ArrayDeque<Long>   chatTimes    = new java.util.ArrayDeque<>();
+    private static final int  CHAT_MAX     = 50;
+    private static final long CHAT_FADE_MS = 8000; // message visible for 8 seconds
 
     // tab player list
     private boolean tabOpen = false;
@@ -166,6 +169,7 @@ public class RubyDung implements Runnable {
         if (ww[0] > 0)  { winWidth = ww[0]; winHeight = wh[0]; }
 
         GL.createCapabilities();
+        fontRenderer = new FontRenderer(21);
 
         GL11.glEnable(GL11.GL_TEXTURE_2D);
         GL11.glShadeModel(GL11.GL_SMOOTH);
@@ -360,7 +364,7 @@ public class RubyDung implements Runnable {
 
                 // chat input captures keys first
                 if (chatOpen) {
-                    if (key == GLFW_KEY_ESCAPE) { chatOpen = false; chatInput = ""; continue; }
+                    if (key == GLFW_KEY_ESCAPE) { chatOpen = false; chatInput = ""; Input.blocked = false; continue; }
                     if (key == GLFW_KEY_ENTER) {
                         if (!chatInput.isEmpty()) {
                             String msg = chatInput.trim();
@@ -377,7 +381,7 @@ public class RubyDung implements Runnable {
                                 else if (client != null) client.sendChat(formatted);
                             }
                         }
-                        chatInput = ""; chatOpen = false; continue;
+                        chatInput = ""; chatOpen = false; Input.blocked = false; continue;
                     }
                     if (key == GLFW_KEY_BACKSPACE && !chatInput.isEmpty()) {
                         chatInput = chatInput.substring(0, chatInput.length() - 1);
@@ -444,6 +448,8 @@ public class RubyDung implements Runnable {
                 } else if (screen == 0) {
                     if (key == GLFW_KEY_T) {
                         chatOpen = true; chatInput = "";
+                        Input.blocked = true;
+                        Input.pollCharEvents(); // discard the 't' char event from this same keypress
                         glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
                     } else if (key == GLFW_KEY_E) {
                         screen = 6;
@@ -461,7 +467,7 @@ public class RubyDung implements Runnable {
         // char events for text input (must happen before chatOpen early-return)
         for (char c : Input.pollCharEvents()) {
             if (chatOpen) {
-                if (chatInput.length() < 100 && c >= 0x20) chatInput += c;
+                if (chatInput.length() < 100 && c >= 0x20) chatInput += c; // includes Cyrillic (U+0400+)
             } else if (screen == 9) {
                 if (editCreateName) {
                     if (createName.length() < 24 && c >= 0x20 && c < 0x7F) createName += c;
@@ -1237,47 +1243,52 @@ public class RubyDung implements Runnable {
 
     private void addChat(String msg) {
         chatMessages.addLast(msg);
-        while (chatMessages.size() > CHAT_MAX) chatMessages.removeFirst();
+        chatTimes.addLast(System.currentTimeMillis());
+        while (chatMessages.size() > CHAT_MAX) { chatMessages.removeFirst(); chatTimes.removeFirst(); }
     }
 
     private void renderChat() {
         beginOrtho();
         GL11.glEnable(GL11.GL_BLEND);
         GL11.glBlendFunc(GL11.GL_SRC_ALPHA, GL11.GL_ONE_MINUS_SRC_ALPHA);
-        int charW = 6, charH = 8, sp = 7;
-        int hotbarTop = height - 40 - 10; // above hotbar
-        int maxLines = 10;
-        // collect last 10 messages
-        var msgs = chatMessages.toArray(new String[0]);
+
+        int lineH = fontRenderer.glyphH + 4, maxLines = 15, pad = 4;
+        int hotbarTop = height - 40 - 10;
+        var msgs  = chatMessages.toArray(new String[0]);
+        var times = chatTimes.toArray(new Long[0]);
+        long now  = System.currentTimeMillis();
         int start = Math.max(0, msgs.length - maxLines);
-        int lineH = charH + 2;
         int baseY = hotbarTop - lineH * (msgs.length - start);
+
         for (int i = start; i < msgs.length; i++) {
+            long age = now - times[i];
+            if (!chatOpen && age > CHAT_FADE_MS) continue;
+            float fade = (float)(CHAT_FADE_MS - age) / 1000f;
+            float alpha = chatOpen ? 1.0f : Math.min(1.0f, Math.max(0f, fade));
             String line = msgs[i];
-            float alpha = 1.0f - (float)(msgs.length - 1 - i) / maxLines * 0.5f;
-            GL11.glColor4f(0,0,0,alpha*0.5f);
-            int textW = line.length() * sp;
-            GL11.glBegin(GL11.GL_QUADS);
+            int w = fontRenderer.stringWidth(line);
             int ly = baseY + (i - start) * lineH;
-            GL11.glVertex2f(4, ly); GL11.glVertex2f(6 + textW, ly);
-            GL11.glVertex2f(6 + textW, ly + lineH); GL11.glVertex2f(4, ly + lineH);
+            GL11.glColor4f(0, 0, 0, alpha * 0.5f);
+            GL11.glDisable(GL11.GL_TEXTURE_2D);
+            GL11.glBegin(GL11.GL_QUADS);
+            GL11.glVertex2f(pad, ly); GL11.glVertex2f(pad + w + 6, ly);
+            GL11.glVertex2f(pad + w + 6, ly + lineH); GL11.glVertex2f(pad, ly + lineH);
             GL11.glEnd();
-            GL11.glColor4f(1,1,1,alpha);
-            for (int j = 0; j < line.length(); j++)
-                drawChar(Character.toUpperCase(line.charAt(j)), 6 + j * sp, ly, charW, charH);
+            fontRenderer.drawString(line, pad + 3, ly + 1, 1, 1, 1, alpha);
         }
+
         if (chatOpen) {
             String prompt = "> " + chatInput;
             int py = hotbarTop;
-            GL11.glColor4f(0,0,0,0.6f);
+            GL11.glDisable(GL11.GL_TEXTURE_2D);
+            GL11.glColor4f(0, 0, 0, 0.7f);
             GL11.glBegin(GL11.GL_QUADS);
-            GL11.glVertex2f(4, py); GL11.glVertex2f(width - 4, py);
-            GL11.glVertex2f(width - 4, py + lineH + 4); GL11.glVertex2f(4, py + lineH + 4);
+            GL11.glVertex2f(pad, py); GL11.glVertex2f(width - pad, py);
+            GL11.glVertex2f(width - pad, py + lineH + 4); GL11.glVertex2f(pad, py + lineH + 4);
             GL11.glEnd();
-            GL11.glColor4f(1,1,1,1);
-            for (int j = 0; j < prompt.length(); j++)
-                drawChar(Character.toUpperCase(prompt.charAt(j)), 6 + j * sp, py + 2, charW, charH);
+            fontRenderer.drawString(prompt, pad + 3, py + 2, 1, 1, 1, 1);
         }
+
         GL11.glDisable(GL11.GL_BLEND);
         endOrtho();
     }
