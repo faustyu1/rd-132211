@@ -34,10 +34,12 @@ public class RubyDung implements Runnable {
     private int displayFps = 0;
 
     // screens: -1=main menu, 0=game, 1=pause, 2=settings, 3=mp host, 4=direct connect,
-    //          5=server list, 6=inventory, 7=crafting, 8=world select, 9=create world, 10=add/edit server
+    //          5=server list, 6=inventory, 7=crafting, 8=world select, 9=create world, 10=add/edit server, 11=loading
     private int screen = -1;
     private boolean shouldQuit = false;
-    private int menuCooldown = 0; // frames to skip menu clicks (prevents focus-click firing buttons)
+    private int menuCooldown = 0;
+    private volatile String loadingStatus = "";
+    private volatile boolean loadingDone = false;
 
     // world management
     private static final java.io.File SAVES_DIR = new java.io.File("saves");
@@ -87,7 +89,8 @@ public class RubyDung implements Runnable {
     private boolean breaking = false;
     private boolean miningHeld = false;
     private float breakProgress = 0f; // 0..1
-    private int placeCooldown = 0;    // frames between placements while held
+    private long breakNextMs  = 0;   // ms timestamp: next allowed creative break
+    private long placeNextMs  = 0;   // ms timestamp: next allowed place
 
     // hotbar
     private final int[] hotbar = {1, 2, 3, 4, 5, 6, 7, 8, 9};
@@ -201,6 +204,15 @@ public class RubyDung implements Runnable {
         try {
             while (!shouldQuit && !glfwWindowShouldClose(window)) {
                 glfwPollEvents();
+                // finish loading on main thread (GL context required for LevelRenderer)
+                if (screen == 11 && loadingDone) {
+                    levelRenderer = new LevelRenderer(level);
+                    player = new Player(level);
+                    screen = 0;
+                    glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+                    Input.consumeMouseDelta();
+                    loadingDone = false;
+                }
                 timer.advanceTime();
                 if (screen == 0) {
                     for (int i = 0; i < timer.ticks; i++) tick();
@@ -228,7 +240,7 @@ public class RubyDung implements Runnable {
         timeOfDay = (timeOfDay + 1f / (20 * 60 * 10)) % 1f;
         player.tick();
         level.update(player.x, player.z, 8);
-        if (fluidTickCounter++ % 4 == 0) level.tickFluids();
+        if (fluidTickCounter++ % 5 == 0) level.tickFluids();
         particles.tick();
         if (miningHeld && hitResult != null) updateBreaking();
 
@@ -501,15 +513,28 @@ public class RubyDung implements Runnable {
                 selectedSlot = ((selectedSlot - (int)Math.signum(scroll)) % 9 + 9) % 9;
             }
 
-            // mouse events: creative break on LMB press, place on RMB press
+            long now = System.currentTimeMillis();
+
+            // mouse events: creative break on LMB press
             for (var e : Input.pollMouseEvents()) {
                 if (e[0] == GLFW_MOUSE_BUTTON_1 && e[1] == GLFW_PRESS
-                        && player.mode == Player.GameMode.CREATIVE && hitResult != null) {
+                        && player.mode == Player.GameMode.CREATIVE && hitResult != null && now >= breakNextMs) {
                     breakBlock(hitResult.x(), hitResult.y(), hitResult.z());
+                    breakNextMs = now + 250;
                 }
                 if (e[0] == GLFW_MOUSE_BUTTON_2 && e[1] == GLFW_PRESS) {
-                    tryPlaceBlock();
+                    tryPlaceBlock(); placeNextMs = now + 250; // first press immediate
                 }
+                if (e[0] == GLFW_MOUSE_BUTTON_2 && e[1] == GLFW_RELEASE) {
+                    placeNextMs = 0; // reset so next press is immediate
+                }
+            }
+
+            // hold LMB — creative continuous break every 250ms
+            if (Input.isMouseDown(GLFW_MOUSE_BUTTON_1) && hitResult != null
+                    && player.mode == Player.GameMode.CREATIVE && now >= breakNextMs) {
+                breakBlock(hitResult.x(), hitResult.y(), hitResult.z());
+                breakNextMs = now + 250;
             }
 
             // continuous LMB in survival
@@ -518,12 +543,10 @@ public class RubyDung implements Runnable {
             miningHeld = mining;
             if (!mining) resetBreaking();
 
-            // continuous RMB placing
-            if (Input.isMouseDown(GLFW_MOUSE_BUTTON_2) && hitResult != null && placeCooldown == 0) {
-                tryPlaceBlock();
+            // hold RMB — place every 250ms
+            if (Input.isMouseDown(GLFW_MOUSE_BUTTON_2) && hitResult != null && now >= placeNextMs) {
+                tryPlaceBlock(); placeNextMs = now + 250;
             }
-
-            if (placeCooldown > 0) placeCooldown--;
         } else {
             // consume mouse delta while in menus so it doesn't accumulate
             Input.consumeMouseDelta();
@@ -544,7 +567,6 @@ public class RubyDung implements Runnable {
             level.setTile(x, y, z, tileType);
             if (client != null) client.sendSetTile(x, y, z, tileType);
             else if (server != null) server.broadcastTile(x, y, z, tileType);
-            placeCooldown = 6;
         }
     }
 
@@ -608,6 +630,11 @@ public class RubyDung implements Runnable {
             glfwSwapBuffers(window);
             return;
         }
+        if (screen == 11) {
+            renderLoadingScreen();
+            glfwSwapBuffers(window);
+            return;
+        }
         if (screen == 2 || screen == 3 || screen == 4 || screen == 5 || screen == 10) {
             if (player == null) {
                 float sa = (float)(Math.cos(timeOfDay * Math.PI * 2));
@@ -654,7 +681,13 @@ public class RubyDung implements Runnable {
         GL11.glHint(GL11.GL_FOG_HINT, GL11.GL_NICEST);
 
         levelRenderer.render(player, 0);
+
+        GL11.glEnable(GL11.GL_BLEND);
+        GL11.glBlendFunc(GL11.GL_SRC_ALPHA, GL11.GL_ONE_MINUS_SRC_ALPHA);
+        GL11.glDepthMask(false);
         levelRenderer.render(player, 1);
+        GL11.glDepthMask(true);
+        GL11.glDisable(GL11.GL_BLEND);
 
         GL11.glDisable(GL11.GL_FOG);
         GL11.glDisable(GL11.GL_TEXTURE_2D);
@@ -1527,19 +1560,30 @@ public class RubyDung implements Runnable {
     private void startWorld(String name, long seed) {
         worldName = name;
         worldSeedValue = seed;
-        java.io.File dir = worldDir(name);
-        dir.mkdirs();
-        level = new Level(seed);
-        if (new java.io.File(dir, "seed.dat").exists()) {
-            level.load(dir);
-            worldSeedValue = level.getSeed();
-        }
-        level.update(0, 0, 8);
-        levelRenderer = new LevelRenderer(level);
-        player = new Player(level);
-        screen = 0;
-        glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
-        Input.consumeMouseDelta();
+        loadingStatus = "GENERATING WORLD...";
+        loadingDone = false;
+        screen = 11;
+        glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+
+        Thread t = new Thread(() -> {
+            java.io.File dir = worldDir(name);
+            dir.mkdirs();
+            level = new Level(seed);
+            if (new java.io.File(dir, "seed.dat").exists()) {
+                loadingStatus = "LOADING WORLD...";
+                level.load(dir);
+                worldSeedValue = level.getSeed();
+            }
+            loadingStatus = "GENERATING TERRAIN...";
+            for (int dx = -4; dx <= 4; dx++)
+                for (int dz = -4; dz <= 4; dz++)
+                    level.getOrLoadChunk(dx, dz);
+            level.update(0, 0, 8);
+            loadingStatus = "SPAWNING...";
+            loadingDone = true;
+        }, "world-loader");
+        t.setDaemon(true);
+        t.start();
     }
 
     /** Save the active world and return to the main menu, fully tearing down level state. */
@@ -1595,6 +1639,41 @@ public class RubyDung implements Runnable {
         if (files != null) for (java.io.File f : files) f.delete();
         dir.delete();
         refreshWorldList();
+    }
+
+    private void renderLoadingScreen() {
+        GL11.glClearColor(0.05f, 0.05f, 0.05f, 1f);
+        GL11.glClear(GL11.GL_COLOR_BUFFER_BIT | GL11.GL_DEPTH_BUFFER_BIT);
+        beginOrtho();
+        GL11.glEnable(GL11.GL_BLEND);
+        GL11.glBlendFunc(GL11.GL_SRC_ALPHA, GL11.GL_ONE_MINUS_SRC_ALPHA);
+
+        // progress bar background
+        int barW = 400, barH = 12;
+        int barX = (width - barW) / 2, barY = height / 2 + 20;
+        GL11.glColor4f(1f, 1f, 1f, 0.15f);
+        GL11.glBegin(GL11.GL_QUADS);
+        GL11.glVertex2f(barX, barY); GL11.glVertex2f(barX+barW, barY);
+        GL11.glVertex2f(barX+barW, barY+barH); GL11.glVertex2f(barX, barY+barH);
+        GL11.glEnd();
+        // animated fill
+        float fill = (System.currentTimeMillis() % 2000) / 2000f;
+        GL11.glColor4f(0.3f, 0.7f, 1f, 0.9f);
+        GL11.glBegin(GL11.GL_QUADS);
+        GL11.glVertex2f(barX, barY); GL11.glVertex2f(barX + barW * fill, barY);
+        GL11.glVertex2f(barX + barW * fill, barY+barH); GL11.glVertex2f(barX, barY+barH);
+        GL11.glEnd();
+
+        drawTitle("RUBYDUNG", height / 2 - 80);
+
+        GL11.glColor4f(0.8f, 0.8f, 0.8f, 1f);
+        String s = loadingStatus;
+        int sw = s.length() * 10;
+        for (int i = 0; i < s.length(); i++)
+            drawChar(s.charAt(i), (width - sw) / 2 + i * 10, height / 2 + 42, 8, 12);
+
+        GL11.glDisable(GL11.GL_BLEND);
+        endOrtho();
     }
 
     private void renderMainMenu() {

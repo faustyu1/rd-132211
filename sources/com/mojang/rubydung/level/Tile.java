@@ -50,12 +50,15 @@ public class Tile {
     public static final Tile gravel     = tinted(TEX_STONE, 0.52f, 0.52f, 0.55f);
     public static final Tile snow       = tinted(TEX_STONE, 0.95f, 0.97f, 1.00f);
     public static final Tile water      = tinted(14, 0.30f, 0.50f, 1.00f);
-    /** Flowing water tiles for levels 1..7 (index 0..6); lower fill = thinner. */
     public static final Tile[] waterFlow = new Tile[7];
     static {
+        water.translucent = true;
+        water.ta = 0.65f;
         for (int lvl = 1; lvl <= 7; lvl++) {
             Tile t = tinted(14, 0.30f, 0.50f, 1.00f);
-            t.fill = 1.0f - lvl / 8.0f;   // level 1 -> 0.875 ... level 7 -> 0.125
+            t.fill = 1.0f - lvl / 8.0f;
+            t.translucent = true;
+            t.ta = 0.65f;
             waterFlow[lvl - 1] = t;
         }
     }
@@ -76,11 +79,10 @@ public class Tile {
     // texTop, texBottom, texSide
     private final int texTop, texBottom, texSide;
     // color tint (default white = no tint)
-    float tr = 1f,
-        tg = 1f,
-        tb = 1f;
+    float tr = 1f, tg = 1f, tb = 1f, ta = 1f;
     // vertical fill fraction (1 = full cube). <1 lowers the top surface (flowing water).
     float fill = 1f;
+    boolean translucent = false;
 
     private Tile(int texTop, int texBottom, int texSide) {
         this.texTop = texTop;
@@ -126,151 +128,152 @@ public class Tile {
             y1 = y + fill;
         float z0 = z,
             z1 = z + 1.0f;
+        boolean w = translucent; // water: cull faces against same fluid
 
         // bottom face
-        if (!level.isSolidTile(x, y - 1, z)) {
+        if (!level.isSolidOrSameFluid(x, y - 1, z, w)) {
             float[] c = uv(texBottom);
             float br = level.getBrightness(x, y - 1, z);
             boolean lit = br >= 1.0f;
-            if (lit ^ (layer == 1)) {
+            if (translucent ? (layer == 1) : (lit ^ (layer == 1))) {
                 float a00 = ao(level, x, y - 1, z, -1, 0, 0, 1) * br,
                     a10 = ao(level, x, y - 1, z, 1, 0, 0, 1) * br;
                 float a01 = ao(level, x, y - 1, z, -1, 0, 0, -1) * br,
                     a11 = ao(level, x, y - 1, z, 1, 0, 0, -1) * br;
-                t.color(a00 * tr, a00 * tg, a00 * tb);
+                t.color(a00 * tr, a00 * tg, a00 * tb, ta);
                 t.tex(c[0], c[2]);
                 t.vertex(x0, y0, z1);
-                t.color(a01 * tr, a01 * tg, a01 * tb);
+                t.color(a01 * tr, a01 * tg, a01 * tb, ta);
                 t.tex(c[0], 0);
                 t.vertex(x0, y0, z0);
-                t.color(a11 * tr, a11 * tg, a11 * tb);
+                t.color(a11 * tr, a11 * tg, a11 * tb, ta);
                 t.tex(c[1], 0);
                 t.vertex(x1, y0, z0);
-                t.color(a10 * tr, a10 * tg, a10 * tb);
+                t.color(a10 * tr, a10 * tg, a10 * tb, ta);
                 t.tex(c[1], c[2]);
                 t.vertex(x1, y0, z1);
             }
         }
         // top face
-        if (!level.isSolidTile(x, y + 1, z)) {
+        if (!level.isSolidOrSameFluid(x, y + 1, z, w)) {
             float[] c = uv(texTop);
             float br = level.getBrightness(x, y, z);
             boolean lit = br >= 1.0f;
-            if (lit ^ (layer == 1)) {
+            if (translucent ? (layer == 1) : (lit ^ (layer == 1))) {
                 float a11 = ao(level, x, y + 1, z, 1, 0, 0, 1) * br,
                     a10 = ao(level, x, y + 1, z, 1, 0, 0, -1) * br;
                 float a00 = ao(level, x, y + 1, z, -1, 0, 0, -1) * br,
                     a01 = ao(level, x, y + 1, z, -1, 0, 0, 1) * br;
-                t.color(a11 * tr, a11 * tg, a11 * tb);
+                t.color(a11 * tr, a11 * tg, a11 * tb, ta);
                 t.tex(c[1], c[2]);
                 t.vertex(x1, y1, z1);
-                t.color(a10 * tr, a10 * tg, a10 * tb);
+                t.color(a10 * tr, a10 * tg, a10 * tb, ta);
                 t.tex(c[1], 0);
                 t.vertex(x1, y1, z0);
-                t.color(a00 * tr, a00 * tg, a00 * tb);
+                t.color(a00 * tr, a00 * tg, a00 * tb, ta);
                 t.tex(c[0], 0);
                 t.vertex(x0, y1, z0);
-                t.color(a01 * tr, a01 * tg, a01 * tb);
+                t.color(a01 * tr, a01 * tg, a01 * tb, ta);
                 t.tex(c[0], c[2]);
                 t.vertex(x0, y1, z1);
             }
         }
         // south face (z-)
-        if (!level.isSolidTile(x, y, z - 1)) {
+        if (!level.isSolidOrSameFluid(x, y, z - 1, w)) {
             float[] c = uv(texSide);
             float rawBr = level.getBrightness(x, y, z - 1);
             float br = rawBr * 0.8f;
             boolean lit = rawBr >= 1.0f;
-            if (lit ^ (layer == 1)) {
+            if (translucent ? (layer == 1) : (lit ^ (layer == 1))) {
                 float a00 = ao(level, x, y, z - 1, -1, 0, 0, -1) * br,
                     a10 = ao(level, x, y, z - 1, 1, 0, 0, -1) * br;
                 float a01 = ao(level, x, y, z - 1, -1, 0, 0, 1) * br,
                     a11 = ao(level, x, y, z - 1, 1, 0, 0, 1) * br;
-                t.color(a00 * tr, a00 * tg, a00 * tb);
+                t.color(a00 * tr, a00 * tg, a00 * tb, ta);
                 t.tex(c[1], 0);
                 t.vertex(x0, y1, z0);
-                t.color(a10 * tr, a10 * tg, a10 * tb);
+                t.color(a10 * tr, a10 * tg, a10 * tb, ta);
                 t.tex(c[0], 0);
                 t.vertex(x1, y1, z0);
-                t.color(a11 * tr, a11 * tg, a11 * tb);
+                t.color(a11 * tr, a11 * tg, a11 * tb, ta);
                 t.tex(c[0], c[2]);
                 t.vertex(x1, y0, z0);
-                t.color(a01 * tr, a01 * tg, a01 * tb);
+                t.color(a01 * tr, a01 * tg, a01 * tb, ta);
                 t.tex(c[1], c[2]);
                 t.vertex(x0, y0, z0);
             }
         }
         // north face (z+)
-        if (!level.isSolidTile(x, y, z + 1)) {
+        if (!level.isSolidOrSameFluid(x, y, z + 1, w)) {
             float[] c = uv(texSide);
             float rawBr = level.getBrightness(x, y, z + 1);
             float br = rawBr * 0.8f;
             boolean lit = rawBr >= 1.0f;
-            if (lit ^ (layer == 1)) {
+            if (translucent ? (layer == 1) : (lit ^ (layer == 1))) {
                 float a00 = ao(level, x, y, z + 1, -1, 0, 0, 1) * br,
                     a10 = ao(level, x, y, z + 1, 1, 0, 0, 1) * br;
                 float a01 = ao(level, x, y, z + 1, -1, 0, 0, -1) * br,
                     a11 = ao(level, x, y, z + 1, 1, 0, 0, -1) * br;
-                t.color(a00 * tr, a00 * tg, a00 * tb);
+                t.color(a00 * tr, a00 * tg, a00 * tb, ta);
                 t.tex(c[0], 0);
                 t.vertex(x0, y1, z1);
-                t.color(a01 * tr, a01 * tg, a01 * tb);
+                t.color(a01 * tr, a01 * tg, a01 * tb, ta);
                 t.tex(c[0], c[2]);
                 t.vertex(x0, y0, z1);
-                t.color(a11 * tr, a11 * tg, a11 * tb);
+                t.color(a11 * tr, a11 * tg, a11 * tb, ta);
                 t.tex(c[1], c[2]);
                 t.vertex(x1, y0, z1);
-                t.color(a10 * tr, a10 * tg, a10 * tb);
+                t.color(a10 * tr, a10 * tg, a10 * tb, ta);
                 t.tex(c[1], 0);
                 t.vertex(x1, y1, z1);
             }
         }
         // west face (x-)
-        if (!level.isSolidTile(x - 1, y, z)) {
+        if (!level.isSolidOrSameFluid(x - 1, y, z, w)) {
             float[] c = uv(texSide);
             float rawBr = level.getBrightness(x - 1, y, z);
             float br = rawBr * 0.6f;
             boolean lit = rawBr >= 1.0f;
-            if (lit ^ (layer == 1)) {
+            if (translucent ? (layer == 1) : (lit ^ (layer == 1))) {
                 float a00 = ao(level, x - 1, y, z, 0, -1, -1, 0) * br,
                     a10 = ao(level, x - 1, y, z, 0, 1, -1, 0) * br;
                 float a01 = ao(level, x - 1, y, z, 0, -1, 1, 0) * br,
                     a11 = ao(level, x - 1, y, z, 0, 1, 1, 0) * br;
-                t.color(a10 * tr, a10 * tg, a10 * tb);
+                t.color(a10 * tr, a10 * tg, a10 * tb, ta);
                 t.tex(c[1], 0);
                 t.vertex(x0, y1, z1);
-                t.color(a00 * tr, a00 * tg, a00 * tb);
+                t.color(a00 * tr, a00 * tg, a00 * tb, ta);
                 t.tex(c[0], 0);
                 t.vertex(x0, y1, z0);
-                t.color(a01 * tr, a01 * tg, a01 * tb);
+                t.color(a01 * tr, a01 * tg, a01 * tb, ta);
                 t.tex(c[0], c[2]);
                 t.vertex(x0, y0, z0);
-                t.color(a11 * tr, a11 * tg, a11 * tb);
+                t.color(a11 * tr, a11 * tg, a11 * tb, ta);
                 t.tex(c[1], c[2]);
                 t.vertex(x0, y0, z1);
             }
         }
         // east face (x+)
-        if (!level.isSolidTile(x + 1, y, z)) {
+        if (!level.isSolidOrSameFluid(x + 1, y, z, w)) {
             float[] c = uv(texSide);
             float rawBr = level.getBrightness(x + 1, y, z);
             float br = rawBr * 0.6f;
             boolean lit = rawBr >= 1.0f;
-            if (lit ^ (layer == 1)) {
+            if (translucent ? (layer == 1) : (lit ^ (layer == 1))) {
                 float a00 = ao(level, x + 1, y, z, 0, -1, 1, 0) * br,
                     a10 = ao(level, x + 1, y, z, 0, 1, 1, 0) * br;
                 float a01 = ao(level, x + 1, y, z, 0, -1, -1, 0) * br,
                     a11 = ao(level, x + 1, y, z, 0, 1, -1, 0) * br;
-                t.color(a00 * tr, a00 * tg, a00 * tb);
+                t.color(a00 * tr, a00 * tg, a00 * tb, ta);
                 t.tex(c[0], c[2]);
                 t.vertex(x1, y0, z1);
-                t.color(a01 * tr, a01 * tg, a01 * tb);
+                t.color(a01 * tr, a01 * tg, a01 * tb, ta);
                 t.tex(c[1], c[2]);
                 t.vertex(x1, y0, z0);
-                t.color(a11 * tr, a11 * tg, a11 * tb);
+                t.color(a11 * tr, a11 * tg, a11 * tb, ta);
                 t.tex(c[1], 0);
                 t.vertex(x1, y1, z0);
-                t.color(a10 * tr, a10 * tg, a10 * tb);
+                t.color(a10 * tr, a10 * tg, a10 * tb, ta);
                 t.tex(c[0], 0);
                 t.vertex(x1, y1, z1);
             }

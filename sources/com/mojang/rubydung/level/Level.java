@@ -134,9 +134,14 @@ public class Level {
     /** Advance water flow. Called a few times per second from the game tick. */
     public void tickFluids() {
         if (fluidPending.isEmpty()) return;
-        // snapshot this round so newly-scheduled cells settle next round (stable animation)
-        Long[] batch = fluidPending.toArray(new Long[0]);
-        fluidPending.clear();
+        // process at most 64 cells per tick — matches MC Alpha's per-tick randomTick feel
+        int limit = Math.min(64, fluidPending.size());
+        var iter = fluidPending.iterator();
+        long[] batch = new long[limit];
+        for (int i = 0; i < limit && iter.hasNext(); i++) {
+            batch[i] = iter.next();
+            iter.remove();
+        }
         for (long packed : batch) {
             int x = (int) (packed >> 38);
             int y = (int) ((packed >> 26) & 0xFFF);
@@ -217,6 +222,13 @@ public class Level {
     public boolean isTile(int x, int y, int z) {
         if (y < 0 || y >= sizeY) return false;
         return getBlock(x, y, z) != 0;
+    }
+
+    public boolean isSolidOrSameFluid(int x, int y, int z, boolean callerIsWater) {
+        if (y < 0 || y >= sizeY) return false;
+        byte b = getBlock(x, y, z);
+        if (callerIsWater && Tile.isWater(b)) return true; // water-water: cull face
+        return b != 0 && b != 3 && !Tile.isWater(b);
     }
 
     public boolean isSolidTile(int x, int y, int z) {

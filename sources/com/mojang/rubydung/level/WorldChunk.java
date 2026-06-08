@@ -28,7 +28,8 @@ public class WorldChunk {
     private final AtomicReference<MeshData> pendingMesh = new AtomicReference<>(null);
 
     private final int[][] vbo = new int[2][3];
-    private volatile int[] vertexCount = new int[2];
+    volatile int[] vertexCount = new int[2];
+    public boolean hasMesh() { return vertexCount[0] > 0 || vertexCount[1] > 0; }
     private volatile boolean vboReady = false; // VBOs allocated on main thread
 
     public static int rebuiltThisFrame = 0;
@@ -198,7 +199,7 @@ public class WorldChunk {
         GL15.glBindBuffer(GL15.GL_ARRAY_BUFFER, vbo[layer][1]);
         GL11.glTexCoordPointer(2, GL11.GL_FLOAT, 0, 0);
         GL15.glBindBuffer(GL15.GL_ARRAY_BUFFER, vbo[layer][2]);
-        GL11.glColorPointer(3, GL11.GL_FLOAT, 0, 0);
+        GL11.glColorPointer(4, GL11.GL_FLOAT, 0, 0);
         GL11.glDrawArrays(GL11.GL_QUADS, 0, vertexCount[layer]);
         GL11.glDisableClientState(GL11.GL_VERTEX_ARRAY);
         GL11.glDisableClientState(GL11.GL_TEXTURE_COORD_ARRAY);

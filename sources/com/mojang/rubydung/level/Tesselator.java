@@ -5,12 +5,12 @@ import org.lwjgl.system.MemoryUtil;
 import org.lwjgl.opengl.GL11;
 
 public class Tesselator {
-    private static final int MAX_VERTICES = 262_144; // 2^18, enough for any chunk layer
+    private static final int MAX_VERTICES = 524_288; // 2^19
 
-    private float u, v, r, g, b;
+    private float u, v, r, g, b, a = 1f;
     private final FloatBuffer vertexBuffer   = MemoryUtil.memAllocFloat(MAX_VERTICES * 3);
     private final FloatBuffer texCoordBuffer = MemoryUtil.memAllocFloat(MAX_VERTICES * 2);
-    private final FloatBuffer colorBuffer    = MemoryUtil.memAllocFloat(MAX_VERTICES * 3);
+    private final FloatBuffer colorBuffer    = MemoryUtil.memAllocFloat(MAX_VERTICES * 4);
     private int vertices = 0;
     private boolean hasColor = false;
     private boolean hasTexture = false;
@@ -22,7 +22,7 @@ public class Tesselator {
 
         GL11.glVertexPointer(3, GL11.GL_FLOAT, 0, vertexBuffer);
         if (hasTexture) GL11.glTexCoordPointer(2, GL11.GL_FLOAT, 0, texCoordBuffer);
-        if (hasColor)   GL11.glColorPointer(3, GL11.GL_FLOAT, 0, colorBuffer);
+        if (hasColor)   GL11.glColorPointer(4, GL11.GL_FLOAT, 0, colorBuffer);
 
         GL11.glEnableClientState(GL11.GL_VERTEX_ARRAY);
         if (hasTexture) GL11.glEnableClientState(GL11.GL_TEXTURE_COORD_ARRAY);
@@ -56,11 +56,10 @@ public class Tesselator {
         this.v = v;
     }
 
-    public void color(float r, float g, float b) {
+    public void color(float r, float g, float b) { color(r, g, b, 1f); }
+    public void color(float r, float g, float b, float a) {
         hasColor = true;
-        this.r = r;
-        this.g = g;
-        this.b = b;
+        this.r = r; this.g = g; this.b = b; this.a = a;
     }
 
     public void vertex(float x, float y, float z) {
@@ -71,7 +70,8 @@ public class Tesselator {
             texCoordBuffer.put(ti, u).put(ti + 1, v);
         }
         if (hasColor) {
-            colorBuffer.put(vi, r).put(vi + 1, g).put(vi + 2, b);
+            int ci = vertices * 4;
+            colorBuffer.put(ci, r).put(ci + 1, g).put(ci + 2, b).put(ci + 3, a);
         }
         vertices++;
         if (vertices == MAX_VERTICES)
@@ -93,7 +93,7 @@ public class Tesselator {
     }
 
     public float[] getColorArray() {
-        float[] arr = new float[vertices * 3];
+        float[] arr = new float[vertices * 4];
         for (int i = 0; i < arr.length; i++) arr[i] = colorBuffer.get(i);
         return arr;
     }

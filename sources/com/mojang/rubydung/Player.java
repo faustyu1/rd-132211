@@ -35,10 +35,8 @@ public class Player {
     }
 
     private void resetPos() {
-        float x = (float) (Math.random() * 64 - 32);
-        float y = Level.sizeY + 10;
-        float z = (float) (Math.random() * 64 - 32);
-        setPos(x, y, z);
+        int sy = level.getSurfaceY(0, 0);
+        setPos(0.5f, sy + 2 + 1.62f, 0.5f);
     }
 
     private void setPos(float x, float y, float z) {
