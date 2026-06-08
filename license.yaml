@@ -1,0 +1,27 @@
+# License Configuration
+# This project contains modifications and additions to decompiled source code
+
+licenses:
+  - name: "Apache License 2.0"
+    spdx: "Apache-2.0"
+    description: "Permissive open source license"
+    
+attribution:
+  - name: "Minecraft"
+    description: "Original decompiled source code base"
+    notice: "Modifications and enhancements added"
+    
+source_disclosure:
+  included: true
+  modifications: true
+  description: "This project includes decompiled and modified source code"
+
+dependencies:
+  # Add any third-party dependencies your project uses
+  - name: "Java Standard Library"
+    license: "GPL-2.0"
+
+disclaimer: |
+  This software is provided as-is for educational and research purposes.
+  Users are responsible for complying with applicable laws and licenses
+  of the original works referenced in this project.
