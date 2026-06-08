@@ -7,3 +7,5 @@ world.bak*/
 settings.properties
 jdk-x64/
 .claude/
+
+dependency-reduced-pom.xml
