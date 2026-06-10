@@ -2,6 +2,12 @@
 
 All notable changes to RubyDung are documented in this file.
 
+This project follows [Semantic Versioning](https://semver.org/) while in `0.x`:
+- **MINOR** (`0.X.0`) — new features or breaking/architectural changes.
+- **PATCH** (`0.x.X`) — bug fixes and small tweaks, no new features.
+
+Do not bump versions for every commit; group changes into a release and tag once.
+
 ## [0.3.0] - 2026-06-10
 
 ### Changed
