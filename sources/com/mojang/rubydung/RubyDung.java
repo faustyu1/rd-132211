@@ -4,17 +4,18 @@ import com.mojang.rubydung.level.Level;
 import com.mojang.rubydung.level.LevelRenderer;
 import com.mojang.rubydung.level.Tile;
 import com.mojang.rubydung.level.WorldChunk;
+import com.mojang.rubydung.level.Frustum;
 import com.mojang.rubydung.net.GameClient;
 import com.mojang.rubydung.net.GameServer;
-import org.lwjgl.opengl.GL;
-import org.lwjgl.opengl.GL11;
+import com.mojang.rubydung.render.GL;
+import com.mojang.rubydung.render.vk.GameRenderer;
+import com.mojang.rubydung.render.vk.Pipelines;
 import org.joml.Matrix4f;
-import java.nio.FloatBuffer;
 import java.util.HashMap;
 import java.util.Map;
-import org.lwjgl.system.MemoryUtil;
 
 import static org.lwjgl.glfw.GLFW.*;
+import static org.lwjgl.glfw.GLFWVulkan.glfwVulkanSupported;
 
 public class RubyDung implements Runnable {
     private int width;
@@ -25,7 +26,7 @@ public class RubyDung implements Runnable {
     private LevelRenderer levelRenderer;
     private Player player;
     private FontRenderer fontRenderer;
-    private final FloatBuffer fogColor = MemoryUtil.memAllocFloat(4);
+    private GameRenderer renderer;
     private final Timer timer = new Timer(60.0f);
     private HitResult hitResult = null;
     private long window;
@@ -79,6 +80,10 @@ public class RubyDung implements Runnable {
     private float currentFov = 70.0f;
     private float currentSneakOffset = 0.0f;
     private long lastFrameNanos = System.nanoTime();
+    private final Matrix4f frustumProj = new Matrix4f();
+    private final Matrix4f frustumMv = new Matrix4f();
+    private final Matrix4f savedProj = new Matrix4f();
+    private final Matrix4f nameTagMv = new Matrix4f();
 
     // day/night
     private float timeOfDay = 0.0f; // 0=noon, 0.5=midnight
@@ -96,9 +101,6 @@ public class RubyDung implements Runnable {
     // hotbar
     private final int[] hotbar = {1, 2, 3, 4, 5, 6, 7, 8, 9};
     private int selectedSlot = 0;
-
-    // matches glClearColor(0.5, 0.8, 1.0) so fog blends into sky
-    private static final float[] SKY_COLOR = {0.5f, 0.8f, 1.0f, 1.0f};
 
     // chat
     private boolean chatOpen = false;
@@ -119,14 +121,12 @@ public class RubyDung implements Runnable {
     private byte[] inventorySlots = new byte[36];
 
     public void init() {
-        fogColor.put(SKY_COLOR).flip();
-
         settings.load();
 
         if (!glfwInit()) throw new RuntimeException("Failed to initialize GLFW");
+        if (!glfwVulkanSupported()) throw new RuntimeException("Vulkan is not supported on this system");
 
-        glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 2);
-        glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 1);
+        glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
         glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
         glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
 
@@ -153,12 +153,10 @@ public class RubyDung implements Runnable {
         glfwSetScrollCallback(window, (win, sx, sy) -> Input.onScroll(sy));
         glfwSetFramebufferSizeCallback(window, (win, w, h) -> {
             width = w; height = h;
-            GL11.glViewport(0, 0, w, h);
+            if (renderer != null) renderer.requestResize();
         });
         glfwSetWindowSizeCallback(window, (win, w, h) -> { winWidth = w; winHeight = h; });
 
-        glfwMakeContextCurrent(window);
-        glfwSwapInterval(settings.vsync ? 1 : 0);
         glfwShowWindow(window);
 
         // read actual sizes after window creation (Retina: fb != window size)
@@ -168,18 +166,8 @@ public class RubyDung implements Runnable {
         if (fbw[0] > 0) { width = fbw[0]; height = fbh[0]; }
         if (ww[0] > 0)  { winWidth = ww[0]; winHeight = wh[0]; }
 
-        GL.createCapabilities();
+        renderer = new GameRenderer(window, settings.vsync);
         fontRenderer = new FontRenderer(21);
-
-        GL11.glEnable(GL11.GL_TEXTURE_2D);
-        GL11.glShadeModel(GL11.GL_SMOOTH);
-        GL11.glClearColor(0.5f, 0.8f, 1.0f, 0.0f);
-        GL11.glClearDepth(1.0);
-        GL11.glEnable(GL11.GL_DEPTH_TEST);
-        GL11.glDepthFunc(GL11.GL_LEQUAL);
-        GL11.glMatrixMode(GL11.GL_PROJECTION);
-        GL11.glLoadIdentity();
-        GL11.glMatrixMode(GL11.GL_MODELVIEW);
 
         screen = -1;
         menuCooldown = 5;
@@ -190,6 +178,7 @@ public class RubyDung implements Runnable {
         stopMultiplayer();
         if (level != null && !worldName.isEmpty()) level.save(worldDir(worldName));
         settings.save();
+        if (renderer != null) renderer.destroy();
         glfwDestroyWindow(window);
         glfwTerminate();
     }
@@ -282,22 +271,17 @@ public class RubyDung implements Runnable {
     }
 
     private void moveCameraToPlayer(float a) {
-        GL11.glTranslatef(0.0f, 0.0f, -0.3f);
-        GL11.glRotatef(player.xRot, 1.0f, 0.0f, 0.0f);
-        GL11.glRotatef(player.yRot, 0.0f, 1.0f, 0.0f);
+        renderer.translate(0.0f, 0.0f, -0.3f);
+        renderer.rotate(player.xRot, 1.0f, 0.0f, 0.0f);
+        renderer.rotate(player.yRot, 0.0f, 1.0f, 0.0f);
         float x = player.xo + (player.x - player.xo) * a;
         float y = player.yo + (player.y - player.yo) * a;
         float z = player.zo + (player.z - player.zo) * a;
-        GL11.glTranslatef(-x, -(y - currentSneakOffset), -z);
+        renderer.translate(-x, -(y - currentSneakOffset), -z);
     }
 
     private void setPerspective(float fov, float aspect, float near, float far) {
-        Matrix4f m = new Matrix4f().perspective((float) Math.toRadians(fov), aspect, near, far);
-        float[] arr = new float[16];
-        m.get(arr);
-        GL11.glMatrixMode(GL11.GL_PROJECTION);
-        GL11.glLoadIdentity();
-        GL11.glLoadMatrixf(arr);
+        renderer.setPerspective(fov, aspect, near, far);
     }
 
     private void setupCamera(float a) {
@@ -314,9 +298,10 @@ public class RubyDung implements Runnable {
         currentSneakOffset += (targetSneak - currentSneakOffset) * sneakAlpha;
 
         setPerspective(currentFov, (float) width / height, 0.1f, 384.0f);
-        GL11.glMatrixMode(GL11.GL_MODELVIEW);
-        GL11.glLoadIdentity();
+        renderer.loadIdentity();
         moveCameraToPlayer(a);
+        // update frustum from current matrices
+        Frustum.getFrustum().update(renderer.getProjection(frustumProj), renderer.getModelView(frustumMv));
     }
 
     private HitResult pick() {
@@ -610,93 +595,71 @@ public class RubyDung implements Runnable {
 
     /** Darkening overlay on the block being mined; opacity grows with progress. */
     private void renderBreakProgress() {
-        float x0 = breakX, x1 = breakX + 1f, y0 = breakY, y1 = breakY + 1f, z0 = breakZ, z1 = breakZ + 1f;
-        GL11.glEnable(GL11.GL_BLEND);
-        GL11.glBlendFunc(GL11.GL_SRC_ALPHA, GL11.GL_ONE_MINUS_SRC_ALPHA);
-        GL11.glColor4f(0f, 0f, 0f, 0.25f + breakProgress * 0.45f);
+        GL.set3DQuadPipeline(Pipelines.Pipeline.WORLD_TRANSLUCENT);
+        GL.glColor4f(0f, 0f, 0f, 0.25f + breakProgress * 0.45f);
         float s = 0.502f, cx = breakX + 0.5f, cy = breakY + 0.5f, cz = breakZ + 0.5f;
-        x0 = cx - s; x1 = cx + s; y0 = cy - s; y1 = cy + s; z0 = cz - s; z1 = cz + s;
-        GL11.glBegin(GL11.GL_QUADS);
-        GL11.glVertex3f(x0,y0,z1); GL11.glVertex3f(x1,y0,z1); GL11.glVertex3f(x1,y1,z1); GL11.glVertex3f(x0,y1,z1);
-        GL11.glVertex3f(x1,y0,z0); GL11.glVertex3f(x0,y0,z0); GL11.glVertex3f(x0,y1,z0); GL11.glVertex3f(x1,y1,z0);
-        GL11.glVertex3f(x0,y1,z1); GL11.glVertex3f(x1,y1,z1); GL11.glVertex3f(x1,y1,z0); GL11.glVertex3f(x0,y1,z0);
-        GL11.glVertex3f(x0,y0,z0); GL11.glVertex3f(x1,y0,z0); GL11.glVertex3f(x1,y0,z1); GL11.glVertex3f(x0,y0,z1);
-        GL11.glVertex3f(x0,y0,z0); GL11.glVertex3f(x0,y0,z1); GL11.glVertex3f(x0,y1,z1); GL11.glVertex3f(x0,y1,z0);
-        GL11.glVertex3f(x1,y0,z1); GL11.glVertex3f(x1,y0,z0); GL11.glVertex3f(x1,y1,z0); GL11.glVertex3f(x1,y1,z1);
-        GL11.glEnd();
-        GL11.glColor4f(1f, 1f, 1f, 1f);
-        GL11.glDisable(GL11.GL_BLEND);
+        float x0 = cx - s, x1 = cx + s, y0 = cy - s, y1 = cy + s, z0 = cz - s, z1 = cz + s;
+        GL.glBegin(GL.GL_QUADS);
+        GL.glVertex3f(x0,y0,z1); GL.glVertex3f(x1,y0,z1); GL.glVertex3f(x1,y1,z1); GL.glVertex3f(x0,y1,z1);
+        GL.glVertex3f(x1,y0,z0); GL.glVertex3f(x0,y0,z0); GL.glVertex3f(x0,y1,z0); GL.glVertex3f(x1,y1,z0);
+        GL.glVertex3f(x0,y1,z1); GL.glVertex3f(x1,y1,z1); GL.glVertex3f(x1,y1,z0); GL.glVertex3f(x0,y1,z0);
+        GL.glVertex3f(x0,y0,z0); GL.glVertex3f(x1,y0,z0); GL.glVertex3f(x1,y0,z1); GL.glVertex3f(x0,y0,z1);
+        GL.glVertex3f(x0,y0,z0); GL.glVertex3f(x0,y0,z1); GL.glVertex3f(x0,y1,z1); GL.glVertex3f(x0,y1,z0);
+        GL.glVertex3f(x1,y0,z1); GL.glVertex3f(x1,y0,z0); GL.glVertex3f(x1,y1,z0); GL.glVertex3f(x1,y1,z1);
+        GL.glEnd();
+        GL.set3DQuadPipeline(Pipelines.Pipeline.WORLD_OPAQUE);
     }
 
     public void render(float a) {
         handleInput(a);
 
+        // compute sky color for clear
+        float sunAngle = (float)(Math.cos(timeOfDay * Math.PI * 2));
+        float brightness = Math.max(0.05f, (sunAngle + 1) * 0.5f);
+        float sr = 0.5f * brightness, sg = 0.8f * brightness, sb = 1.0f * brightness;
+
         if (screen == -1) {
+            if (!renderer.beginFrame(sr, sg, sb)) return;
             renderMainMenu();
-            glfwSwapBuffers(window);
+            renderer.endFrame();
             return;
         }
         if (screen == 11) {
+            if (!renderer.beginFrame(0.05f, 0.05f, 0.05f)) return;
             renderLoadingScreen();
-            glfwSwapBuffers(window);
+            renderer.endFrame();
             return;
         }
         if (screen == 2 || screen == 3 || screen == 4 || screen == 5 || screen == 10) {
             if (player == null) {
-                float sa = (float)(Math.cos(timeOfDay * Math.PI * 2));
-                float br = Math.max(0.05f, (sa + 1) * 0.5f);
-                GL11.glClearColor(0.5f * br, 0.8f * br, 1.0f * br, 0);
-                GL11.glClear(GL11.GL_COLOR_BUFFER_BIT | GL11.GL_DEPTH_BUFFER_BIT);
+                if (!renderer.beginFrame(sr, sg, sb)) return;
                 if      (screen == 2)  renderSettingsMenu();
                 else if (screen == 5)  renderServerList();
                 else if (screen == 10) renderAddServer();
                 else if (screen == 3)  renderMultiplayerMenu();
                 else                   renderJoinScreen();
-                glfwSwapBuffers(window);
+                renderer.endFrame();
                 return;
             }
             // fall through to full 3D render path so game world shows behind menu
         }
         if (screen == 8 || screen == 9) {
-            // world-select / create-world share the animated menu backdrop
-            float sa = (float)(Math.cos(timeOfDay * Math.PI * 2));
-            float br = Math.max(0.05f, (sa + 1) * 0.5f);
-            GL11.glClearColor(0.5f * br, 0.8f * br, 1.0f * br, 0);
-            GL11.glClear(GL11.GL_COLOR_BUFFER_BIT | GL11.GL_DEPTH_BUFFER_BIT);
+            if (!renderer.beginFrame(sr, sg, sb)) return;
             if (screen == 8) renderWorldSelect(); else renderCreateWorld();
-            glfwSwapBuffers(window);
+            renderer.endFrame();
             return;
         }
 
-        float sunAngle = (float)(Math.cos(timeOfDay * Math.PI * 2));
-        float brightness = Math.max(0.05f, (sunAngle + 1) * 0.5f);
-        float sr = 0.5f * brightness, sg = 0.8f * brightness, sb = 1.0f * brightness;
-        GL11.glClearColor(sr, sg, sb, 0);
-        fogColor.put(0, sr).put(1, sg).put(2, sb).put(3, 1.0f);
-
-        GL11.glClear(GL11.GL_COLOR_BUFFER_BIT | GL11.GL_DEPTH_BUFFER_BIT);
+        if (!renderer.beginFrame(sr, sg, sb)) return;
         setupCamera(screen != 0 ? 1.0f : a);
-        GL11.glEnable(GL11.GL_CULL_FACE);
+
         float fogEnd = Settings.DIST_END[settings.renderDist];
-        GL11.glEnable(GL11.GL_FOG);
-        GL11.glFogi(GL11.GL_FOG_MODE, GL11.GL_LINEAR);
-        GL11.glFogf(GL11.GL_FOG_START, 0.0f);
-        GL11.glFogf(GL11.GL_FOG_END, fogEnd);
-        fogColor.rewind();
-        GL11.glFogfv(GL11.GL_FOG_COLOR, fogColor);
-        GL11.glHint(GL11.GL_FOG_HINT, GL11.GL_NICEST);
+        renderer.setFog(sr, sg, sb, 0.0f, fogEnd);
 
         levelRenderer.render(player, 0);
-
-        GL11.glEnable(GL11.GL_BLEND);
-        GL11.glBlendFunc(GL11.GL_SRC_ALPHA, GL11.GL_ONE_MINUS_SRC_ALPHA);
-        GL11.glDepthMask(false);
         levelRenderer.render(player, 1);
-        GL11.glDepthMask(true);
-        GL11.glDisable(GL11.GL_BLEND);
 
-        GL11.glDisable(GL11.GL_FOG);
-        GL11.glDisable(GL11.GL_TEXTURE_2D);
+        renderer.disableFog();
 
         particles.render(a);
 
@@ -716,11 +679,11 @@ public class RubyDung implements Runnable {
         else if (screen == 7) renderCrafting();
         else if (screen == 10) renderAddServer();
 
-        glfwSwapBuffers(window);
+        renderer.endFrame();
     }
 
     private void applyVsync() {
-        glfwSwapInterval(settings.vsync ? 1 : 0);
+        renderer.setVsync(settings.vsync);
     }
 
     private void applyDisplayMode() {
@@ -744,7 +707,7 @@ public class RubyDung implements Runnable {
         glfwGetFramebufferSize(window, fbw, fbh);
         if (fbw[0] > 0 && fbh[0] > 0) {
             width = fbw[0]; height = fbh[0];
-            GL11.glViewport(0, 0, width, height);
+            if (renderer != null) renderer.requestResize();
         }
     }
 
@@ -757,22 +720,18 @@ public class RubyDung implements Runnable {
 
     private void renderRemotePlayers(float a) {
         if (remotePlayers.isEmpty()) return;
-        GL11.glDisable(GL11.GL_TEXTURE_2D);
-        GL11.glDisable(GL11.GL_CULL_FACE);
+        GL.set3DQuadPipeline(Pipelines.Pipeline.WORLD_OPAQUE);
         for (var rp : remotePlayers.values()) {
             float rx = rp.xo + (rp.x - rp.xo) * a;
             float ry = rp.yo + (rp.y - rp.yo) * a;
             float rz = rp.zo + (rp.z - rp.zo) * a;
-            GL11.glPushMatrix();
-            // origin = eye height (y), model goes down from there
-            GL11.glTranslatef(rx, ry, rz);
-            GL11.glRotatef(-rp.yRot, 0, 1, 0);
+            renderer.push();
+            renderer.translate(rx, ry, rz);
+            renderer.rotate(-rp.yRot, 0, 1, 0);
             renderMinecraftModel();
-            GL11.glPopMatrix();
+            renderer.pop();
             renderNameTag(rx, ry + 0.75f, rz, rp.name);
         }
-        GL11.glEnable(GL11.GL_CULL_FACE);
-        GL11.glEnable(GL11.GL_TEXTURE_2D);
     }
 
     /**
@@ -783,88 +742,76 @@ public class RubyDung implements Runnable {
     private void renderMinecraftModel() {
         // all sizes in blocks (MC: 1 block = 16px, player = 32px tall)
         // head: 8px cube = 0.5 blocks, sits at eye-level ~ +0.1 to +0.6 above origin
-        GL11.glColor3f(0.95f, 0.78f, 0.62f); // skin tone
+        GL.glColor3f(0.95f, 0.78f, 0.62f); // skin tone
         drawBox(-0.25f, 0.1f, -0.25f,  0.25f, 0.6f, 0.25f);  // head
 
         // body: 8x12x4 px = 0.5 x 0.75 x 0.25
-        GL11.glColor3f(0.25f, 0.45f, 0.75f); // shirt
+        GL.glColor3f(0.25f, 0.45f, 0.75f); // shirt
         drawBox(-0.25f, -0.625f, -0.125f,  0.25f, 0.1f, 0.125f);
 
         // arms 4x12x4 px = 0.25 x 0.75 x 0.25
-        GL11.glColor3f(0.95f, 0.78f, 0.62f);
+        GL.glColor3f(0.95f, 0.78f, 0.62f);
         drawBox(-0.5f, -0.625f, -0.125f,  -0.25f, 0.1f, 0.125f);  // left arm
         drawBox( 0.25f,-0.625f, -0.125f,   0.5f,  0.1f, 0.125f);  // right arm
 
         // legs 4x12x4 px each
-        GL11.glColor3f(0.18f, 0.25f, 0.55f); // pants
+        GL.glColor3f(0.18f, 0.25f, 0.55f); // pants
         drawBox(-0.25f, -1.375f, -0.125f,  0f,    -0.625f, 0.125f); // left leg
         drawBox( 0f,    -1.375f, -0.125f,  0.25f, -0.625f, 0.125f); // right leg
     }
 
     private void drawBox(float x0, float y0, float z0, float x1, float y1, float z1) {
-        GL11.glBegin(GL11.GL_QUADS);
+        GL.glBegin(GL.GL_QUADS);
         // front
-        GL11.glVertex3f(x0,y0,z1); GL11.glVertex3f(x1,y0,z1); GL11.glVertex3f(x1,y1,z1); GL11.glVertex3f(x0,y1,z1);
+        GL.glVertex3f(x0,y0,z1); GL.glVertex3f(x1,y0,z1); GL.glVertex3f(x1,y1,z1); GL.glVertex3f(x0,y1,z1);
         // back
-        GL11.glVertex3f(x1,y0,z0); GL11.glVertex3f(x0,y0,z0); GL11.glVertex3f(x0,y1,z0); GL11.glVertex3f(x1,y1,z0);
+        GL.glVertex3f(x1,y0,z0); GL.glVertex3f(x0,y0,z0); GL.glVertex3f(x0,y1,z0); GL.glVertex3f(x1,y1,z0);
         // left
-        GL11.glVertex3f(x0,y0,z0); GL11.glVertex3f(x0,y0,z1); GL11.glVertex3f(x0,y1,z1); GL11.glVertex3f(x0,y1,z0);
+        GL.glVertex3f(x0,y0,z0); GL.glVertex3f(x0,y0,z1); GL.glVertex3f(x0,y1,z1); GL.glVertex3f(x0,y1,z0);
         // right
-        GL11.glVertex3f(x1,y0,z1); GL11.glVertex3f(x1,y0,z0); GL11.glVertex3f(x1,y1,z0); GL11.glVertex3f(x1,y1,z1);
+        GL.glVertex3f(x1,y0,z1); GL.glVertex3f(x1,y0,z0); GL.glVertex3f(x1,y1,z0); GL.glVertex3f(x1,y1,z1);
         // top
-        GL11.glVertex3f(x0,y1,z1); GL11.glVertex3f(x1,y1,z1); GL11.glVertex3f(x1,y1,z0); GL11.glVertex3f(x0,y1,z0);
+        GL.glVertex3f(x0,y1,z1); GL.glVertex3f(x1,y1,z1); GL.glVertex3f(x1,y1,z0); GL.glVertex3f(x0,y1,z0);
         // bottom
-        GL11.glVertex3f(x0,y0,z0); GL11.glVertex3f(x1,y0,z0); GL11.glVertex3f(x1,y0,z1); GL11.glVertex3f(x0,y0,z1);
-        GL11.glEnd();
+        GL.glVertex3f(x0,y0,z0); GL.glVertex3f(x1,y0,z0); GL.glVertex3f(x1,y0,z1); GL.glVertex3f(x0,y0,z1);
+        GL.glEnd();
     }
 
     private void renderNameTag(float x, float y, float z, String name) {
-        // billboard: face the camera
-        GL11.glPushMatrix();
-        GL11.glTranslatef(x, y, z);
-        // undo yaw so tag always faces camera
-        float[] m = new float[16];
-        FloatBuffer mb = MemoryUtil.memAllocFloat(16);
-        GL11.glGetFloatv(GL11.GL_MODELVIEW_MATRIX, mb);
-        for (int i = 0; i < 16; i++) m[i] = mb.get(i);
-        MemoryUtil.memFree(mb);
-        // reset rotation columns
-        m[0] = 1; m[1] = 0; m[2] = 0;
-        m[4] = 0; m[5] = 1; m[6] = 0;
-        m[8] = 0; m[9] = 0; m[10] = 1;
-        FloatBuffer mb2 = MemoryUtil.memAllocFloat(16);
-        mb2.put(m).flip();
-        GL11.glLoadMatrixf(mb2);
-        MemoryUtil.memFree(mb2);
-
-        GL11.glDisable(GL11.GL_DEPTH_TEST);
-        GL11.glEnable(GL11.GL_BLEND);
-        GL11.glBlendFunc(GL11.GL_SRC_ALPHA, GL11.GL_ONE_MINUS_SRC_ALPHA);
+        // billboard: face the camera by zeroing the rotation 3x3 of the modelView
+        renderer.push();
+        renderer.translate(x, y, z);
+        renderer.getModelView(nameTagMv);
+        // reset rotation 3x3 to identity (keep translation column)
+        nameTagMv.m00(1).m01(0).m02(0);
+        nameTagMv.m10(0).m11(1).m12(0);
+        nameTagMv.m20(0).m21(0).m22(1);
+        renderer.loadModelView(nameTagMv);
 
         int cw = 5, ch = 7, sp = 1;
         float scale = 0.01f;
         int tw = name.length() * (cw + sp);
         float hw = tw * scale / 2f;
 
-        // dark background
-        GL11.glColor4f(0f, 0f, 0f, 0.5f);
-        GL11.glBegin(GL11.GL_QUADS);
-        GL11.glVertex3f(-hw - 0.02f, -ch * scale - 0.01f, 0);
-        GL11.glVertex3f( hw + 0.02f, -ch * scale - 0.01f, 0);
-        GL11.glVertex3f( hw + 0.02f, 0.01f, 0);
-        GL11.glVertex3f(-hw - 0.02f, 0.01f, 0);
-        GL11.glEnd();
+        // dark background (3D quad, overlay pipeline so it ignores depth)
+        GL.set3DQuadPipeline(Pipelines.Pipeline.OVERLAY_3D);
+        GL.glColor4f(0f, 0f, 0f, 0.5f);
+        GL.glBegin(GL.GL_QUADS);
+        GL.glVertex3f(-hw - 0.02f, -ch * scale - 0.01f, 0);
+        GL.glVertex3f( hw + 0.02f, -ch * scale - 0.01f, 0);
+        GL.glVertex3f( hw + 0.02f, 0.01f, 0);
+        GL.glVertex3f(-hw - 0.02f, 0.01f, 0);
+        GL.glEnd();
 
         // text
-        GL11.glColor4f(1f, 1f, 1f, 1f);
-        GL11.glTranslatef(-hw, -ch * scale, 0);
-        GL11.glScalef(scale, scale, scale);
+        GL.glColor4f(1f, 1f, 1f, 1f);
+        renderer.translate(-hw, -ch * scale, 0);
+        renderer.scale(scale, scale, scale);
         for (int i = 0; i < name.length(); i++)
             drawChar(Character.toUpperCase(name.charAt(i)), i * (cw + sp), 0, cw, ch);
 
-        GL11.glEnable(GL11.GL_DEPTH_TEST);
-        GL11.glDisable(GL11.GL_BLEND);
-        GL11.glPopMatrix();
+        renderer.pop();
+        GL.set3DQuadPipeline(Pipelines.Pipeline.WORLD_OPAQUE);
     }
 
     private void renderMultiplayerMenu() {
@@ -895,15 +842,15 @@ public class RubyDung implements Runnable {
         drawButton(bx, by3, btnW, btnH, server != null || client != null ? "DISCONNECT" : "BACK", h3);
 
         if (!mpStatus.isEmpty()) {
-            GL11.glEnable(GL11.GL_BLEND);
-            GL11.glBlendFunc(GL11.GL_SRC_ALPHA, GL11.GL_ONE_MINUS_SRC_ALPHA);
-            GL11.glColor4f(1f, 1f, 0.4f, 1f);
+            GL.glEnable(GL.GL_BLEND);
+            GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA);
+            GL.glColor4f(1f, 1f, 0.4f, 1f);
             int sw = mpStatus.length() * 10;
             for (int i = 0; i < mpStatus.length(); i++)
                 drawChar(mpStatus.charAt(i), (width - sw) / 2 + i * 10, by3 + btnH + 14, 8, 12);
         }
 
-        GL11.glDisable(GL11.GL_BLEND);
+        GL.glDisable(GL.GL_BLEND);
 
         for (var e : Input.pollMouseEvents()) {
             if (e[0] == GLFW_MOUSE_BUTTON_1 && e[1] == GLFW_PRESS) {
@@ -959,14 +906,14 @@ public class RubyDung implements Runnable {
         drawButton(fx, by+fh+gap, fw, fh, "BACK",    hBack);
 
         if (!mpStatus.isEmpty()) {
-            GL11.glEnable(GL11.GL_BLEND);
-            GL11.glBlendFunc(GL11.GL_SRC_ALPHA, GL11.GL_ONE_MINUS_SRC_ALPHA);
-            GL11.glColor4f(1f, 0.4f, 0.4f, 1f);
+            GL.glEnable(GL.GL_BLEND);
+            GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA);
+            GL.glColor4f(1f, 0.4f, 0.4f, 1f);
             for (int i = 0; i < mpStatus.length(); i++)
                 drawChar(mpStatus.charAt(i), fx + i * 10, by + fh*2 + gap*2, 8, 12);
         }
 
-        GL11.glDisable(GL11.GL_BLEND);
+        GL.glDisable(GL.GL_BLEND);
         for (var e : Input.pollMouseEvents()) {
             if (e[0] == GLFW_MOUSE_BUTTON_1 && e[1] == GLFW_PRESS) {
                 if (hName) { editingName = true;  editingPort = false; }
@@ -1032,24 +979,24 @@ public class RubyDung implements Runnable {
             boolean hov = hover(mx, my, lx, ey, listW, entryH);
             boolean sel = idx == serverSelected;
 
-            GL11.glEnable(GL11.GL_BLEND);
-            GL11.glBlendFunc(GL11.GL_SRC_ALPHA, GL11.GL_ONE_MINUS_SRC_ALPHA);
-            GL11.glColor4f(1f, 1f, 1f, sel ? 0.25f : hov ? 0.15f : 0.08f);
-            GL11.glBegin(GL11.GL_QUADS);
-            GL11.glVertex2f(lx, ey); GL11.glVertex2f(lx+listW, ey);
-            GL11.glVertex2f(lx+listW, ey+entryH); GL11.glVertex2f(lx, ey+entryH);
-            GL11.glEnd();
-            GL11.glColor4f(1f, 1f, 1f, sel ? 1f : 0.4f);
-            GL11.glLineWidth(1f);
-            GL11.glBegin(GL11.GL_LINE_LOOP);
-            GL11.glVertex2f(lx+0.5f,ey+0.5f); GL11.glVertex2f(lx+listW-0.5f,ey+0.5f);
-            GL11.glVertex2f(lx+listW-0.5f,ey+entryH-0.5f); GL11.glVertex2f(lx+0.5f,ey+entryH-0.5f);
-            GL11.glEnd();
-            GL11.glColor4f(1f, 1f, 1f, 1f);
+            GL.glEnable(GL.GL_BLEND);
+            GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA);
+            GL.glColor4f(1f, 1f, 1f, sel ? 0.25f : hov ? 0.15f : 0.08f);
+            GL.glBegin(GL.GL_QUADS);
+            GL.glVertex2f(lx, ey); GL.glVertex2f(lx+listW, ey);
+            GL.glVertex2f(lx+listW, ey+entryH); GL.glVertex2f(lx, ey+entryH);
+            GL.glEnd();
+            GL.glColor4f(1f, 1f, 1f, sel ? 1f : 0.4f);
+            GL.glLineWidth(1f);
+            GL.glBegin(GL.GL_LINE_LOOP);
+            GL.glVertex2f(lx+0.5f,ey+0.5f); GL.glVertex2f(lx+listW-0.5f,ey+0.5f);
+            GL.glVertex2f(lx+listW-0.5f,ey+entryH-0.5f); GL.glVertex2f(lx+0.5f,ey+entryH-0.5f);
+            GL.glEnd();
+            GL.glColor4f(1f, 1f, 1f, 1f);
             String label = s[0];
             for (int ci = 0; ci < Math.min(label.length(), 30); ci++)
                 drawChar(label.charAt(ci), lx + 10 + ci * 10, ey + 7, 8, 12);
-            GL11.glColor4f(0.7f, 0.7f, 0.7f, 1f);
+            GL.glColor4f(0.7f, 0.7f, 0.7f, 1f);
             String addr = s[1];
             for (int ci = 0; ci < Math.min(addr.length(), 38); ci++)
                 drawChar(addr.charAt(ci), lx + 10 + ci * 8, ey + 22, 6, 10);
@@ -1057,7 +1004,7 @@ public class RubyDung implements Runnable {
 
         // empty list hint
         if (serverList.isEmpty()) {
-            GL11.glColor4f(0.6f, 0.6f, 0.6f, 1f);
+            GL.glColor4f(0.6f, 0.6f, 0.6f, 1f);
             String hint = "NO SERVERS  ADD ONE BELOW";
             int hw = hint.length() * 10;
             for (int i = 0; i < hint.length(); i++)
@@ -1087,15 +1034,15 @@ public class RubyDung implements Runnable {
 
         // status
         if (!mpStatus.isEmpty()) {
-            GL11.glEnable(GL11.GL_BLEND);
-            GL11.glBlendFunc(GL11.GL_SRC_ALPHA, GL11.GL_ONE_MINUS_SRC_ALPHA);
-            GL11.glColor4f(1f, 0.4f, 0.4f, 1f);
+            GL.glEnable(GL.GL_BLEND);
+            GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA);
+            GL.glColor4f(1f, 0.4f, 0.4f, 1f);
             int sw = mpStatus.length() * 10;
             for (int i = 0; i < mpStatus.length(); i++)
                 drawChar(mpStatus.charAt(i), (width - sw) / 2 + i * 10, btnY2 + btnH + 10, 8, 12);
         }
 
-        GL11.glDisable(GL11.GL_BLEND);
+        GL.glDisable(GL.GL_BLEND);
 
         for (var e : Input.pollMouseEvents()) {
             if (e[0] == GLFW_MOUSE_BUTTON_1 && e[1] == GLFW_PRESS) {
@@ -1196,25 +1143,25 @@ public class RubyDung implements Runnable {
                 }
             }
         }
-        GL11.glDisable(GL11.GL_BLEND);
+        GL.glDisable(GL.GL_BLEND);
         endOrtho();
     }
 
     private void drawInputField(int x, int y, int w, int h, String text, boolean focused) {
-        GL11.glEnable(GL11.GL_BLEND);
-        GL11.glBlendFunc(GL11.GL_SRC_ALPHA, GL11.GL_ONE_MINUS_SRC_ALPHA);
-        GL11.glColor4f(1f, 1f, 1f, focused ? 0.18f : 0.08f);
-        GL11.glBegin(GL11.GL_QUADS);
-        GL11.glVertex2f(x, y); GL11.glVertex2f(x+w, y);
-        GL11.glVertex2f(x+w, y+h); GL11.glVertex2f(x, y+h);
-        GL11.glEnd();
-        GL11.glColor4f(1f, 1f, 1f, focused ? 1f : 0.5f);
-        GL11.glLineWidth(focused ? 2f : 1f);
-        GL11.glBegin(GL11.GL_LINE_LOOP);
-        GL11.glVertex2f(x+0.5f, y+0.5f); GL11.glVertex2f(x+w-0.5f, y+0.5f);
-        GL11.glVertex2f(x+w-0.5f, y+h-0.5f); GL11.glVertex2f(x+0.5f, y+h-0.5f);
-        GL11.glEnd();
-        GL11.glColor4f(1f, 1f, 1f, 1f);
+        GL.glEnable(GL.GL_BLEND);
+        GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA);
+        GL.glColor4f(1f, 1f, 1f, focused ? 0.18f : 0.08f);
+        GL.glBegin(GL.GL_QUADS);
+        GL.glVertex2f(x, y); GL.glVertex2f(x+w, y);
+        GL.glVertex2f(x+w, y+h); GL.glVertex2f(x, y+h);
+        GL.glEnd();
+        GL.glColor4f(1f, 1f, 1f, focused ? 1f : 0.5f);
+        GL.glLineWidth(focused ? 2f : 1f);
+        GL.glBegin(GL.GL_LINE_LOOP);
+        GL.glVertex2f(x+0.5f, y+0.5f); GL.glVertex2f(x+w-0.5f, y+0.5f);
+        GL.glVertex2f(x+w-0.5f, y+h-0.5f); GL.glVertex2f(x+0.5f, y+h-0.5f);
+        GL.glEnd();
+        GL.glColor4f(1f, 1f, 1f, 1f);
         for (int i = 0; i < text.length(); i++)
             drawChar(text.charAt(i), x + 10 + i * 10, y + (h - 12) / 2, 8, 12);
     }
@@ -1249,8 +1196,8 @@ public class RubyDung implements Runnable {
 
     private void renderChat() {
         beginOrtho();
-        GL11.glEnable(GL11.GL_BLEND);
-        GL11.glBlendFunc(GL11.GL_SRC_ALPHA, GL11.GL_ONE_MINUS_SRC_ALPHA);
+        GL.glEnable(GL.GL_BLEND);
+        GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA);
 
         int lineH = fontRenderer.glyphH + 4, maxLines = 15, pad = 4;
         int hotbarTop = height - 40 - 10;
@@ -1268,34 +1215,34 @@ public class RubyDung implements Runnable {
             String line = msgs[i];
             int w = fontRenderer.stringWidth(line);
             int ly = baseY + (i - start) * lineH;
-            GL11.glColor4f(0, 0, 0, alpha * 0.5f);
-            GL11.glDisable(GL11.GL_TEXTURE_2D);
-            GL11.glBegin(GL11.GL_QUADS);
-            GL11.glVertex2f(pad, ly); GL11.glVertex2f(pad + w + 6, ly);
-            GL11.glVertex2f(pad + w + 6, ly + lineH); GL11.glVertex2f(pad, ly + lineH);
-            GL11.glEnd();
+            GL.glColor4f(0, 0, 0, alpha * 0.5f);
+            GL.glDisable(GL.GL_TEXTURE_2D);
+            GL.glBegin(GL.GL_QUADS);
+            GL.glVertex2f(pad, ly); GL.glVertex2f(pad + w + 6, ly);
+            GL.glVertex2f(pad + w + 6, ly + lineH); GL.glVertex2f(pad, ly + lineH);
+            GL.glEnd();
             fontRenderer.drawString(line, pad + 3, ly + 1, 1, 1, 1, alpha);
         }
 
         if (chatOpen) {
             String prompt = "> " + chatInput;
             int py = hotbarTop;
-            GL11.glDisable(GL11.GL_TEXTURE_2D);
-            GL11.glColor4f(0, 0, 0, 0.7f);
-            GL11.glBegin(GL11.GL_QUADS);
-            GL11.glVertex2f(pad, py); GL11.glVertex2f(width - pad, py);
-            GL11.glVertex2f(width - pad, py + lineH + 4); GL11.glVertex2f(pad, py + lineH + 4);
-            GL11.glEnd();
+            GL.glDisable(GL.GL_TEXTURE_2D);
+            GL.glColor4f(0, 0, 0, 0.7f);
+            GL.glBegin(GL.GL_QUADS);
+            GL.glVertex2f(pad, py); GL.glVertex2f(width - pad, py);
+            GL.glVertex2f(width - pad, py + lineH + 4); GL.glVertex2f(pad, py + lineH + 4);
+            GL.glEnd();
             fontRenderer.drawString(prompt, pad + 3, py + 2, 1, 1, 1, 1);
         }
 
-        GL11.glDisable(GL11.GL_BLEND);
+        GL.glDisable(GL.GL_BLEND);
         endOrtho();
     }
 
     private void drawSmallText(String text, int x, int y) {
         int charW = 6, charH = 8, sp = 7;
-        GL11.glColor4f(1,1,1,1);
+        GL.glColor4f(1,1,1,1);
         for (int i = 0; i < text.length(); i++)
             drawChar(Character.toUpperCase(text.charAt(i)), x + i * sp, y, charW, charH);
     }
@@ -1315,18 +1262,18 @@ public class RubyDung implements Runnable {
         int panH = 30 + rows * (cellH + cellGap) + cellGap;
         int px = (width - panW) / 2, py = 10;
 
-        GL11.glEnable(GL11.GL_BLEND);
-        GL11.glBlendFunc(GL11.GL_SRC_ALPHA, GL11.GL_ONE_MINUS_SRC_ALPHA);
+        GL.glEnable(GL.GL_BLEND);
+        GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA);
 
         // background panel
-        GL11.glColor4f(0, 0, 0, 0.7f);
-        GL11.glBegin(GL11.GL_QUADS);
-        GL11.glVertex2f(px, py); GL11.glVertex2f(px + panW, py);
-        GL11.glVertex2f(px + panW, py + panH); GL11.glVertex2f(px, py + panH);
-        GL11.glEnd();
+        GL.glColor4f(0, 0, 0, 0.7f);
+        GL.glBegin(GL.GL_QUADS);
+        GL.glVertex2f(px, py); GL.glVertex2f(px + panW, py);
+        GL.glVertex2f(px + panW, py + panH); GL.glVertex2f(px, py + panH);
+        GL.glEnd();
 
         // header
-        GL11.glColor4f(1, 1, 1, 1);
+        GL.glColor4f(1, 1, 1, 1);
         String header = players.size() + " player" + (players.size() != 1 ? "s" : "") + " online";
         drawSmallText(header, px + panW / 2 - header.length() * 4, py + 8);
 
@@ -1335,16 +1282,16 @@ public class RubyDung implements Runnable {
             int col = i % cols, row = i / cols;
             int cx = px + cellGap + col * (cellW + cellGap);
             int cy = py + 28 + row * (cellH + cellGap);
-            GL11.glColor4f(0.4f, 0.4f, 0.4f, 0.8f);
-            GL11.glBegin(GL11.GL_QUADS);
-            GL11.glVertex2f(cx, cy); GL11.glVertex2f(cx + cellW, cy);
-            GL11.glVertex2f(cx + cellW, cy + cellH); GL11.glVertex2f(cx, cy + cellH);
-            GL11.glEnd();
-            GL11.glColor4f(1, 1, 1, 1);
+            GL.glColor4f(0.4f, 0.4f, 0.4f, 0.8f);
+            GL.glBegin(GL.GL_QUADS);
+            GL.glVertex2f(cx, cy); GL.glVertex2f(cx + cellW, cy);
+            GL.glVertex2f(cx + cellW, cy + cellH); GL.glVertex2f(cx, cy + cellH);
+            GL.glEnd();
+            GL.glColor4f(1, 1, 1, 1);
             drawSmallText(players.get(i), cx + 6, cy + (cellH - 8) / 2);
         }
 
-        GL11.glDisable(GL11.GL_BLEND);
+        GL.glDisable(GL.GL_BLEND);
         endOrtho();
     }
 
@@ -1367,8 +1314,8 @@ public class RubyDung implements Runnable {
 
         int mx = mouseScreenX(), my = mouseScreenY();
 
-        GL11.glEnable(GL11.GL_BLEND);
-        GL11.glBlendFunc(GL11.GL_SRC_ALPHA, GL11.GL_ONE_MINUS_SRC_ALPHA);
+        GL.glEnable(GL.GL_BLEND);
+        GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA);
 
         for (int row = 0; row < 4; row++) {
             int y = invY + row * (slotSize + gap + 2) + (row == 3 ? 10 : 0);
@@ -1378,17 +1325,17 @@ public class RubyDung implements Runnable {
                 boolean sel = slotIdx < 9 && slotIdx == selectedSlot;
                 boolean hov = hover(mx, my, x, y, slotSize, slotSize);
 
-                GL11.glColor4f(1, 1, 1, sel ? 0.5f : hov ? 0.3f : 0.15f);
-                GL11.glBegin(GL11.GL_QUADS);
-                GL11.glVertex2f(x, y); GL11.glVertex2f(x + slotSize, y);
-                GL11.glVertex2f(x + slotSize, y + slotSize); GL11.glVertex2f(x, y + slotSize);
-                GL11.glEnd();
-                GL11.glColor4f(1, 1, 1, sel || hov ? 1f : 0.4f);
-                GL11.glLineWidth(sel || hov ? 2f : 1f);
-                GL11.glBegin(GL11.GL_LINE_LOOP);
-                GL11.glVertex2f(x + 0.5f, y + 0.5f); GL11.glVertex2f(x + slotSize - 0.5f, y + 0.5f);
-                GL11.glVertex2f(x + slotSize - 0.5f, y + slotSize - 0.5f); GL11.glVertex2f(x + 0.5f, y + slotSize - 0.5f);
-                GL11.glEnd();
+                GL.glColor4f(1, 1, 1, sel ? 0.5f : hov ? 0.3f : 0.15f);
+                GL.glBegin(GL.GL_QUADS);
+                GL.glVertex2f(x, y); GL.glVertex2f(x + slotSize, y);
+                GL.glVertex2f(x + slotSize, y + slotSize); GL.glVertex2f(x, y + slotSize);
+                GL.glEnd();
+                GL.glColor4f(1, 1, 1, sel || hov ? 1f : 0.4f);
+                GL.glLineWidth(sel || hov ? 2f : 1f);
+                GL.glBegin(GL.GL_LINE_LOOP);
+                GL.glVertex2f(x + 0.5f, y + 0.5f); GL.glVertex2f(x + slotSize - 0.5f, y + 0.5f);
+                GL.glVertex2f(x + slotSize - 0.5f, y + slotSize - 0.5f); GL.glVertex2f(x + 0.5f, y + slotSize - 0.5f);
+                GL.glEnd();
             }
         }
 
@@ -1402,7 +1349,7 @@ public class RubyDung implements Runnable {
         boolean hClose = hover(mx, my, (width - 120) / 2, closeY, 120, 30);
         drawButton((width - 120) / 2, closeY, 120, 30, "CLOSE", hClose);
 
-        GL11.glDisable(GL11.GL_BLEND);
+        GL.glDisable(GL.GL_BLEND);
 
         for (var e : Input.pollMouseEvents()) {
             if (e[0] == GLFW_MOUSE_BUTTON_1 && e[1] == GLFW_PRESS) {
@@ -1425,8 +1372,8 @@ public class RubyDung implements Runnable {
 
         craftOutput = checkCraft();
 
-        GL11.glEnable(GL11.GL_BLEND);
-        GL11.glBlendFunc(GL11.GL_SRC_ALPHA, GL11.GL_ONE_MINUS_SRC_ALPHA);
+        GL.glEnable(GL.GL_BLEND);
+        GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA);
 
         // draw 2x2 craft grid
         for (int row = 0; row < 2; row++) {
@@ -1434,16 +1381,16 @@ public class RubyDung implements Runnable {
                 int sx = gridX + col * (slotSize + gap);
                 int sy = gridY + row * (slotSize + gap);
                 boolean hov = hover(mx, my, sx, sy, slotSize, slotSize);
-                GL11.glColor4f(1,1,1, hov ? 0.3f : 0.15f);
-                GL11.glBegin(GL11.GL_QUADS);
-                GL11.glVertex2f(sx,sy); GL11.glVertex2f(sx+slotSize,sy);
-                GL11.glVertex2f(sx+slotSize,sy+slotSize); GL11.glVertex2f(sx,sy+slotSize);
-                GL11.glEnd();
-                GL11.glColor4f(1,1,1,0.8f);
-                GL11.glBegin(GL11.GL_LINE_LOOP);
-                GL11.glVertex2f(sx+0.5f,sy+0.5f); GL11.glVertex2f(sx+slotSize-0.5f,sy+0.5f);
-                GL11.glVertex2f(sx+slotSize-0.5f,sy+slotSize-0.5f); GL11.glVertex2f(sx+0.5f,sy+slotSize-0.5f);
-                GL11.glEnd();
+                GL.glColor4f(1,1,1, hov ? 0.3f : 0.15f);
+                GL.glBegin(GL.GL_QUADS);
+                GL.glVertex2f(sx,sy); GL.glVertex2f(sx+slotSize,sy);
+                GL.glVertex2f(sx+slotSize,sy+slotSize); GL.glVertex2f(sx,sy+slotSize);
+                GL.glEnd();
+                GL.glColor4f(1,1,1,0.8f);
+                GL.glBegin(GL.GL_LINE_LOOP);
+                GL.glVertex2f(sx+0.5f,sy+0.5f); GL.glVertex2f(sx+slotSize-0.5f,sy+0.5f);
+                GL.glVertex2f(sx+slotSize-0.5f,sy+slotSize-0.5f); GL.glVertex2f(sx+0.5f,sy+slotSize-0.5f);
+                GL.glEnd();
                 byte block = craftGrid[row][col];
                 if (block != 0) drawSmallText(String.valueOf(block), sx + 4, sy + 4);
             }
@@ -1457,19 +1404,19 @@ public class RubyDung implements Runnable {
         // output slot
         int outX = arrowX + 30, outY = gridY + gap / 2;
         boolean hOut = hover(mx, my, outX, outY, slotSize, slotSize * 2 + gap);
-        GL11.glColor4f(1,1,1, hOut && craftOutput != 0 ? 0.4f : 0.15f);
-        GL11.glBegin(GL11.GL_QUADS);
-        GL11.glVertex2f(outX, outY); GL11.glVertex2f(outX+slotSize, outY);
-        GL11.glVertex2f(outX+slotSize, outY+slotSize); GL11.glVertex2f(outX, outY+slotSize);
-        GL11.glEnd();
-        GL11.glColor4f(1,1,1,0.8f);
-        GL11.glBegin(GL11.GL_LINE_LOOP);
-        GL11.glVertex2f(outX+0.5f,outY+0.5f); GL11.glVertex2f(outX+slotSize-0.5f,outY+0.5f);
-        GL11.glVertex2f(outX+slotSize-0.5f,outY+slotSize-0.5f); GL11.glVertex2f(outX+0.5f,outY+slotSize-0.5f);
-        GL11.glEnd();
+        GL.glColor4f(1,1,1, hOut && craftOutput != 0 ? 0.4f : 0.15f);
+        GL.glBegin(GL.GL_QUADS);
+        GL.glVertex2f(outX, outY); GL.glVertex2f(outX+slotSize, outY);
+        GL.glVertex2f(outX+slotSize, outY+slotSize); GL.glVertex2f(outX, outY+slotSize);
+        GL.glEnd();
+        GL.glColor4f(1,1,1,0.8f);
+        GL.glBegin(GL.GL_LINE_LOOP);
+        GL.glVertex2f(outX+0.5f,outY+0.5f); GL.glVertex2f(outX+slotSize-0.5f,outY+0.5f);
+        GL.glVertex2f(outX+slotSize-0.5f,outY+slotSize-0.5f); GL.glVertex2f(outX+0.5f,outY+slotSize-0.5f);
+        GL.glEnd();
         if (craftOutput != 0) drawSmallText(String.valueOf(craftOutput), outX + 4, outY + 4);
 
-        GL11.glDisable(GL11.GL_BLEND);
+        GL.glDisable(GL.GL_BLEND);
 
         for (var e : Input.pollMouseEvents()) {
             if (e[0] == GLFW_MOUSE_BUTTON_1 && e[1] == GLFW_PRESS) {
@@ -1505,7 +1452,7 @@ public class RubyDung implements Runnable {
         String text = "FPS " + displayFps;
         int x = 10, y = 10;
         int charW = 12, charH = 16;
-        GL11.glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
+        GL.glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
         for (int i = 0; i < text.length(); i++) {
             drawChar(text.charAt(i), x + i * (charW + 3), y, charW, charH);
         }
@@ -1517,24 +1464,24 @@ public class RubyDung implements Runnable {
         int slots = 9, slotSize = 40, gap = 2;
         int totalW = slots * (slotSize + gap) - gap;
         int startX = (width - totalW) / 2, y = height - slotSize - 10;
-        GL11.glEnable(GL11.GL_BLEND);
-        GL11.glBlendFunc(GL11.GL_SRC_ALPHA, GL11.GL_ONE_MINUS_SRC_ALPHA);
+        GL.glEnable(GL.GL_BLEND);
+        GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA);
         for (int i = 0; i < slots; i++) {
             int x = startX + i * (slotSize + gap);
             boolean sel = i == selectedSlot;
-            GL11.glColor4f(1, 1, 1, sel ? 0.5f : 0.2f);
-            GL11.glBegin(GL11.GL_QUADS);
-            GL11.glVertex2f(x, y); GL11.glVertex2f(x + slotSize, y);
-            GL11.glVertex2f(x + slotSize, y + slotSize); GL11.glVertex2f(x, y + slotSize);
-            GL11.glEnd();
-            GL11.glColor4f(1, 1, 1, sel ? 1f : 0.5f);
-            GL11.glLineWidth(sel ? 2f : 1f);
-            GL11.glBegin(GL11.GL_LINE_LOOP);
-            GL11.glVertex2f(x + 0.5f, y + 0.5f); GL11.glVertex2f(x + slotSize - 0.5f, y + 0.5f);
-            GL11.glVertex2f(x + slotSize - 0.5f, y + slotSize - 0.5f); GL11.glVertex2f(x + 0.5f, y + slotSize - 0.5f);
-            GL11.glEnd();
+            GL.glColor4f(1, 1, 1, sel ? 0.5f : 0.2f);
+            GL.glBegin(GL.GL_QUADS);
+            GL.glVertex2f(x, y); GL.glVertex2f(x + slotSize, y);
+            GL.glVertex2f(x + slotSize, y + slotSize); GL.glVertex2f(x, y + slotSize);
+            GL.glEnd();
+            GL.glColor4f(1, 1, 1, sel ? 1f : 0.5f);
+            GL.glLineWidth(sel ? 2f : 1f);
+            GL.glBegin(GL.GL_LINE_LOOP);
+            GL.glVertex2f(x + 0.5f, y + 0.5f); GL.glVertex2f(x + slotSize - 0.5f, y + 0.5f);
+            GL.glVertex2f(x + slotSize - 0.5f, y + slotSize - 0.5f); GL.glVertex2f(x + 0.5f, y + slotSize - 0.5f);
+            GL.glEnd();
         }
-        GL11.glDisable(GL11.GL_BLEND);
+        GL.glDisable(GL.GL_BLEND);
         endOrtho();
     }
 
@@ -1542,29 +1489,29 @@ public class RubyDung implements Runnable {
         beginOrtho();
         int cx = width / 2, cy = height / 2;
         int s = 10, t = 2;
-        GL11.glEnable(GL11.GL_BLEND);
-        GL11.glBlendFunc(GL11.GL_ONE_MINUS_DST_COLOR, GL11.GL_ZERO);
-        GL11.glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
-        GL11.glBegin(GL11.GL_QUADS);
+        GL.glEnable(GL.GL_BLEND);
+        GL.glBlendFunc(GL.GL_ONE_MINUS_DST_COLOR, GL.GL_ZERO);
+        GL.glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
+        GL.glBegin(GL.GL_QUADS);
         // horizontal
-        GL11.glVertex2f(cx - s, cy - t); GL11.glVertex2f(cx + s, cy - t);
-        GL11.glVertex2f(cx + s, cy + t); GL11.glVertex2f(cx - s, cy + t);
+        GL.glVertex2f(cx - s, cy - t); GL.glVertex2f(cx + s, cy - t);
+        GL.glVertex2f(cx + s, cy + t); GL.glVertex2f(cx - s, cy + t);
         // vertical
-        GL11.glVertex2f(cx - t, cy - s); GL11.glVertex2f(cx + t, cy - s);
-        GL11.glVertex2f(cx + t, cy + s); GL11.glVertex2f(cx - t, cy + s);
-        GL11.glEnd();
-        GL11.glDisable(GL11.GL_BLEND);
+        GL.glVertex2f(cx - t, cy - s); GL.glVertex2f(cx + t, cy - s);
+        GL.glVertex2f(cx + t, cy + s); GL.glVertex2f(cx - t, cy + s);
+        GL.glEnd();
+        GL.glDisable(GL.GL_BLEND);
         endOrtho();
     }
 
     private void renderOverlay() {
-        GL11.glEnable(GL11.GL_BLEND);
-        GL11.glBlendFunc(GL11.GL_SRC_ALPHA, GL11.GL_ONE_MINUS_SRC_ALPHA);
-        GL11.glColor4f(0.0f, 0.0f, 0.0f, 0.6f);
-        GL11.glBegin(GL11.GL_QUADS);
-        GL11.glVertex2f(0, 0); GL11.glVertex2f(width, 0);
-        GL11.glVertex2f(width, height); GL11.glVertex2f(0, height);
-        GL11.glEnd();
+        GL.glEnable(GL.GL_BLEND);
+        GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA);
+        GL.glColor4f(0.0f, 0.0f, 0.0f, 0.6f);
+        GL.glBegin(GL.GL_QUADS);
+        GL.glVertex2f(0, 0); GL.glVertex2f(width, 0);
+        GL.glVertex2f(width, height); GL.glVertex2f(0, height);
+        GL.glEnd();
     }
 
     /** Open (and create if missing) a named world folder. */
@@ -1653,67 +1600,59 @@ public class RubyDung implements Runnable {
     }
 
     private void renderLoadingScreen() {
-        GL11.glClearColor(0.05f, 0.05f, 0.05f, 1f);
-        GL11.glClear(GL11.GL_COLOR_BUFFER_BIT | GL11.GL_DEPTH_BUFFER_BIT);
         beginOrtho();
-        GL11.glEnable(GL11.GL_BLEND);
-        GL11.glBlendFunc(GL11.GL_SRC_ALPHA, GL11.GL_ONE_MINUS_SRC_ALPHA);
+        GL.glEnable(GL.GL_BLEND);
+        GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA);
 
         // progress bar background
         int barW = 400, barH = 12;
         int barX = (width - barW) / 2, barY = height / 2 + 20;
-        GL11.glColor4f(1f, 1f, 1f, 0.15f);
-        GL11.glBegin(GL11.GL_QUADS);
-        GL11.glVertex2f(barX, barY); GL11.glVertex2f(barX+barW, barY);
-        GL11.glVertex2f(barX+barW, barY+barH); GL11.glVertex2f(barX, barY+barH);
-        GL11.glEnd();
+        GL.glColor4f(1f, 1f, 1f, 0.15f);
+        GL.glBegin(GL.GL_QUADS);
+        GL.glVertex2f(barX, barY); GL.glVertex2f(barX+barW, barY);
+        GL.glVertex2f(barX+barW, barY+barH); GL.glVertex2f(barX, barY+barH);
+        GL.glEnd();
         // animated fill
         float fill = (System.currentTimeMillis() % 2000) / 2000f;
-        GL11.glColor4f(0.3f, 0.7f, 1f, 0.9f);
-        GL11.glBegin(GL11.GL_QUADS);
-        GL11.glVertex2f(barX, barY); GL11.glVertex2f(barX + barW * fill, barY);
-        GL11.glVertex2f(barX + barW * fill, barY+barH); GL11.glVertex2f(barX, barY+barH);
-        GL11.glEnd();
+        GL.glColor4f(0.3f, 0.7f, 1f, 0.9f);
+        GL.glBegin(GL.GL_QUADS);
+        GL.glVertex2f(barX, barY); GL.glVertex2f(barX + barW * fill, barY);
+        GL.glVertex2f(barX + barW * fill, barY+barH); GL.glVertex2f(barX, barY+barH);
+        GL.glEnd();
 
         drawTitle("RUBYDUNG", height / 2 - 80);
 
-        GL11.glColor4f(0.8f, 0.8f, 0.8f, 1f);
+        GL.glColor4f(0.8f, 0.8f, 0.8f, 1f);
         String s = loadingStatus;
         int sw = s.length() * 10;
         for (int i = 0; i < s.length(); i++)
             drawChar(s.charAt(i), (width - sw) / 2 + i * 10, height / 2 + 42, 8, 12);
 
-        GL11.glDisable(GL11.GL_BLEND);
+        GL.glDisable(GL.GL_BLEND);
         endOrtho();
     }
 
     private void renderMainMenu() {
-        // animated sky gradient
-        float sunAngle = (float)(Math.cos(timeOfDay * Math.PI * 2));
-        float bright = Math.max(0.05f, (sunAngle + 1) * 0.5f);
-        GL11.glClearColor(0.5f * bright, 0.8f * bright, 1.0f * bright, 0);
-        GL11.glClear(GL11.GL_COLOR_BUFFER_BIT | GL11.GL_DEPTH_BUFFER_BIT);
-
         beginOrtho();
 
         // background quad (sky tinted)
-        GL11.glEnable(GL11.GL_BLEND);
-        GL11.glBlendFunc(GL11.GL_SRC_ALPHA, GL11.GL_ONE_MINUS_SRC_ALPHA);
-        GL11.glColor4f(0f, 0f, 0f, 0.35f);
-        GL11.glBegin(GL11.GL_QUADS);
-        GL11.glVertex2f(0, 0); GL11.glVertex2f(width, 0);
-        GL11.glVertex2f(width, height); GL11.glVertex2f(0, height);
-        GL11.glEnd();
+        GL.glEnable(GL.GL_BLEND);
+        GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA);
+        GL.glColor4f(0f, 0f, 0f, 0.35f);
+        GL.glBegin(GL.GL_QUADS);
+        GL.glVertex2f(0, 0); GL.glVertex2f(width, 0);
+        GL.glVertex2f(width, height); GL.glVertex2f(0, height);
+        GL.glEnd();
 
         // logo shadow
         int logoY = height / 2 - 200;
         int cw = 28, ch = 38, sp = 5;
         String logo = "RUBYDUNG";
         int tw = logo.length() * (cw + sp);
-        GL11.glColor4f(0.1f, 0.1f, 0.1f, 0.8f);
+        GL.glColor4f(0.1f, 0.1f, 0.1f, 0.8f);
         for (int i = 0; i < logo.length(); i++)
             drawChar(logo.charAt(i), (width - tw) / 2 + i * (cw + sp) + 3, logoY + 3, cw, ch);
-        GL11.glColor4f(1.0f, 0.85f, 0.3f, 1.0f);
+        GL.glColor4f(1.0f, 0.85f, 0.3f, 1.0f);
         for (int i = 0; i < logo.length(); i++)
             drawChar(logo.charAt(i), (width - tw) / 2 + i * (cw + sp), logoY, cw, ch);
 
@@ -1733,7 +1672,7 @@ public class RubyDung implements Runnable {
         drawButton(bx, by0+(btnH+gap)*3, btnW, btnH, "QUIT",         h4);
 
         // version strings
-        GL11.glColor4f(1f, 1f, 1f, 0.7f);
+        GL.glColor4f(1f, 1f, 1f, 0.7f);
         String ver = "RUBYDUNG ALPHA 0.1";
         for (int i = 0; i < ver.length(); i++)
             drawChar(ver.charAt(i), 8 + i * 11, height - 22, 8, 12);
@@ -1758,7 +1697,7 @@ public class RubyDung implements Runnable {
             }
         }
 
-        GL11.glDisable(GL11.GL_BLEND);
+        GL.glDisable(GL.GL_BLEND);
         endOrtho();
     }
 
@@ -1787,7 +1726,7 @@ public class RubyDung implements Runnable {
             if (hDel) clickedDel = idx;
         }
         if (worldList.isEmpty()) {
-            GL11.glColor4f(1f, 1f, 1f, 0.7f);
+            GL.glColor4f(1f, 1f, 1f, 0.7f);
             drawSmallText("NO WORLDS YET - CREATE ONE", bx + 20, top + 10);
         }
 
@@ -1797,7 +1736,7 @@ public class RubyDung implements Runnable {
         drawButton(width/2 - btnW - 10, by, btnW, btnH, "CREATE NEW", hNew);
         drawButton(width/2 + 10,        by, btnW, btnH, "BACK", hBack);
 
-        GL11.glDisable(GL11.GL_BLEND);
+        GL.glDisable(GL.GL_BLEND);
 
         double scroll = Input.consumeScroll();
         if (scroll != 0 && worldList.size() > maxRows) {
@@ -1828,7 +1767,7 @@ public class RubyDung implements Runnable {
 
         int nameY = height / 2 - 70;
         int seedY = height / 2;
-        GL11.glColor4f(1f, 1f, 1f, 0.8f);
+        GL.glColor4f(1f, 1f, 1f, 0.8f);
         drawSmallText("WORLD NAME", fx, nameY - 18);
         drawInputField(fx, nameY, fw, 34, createName.isEmpty() ? "NEW WORLD" : createName, editCreateName);
         drawSmallText("SEED  (BLANK = RANDOM)", fx, seedY - 18);
@@ -1843,7 +1782,7 @@ public class RubyDung implements Runnable {
         boolean hName = hover(mx, my, fx, nameY, fw, 34);
         boolean hSeed = hover(mx, my, fx, seedY, fw, 34);
 
-        GL11.glDisable(GL11.GL_BLEND);
+        GL.glDisable(GL.GL_BLEND);
 
         var events = Input.pollMouseEvents();
         if (menuCooldown > 0) { menuCooldown--; events.clear(); }
@@ -1885,7 +1824,7 @@ public class RubyDung implements Runnable {
         drawButton(bx, by4, btnW, btnH, "SAVE & QUIT TO MENU", h4);
         drawButton(bx, by5, btnW, btnH, "QUIT GAME", h5);
 
-        GL11.glDisable(GL11.GL_BLEND);
+        GL.glDisable(GL.GL_BLEND);
 
         for (var e : Input.pollMouseEvents()) {
             if (e[0] == GLFW_MOUSE_BUTTON_1 && e[1] == GLFW_PRESS) {
@@ -1948,7 +1887,7 @@ public class RubyDung implements Runnable {
         }
         drawButton(bx, by + unit*r, btnW, btnH, "BACK", hBack);
 
-        GL11.glDisable(GL11.GL_BLEND);
+        GL.glDisable(GL.GL_BLEND);
 
         for (var e : Input.pollMouseEvents()) {
             if (e[0] == GLFW_MOUSE_BUTTON_1 && e[1] == GLFW_PRESS) {
@@ -1975,66 +1914,58 @@ public class RubyDung implements Runnable {
     private void drawTitle(String title, int y) {
         int cw = 30, ch = 42, sp = 5;
         int tw = title.length() * (cw + sp);
-        GL11.glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
+        GL.glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
         for (int i = 0; i < title.length(); i++)
             drawChar(title.charAt(i), (width - tw) / 2 + i * (cw + sp), y, cw, ch);
     }
 
     private void drawButton(int x, int y, int w, int h, String label, boolean hover) {
-        GL11.glEnable(GL11.GL_BLEND);
-        GL11.glBlendFunc(GL11.GL_SRC_ALPHA, GL11.GL_ONE_MINUS_SRC_ALPHA);
+        GL.glEnable(GL.GL_BLEND);
+        GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA);
 
         // fill
-        if (hover) GL11.glColor4f(1.0f, 1.0f, 1.0f, 0.18f);
-        else       GL11.glColor4f(1.0f, 1.0f, 1.0f, 0.08f);
-        GL11.glBegin(GL11.GL_QUADS);
-        GL11.glVertex2f(x,     y);
-        GL11.glVertex2f(x + w, y);
-        GL11.glVertex2f(x + w, y + h);
-        GL11.glVertex2f(x,     y + h);
-        GL11.glEnd();
+        if (hover) GL.glColor4f(1.0f, 1.0f, 1.0f, 0.18f);
+        else       GL.glColor4f(1.0f, 1.0f, 1.0f, 0.08f);
+        GL.glBegin(GL.GL_QUADS);
+        GL.glVertex2f(x,     y);
+        GL.glVertex2f(x + w, y);
+        GL.glVertex2f(x + w, y + h);
+        GL.glVertex2f(x,     y + h);
+        GL.glEnd();
 
         // border
-        GL11.glColor4f(1.0f, 1.0f, 1.0f, hover ? 1.0f : 0.6f);
-        GL11.glLineWidth(hover ? 2.0f : 1.0f);
-        GL11.glBegin(GL11.GL_LINE_LOOP);
-        GL11.glVertex2f(x + 0.5f,     y + 0.5f);
-        GL11.glVertex2f(x + w - 0.5f, y + 0.5f);
-        GL11.glVertex2f(x + w - 0.5f, y + h - 0.5f);
-        GL11.glVertex2f(x + 0.5f,     y + h - 0.5f);
-        GL11.glEnd();
+        GL.glColor4f(1.0f, 1.0f, 1.0f, hover ? 1.0f : 0.6f);
+        GL.glLineWidth(hover ? 2.0f : 1.0f);
+        GL.glBegin(GL.GL_LINE_LOOP);
+        GL.glVertex2f(x + 0.5f,     y + 0.5f);
+        GL.glVertex2f(x + w - 0.5f, y + 0.5f);
+        GL.glVertex2f(x + w - 0.5f, y + h - 0.5f);
+        GL.glVertex2f(x + 0.5f,     y + h - 0.5f);
+        GL.glEnd();
 
         // label
         int charW = 18, charH = 26;
         int spacing = charW + 3;
         int textW = label.length() * spacing;
-        GL11.glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
+        GL.glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
         for (int i = 0; i < label.length(); i++) {
             drawChar(label.charAt(i), x + (w - textW) / 2 + i * spacing, y + (h - charH) / 2, charW, charH);
         }
     }
 
     private void beginOrtho() {
-        GL11.glMatrixMode(GL11.GL_PROJECTION);
-        GL11.glPushMatrix();
-        GL11.glLoadIdentity();
-        GL11.glOrtho(0, width, height, 0, -1, 1);
-        GL11.glMatrixMode(GL11.GL_MODELVIEW);
-        GL11.glPushMatrix();
-        GL11.glLoadIdentity();
-        GL11.glDisable(GL11.GL_DEPTH_TEST);
-        GL11.glDisable(GL11.GL_TEXTURE_2D);
-        GL11.glDisable(GL11.GL_CULL_FACE);
-        GL11.glDisable(GL11.GL_FOG);
-        GL11.glDisable(GL11.GL_LIGHTING);
+        renderer.push();
+        renderer.getProjection(savedProj);
+        renderer.setOrtho(width, height);
+        renderer.loadIdentity();
+        renderer.disableFog();
+        GL.setOrtho(true);
     }
 
     private void endOrtho() {
-        GL11.glEnable(GL11.GL_DEPTH_TEST);
-        GL11.glMatrixMode(GL11.GL_PROJECTION);
-        GL11.glPopMatrix();
-        GL11.glMatrixMode(GL11.GL_MODELVIEW);
-        GL11.glPopMatrix();
+        GL.setOrtho(false);
+        renderer.setProjection(savedProj);
+        renderer.pop();
     }
 
     /** 5x7 bitmap font. Bit 4 = leftmost pixel. */
@@ -2110,20 +2041,20 @@ public class RubyDung implements Runnable {
         int pixW = Math.max(w / 5, 1);
         int pixH = Math.max(h / 7, 1);
 
-        GL11.glBegin(GL11.GL_QUADS);
+        GL.glBegin(GL.GL_QUADS);
         for (int row = 0; row < 7; row++) {
             for (int col = 0; col < 5; col++) {
                 if ((GLYPHS[glyph][row] & (1 << (4 - col))) != 0) {
                     float px = x + col * pixW;
                     float py = y + row * pixH;
-                    GL11.glVertex2f(px,          py);
-                    GL11.glVertex2f(px + pixW,   py);
-                    GL11.glVertex2f(px + pixW,   py + pixH);
-                    GL11.glVertex2f(px,          py + pixH);
+                    GL.glVertex2f(px,          py);
+                    GL.glVertex2f(px + pixW,   py);
+                    GL.glVertex2f(px + pixW,   py + pixH);
+                    GL.glVertex2f(px,          py + pixH);
                 }
             }
         }
-        GL11.glEnd();
+        GL.glEnd();
     }
 
     public static void main(String[] args) {

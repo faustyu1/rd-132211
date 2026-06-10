@@ -1,14 +1,13 @@
 package com.mojang.rubydung.level;
 
-import com.mojang.rubydung.Textures;
 import com.mojang.rubydung.phys.AABB;
-import org.lwjgl.opengl.GL11;
-import org.lwjgl.opengl.GL15;
-import org.lwjgl.system.MemoryUtil;
+import com.mojang.rubydung.render.vk.GameRenderer;
+import com.mojang.rubydung.render.vk.VkBuf;
 
-import java.nio.FloatBuffer;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
+
+import static org.lwjgl.vulkan.VK10.VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
 
 public class WorldChunk {
     public static final int SIZE = 16;
@@ -24,17 +23,16 @@ public class WorldChunk {
     private volatile boolean dirty = true;
     private final AtomicBoolean rebuilding = new AtomicBoolean(false);
 
-    private record MeshData(float[][] verts, float[][] tex, float[][] color, int[] count) {}
+    // one interleaved vertex array per layer (pos3+uv2+color4 = 9 floats/vertex)
+    private record MeshData(float[][] verts, int[] floatCount, int[] count) {}
     private final AtomicReference<MeshData> pendingMesh = new AtomicReference<>(null);
 
-    private final int[][] vbo = new int[2][3];
+    private final VkBuf[] buf = new VkBuf[2];
     volatile int[] vertexCount = new int[2];
     public boolean hasMesh() { return vertexCount[0] > 0 || vertexCount[1] > 0; }
-    private volatile boolean vboReady = false; // VBOs allocated on main thread
 
     public static int rebuiltThisFrame = 0;
     public static int updates = 0;
-    private static int texture = -1;
 
     private final Level level;
 
@@ -44,20 +42,6 @@ public class WorldChunk {
         this.level = level;
         int x0 = cx * SIZE, z0 = cz * SIZE;
         this.aabb = new AABB(x0, 0, z0, x0 + SIZE, HEIGHT, z0 + SIZE);
-        // VBOs are NOT created here — constructor may be called from background threads.
-        // They are created lazily on the main thread in ensureVBOs().
-    }
-
-    /** Must be called on the GL (main) thread before any upload/render. */
-    private void ensureVBOs() {
-        if (vboReady) return;
-        for (int layer = 0; layer < 2; layer++) {
-            vbo[layer][0] = GL15.glGenBuffers();
-            vbo[layer][1] = GL15.glGenBuffers();
-            vbo[layer][2] = GL15.glGenBuffers();
-        }
-        if (texture == -1) texture = Textures.loadTexture("/terrain.png", GL11.GL_NEAREST);
-        vboReady = true;
     }
 
     public byte getBlock(int lx, int y, int lz) {
@@ -101,13 +85,13 @@ public class WorldChunk {
 
     private void buildMesh() {
         float[][] verts = new float[2][];
-        float[][] tex   = new float[2][];
-        float[][] color = new float[2][];
+        int[]     floatCount = new int[2];
         int[]     count = new int[2];
         int bx0 = cx * SIZE, bz0 = cz * SIZE;
 
         for (int layer = 0; layer < 2; layer++) {
             Tesselator t = new Tesselator();
+            t.init();
             for (int lx = 0; lx < SIZE; lx++) {
                 for (int y = 0; y < HEIGHT; y++) {
                     for (int lz = 0; lz < SIZE; lz++) {
@@ -124,12 +108,12 @@ public class WorldChunk {
                     }
                 }
             }
-            verts[layer] = t.getVertexArray();
-            tex[layer]   = t.getTexArray();
-            color[layer] = t.getColorArray();
+            // throwaway build Tesselator → take its backing array directly (no copy)
+            verts[layer] = t.getBackingArray();
             count[layer] = t.getVertexCount();
+            floatCount[layer] = count[layer] * 9;
         }
-        pendingMesh.set(new MeshData(verts, tex, color, count));
+        pendingMesh.set(new MeshData(verts, floatCount, count));
     }
 
     private Tile getTile(byte blockType) {
@@ -155,27 +139,20 @@ public class WorldChunk {
     private void uploadPending() {
         MeshData mesh = pendingMesh.getAndSet(null);
         if (mesh == null) return;
-        ensureVBOs();
+        GameRenderer r = GameRenderer.instance;
         for (int layer = 0; layer < 2; layer++) {
             vertexCount[layer] = mesh.count()[layer];
+            // defer-delete the old buffer (GPU may still be reading it)
+            final VkBuf old = buf[layer];
+            if (old != null) r.deleter.enqueue(old::free);
+            buf[layer] = null;
             if (mesh.count()[layer] == 0) continue;
-            FloatBuffer vb = MemoryUtil.memAllocFloat(mesh.verts()[layer].length);
-            vb.put(mesh.verts()[layer]).flip();
-            GL15.glBindBuffer(GL15.GL_ARRAY_BUFFER, vbo[layer][0]);
-            GL15.glBufferData(GL15.GL_ARRAY_BUFFER, vb, GL15.GL_DYNAMIC_DRAW);
-            MemoryUtil.memFree(vb);
-            FloatBuffer tb = MemoryUtil.memAllocFloat(mesh.tex()[layer].length);
-            tb.put(mesh.tex()[layer]).flip();
-            GL15.glBindBuffer(GL15.GL_ARRAY_BUFFER, vbo[layer][1]);
-            GL15.glBufferData(GL15.GL_ARRAY_BUFFER, tb, GL15.GL_DYNAMIC_DRAW);
-            MemoryUtil.memFree(tb);
-            FloatBuffer cb = MemoryUtil.memAllocFloat(mesh.color()[layer].length);
-            cb.put(mesh.color()[layer]).flip();
-            GL15.glBindBuffer(GL15.GL_ARRAY_BUFFER, vbo[layer][2]);
-            GL15.glBufferData(GL15.GL_ARRAY_BUFFER, cb, GL15.GL_DYNAMIC_DRAW);
-            MemoryUtil.memFree(cb);
+            float[] data = mesh.verts()[layer];
+            int floats = mesh.floatCount()[layer];
+            VkBuf vb = new VkBuf(r.ctx, (long) floats * 4, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+            vb.upload2(data, 0, floats);
+            buf[layer] = vb;
         }
-        GL15.glBindBuffer(GL15.GL_ARRAY_BUFFER, 0);
         updates++;
         rebuiltThisFrame++;
         rebuilding.set(false);
@@ -188,28 +165,16 @@ public class WorldChunk {
             rebuilding.set(true);
             java.util.concurrent.ForkJoinPool.commonPool().execute(this::buildMesh);
         }
-        if (vertexCount[layer] == 0) return;
-        GL11.glEnable(GL11.GL_TEXTURE_2D);
-        Textures.bind(texture);
-        GL11.glEnableClientState(GL11.GL_VERTEX_ARRAY);
-        GL11.glEnableClientState(GL11.GL_TEXTURE_COORD_ARRAY);
-        GL11.glEnableClientState(GL11.GL_COLOR_ARRAY);
-        GL15.glBindBuffer(GL15.GL_ARRAY_BUFFER, vbo[layer][0]);
-        GL11.glVertexPointer(3, GL11.GL_FLOAT, 0, 0);
-        GL15.glBindBuffer(GL15.GL_ARRAY_BUFFER, vbo[layer][1]);
-        GL11.glTexCoordPointer(2, GL11.GL_FLOAT, 0, 0);
-        GL15.glBindBuffer(GL15.GL_ARRAY_BUFFER, vbo[layer][2]);
-        GL11.glColorPointer(4, GL11.GL_FLOAT, 0, 0);
-        GL11.glDrawArrays(GL11.GL_QUADS, 0, vertexCount[layer]);
-        GL11.glDisableClientState(GL11.GL_VERTEX_ARRAY);
-        GL11.glDisableClientState(GL11.GL_TEXTURE_COORD_ARRAY);
-        GL11.glDisableClientState(GL11.GL_COLOR_ARRAY);
-        GL15.glBindBuffer(GL15.GL_ARRAY_BUFFER, 0);
+        if (vertexCount[layer] == 0 || buf[layer] == null) return;
+        GameRenderer.instance.draw(buf[layer], vertexCount[layer]);
     }
 
     public void freeGL() {
-        if (!vboReady) return;
-        for (int layer = 0; layer < 2; layer++)
-            for (int i = 0; i < 3; i++) GL15.glDeleteBuffers(vbo[layer][i]);
+        GameRenderer r = GameRenderer.instance;
+        for (int layer = 0; layer < 2; layer++) {
+            final VkBuf b = buf[layer];
+            if (b != null && r != null) r.deleter.enqueue(b::free);
+            buf[layer] = null;
+        }
     }
 }

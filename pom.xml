@@ -20,22 +20,30 @@
     <dependencies>
         <dependency><groupId>org.lwjgl</groupId><artifactId>lwjgl</artifactId><version>${lwjgl.version}</version></dependency>
         <dependency><groupId>org.lwjgl</groupId><artifactId>lwjgl-glfw</artifactId><version>${lwjgl.version}</version></dependency>
-        <dependency><groupId>org.lwjgl</groupId><artifactId>lwjgl-opengl</artifactId><version>${lwjgl.version}</version></dependency>
         <dependency><groupId>org.lwjgl</groupId><artifactId>lwjgl</artifactId><version>${lwjgl.version}</version><classifier>natives-macos</classifier></dependency>
         <dependency><groupId>org.lwjgl</groupId><artifactId>lwjgl</artifactId><version>${lwjgl.version}</version><classifier>natives-macos-arm64</classifier></dependency>
         <dependency><groupId>org.lwjgl</groupId><artifactId>lwjgl-glfw</artifactId><version>${lwjgl.version}</version><classifier>natives-macos</classifier></dependency>
         <dependency><groupId>org.lwjgl</groupId><artifactId>lwjgl-glfw</artifactId><version>${lwjgl.version}</version><classifier>natives-macos-arm64</classifier></dependency>
-        <dependency><groupId>org.lwjgl</groupId><artifactId>lwjgl-opengl</artifactId><version>${lwjgl.version}</version><classifier>natives-macos</classifier></dependency>
-        <dependency><groupId>org.lwjgl</groupId><artifactId>lwjgl-opengl</artifactId><version>${lwjgl.version}</version><classifier>natives-macos-arm64</classifier></dependency>
         <dependency><groupId>org.lwjgl</groupId><artifactId>lwjgl</artifactId><version>${lwjgl.version}</version><classifier>natives-windows</classifier></dependency>
         <dependency><groupId>org.lwjgl</groupId><artifactId>lwjgl</artifactId><version>${lwjgl.version}</version><classifier>natives-windows-arm64</classifier></dependency>
         <dependency><groupId>org.lwjgl</groupId><artifactId>lwjgl-glfw</artifactId><version>${lwjgl.version}</version><classifier>natives-windows</classifier></dependency>
         <dependency><groupId>org.lwjgl</groupId><artifactId>lwjgl-glfw</artifactId><version>${lwjgl.version}</version><classifier>natives-windows-arm64</classifier></dependency>
-        <dependency><groupId>org.lwjgl</groupId><artifactId>lwjgl-opengl</artifactId><version>${lwjgl.version}</version><classifier>natives-windows</classifier></dependency>
-        <dependency><groupId>org.lwjgl</groupId><artifactId>lwjgl-opengl</artifactId><version>${lwjgl.version}</version><classifier>natives-windows-arm64</classifier></dependency>
         <dependency><groupId>org.lwjgl</groupId><artifactId>lwjgl</artifactId><version>${lwjgl.version}</version><classifier>natives-linux</classifier></dependency>
         <dependency><groupId>org.lwjgl</groupId><artifactId>lwjgl-glfw</artifactId><version>${lwjgl.version}</version><classifier>natives-linux</classifier></dependency>
-        <dependency><groupId>org.lwjgl</groupId><artifactId>lwjgl-opengl</artifactId><version>${lwjgl.version}</version><classifier>natives-linux</classifier></dependency>
+
+        <!-- Vulkan bindings (MoltenVK bundled in natives-macos*; system loader on Win/Linux) -->
+        <dependency><groupId>org.lwjgl</groupId><artifactId>lwjgl-vulkan</artifactId><version>${lwjgl.version}</version></dependency>
+        <dependency><groupId>org.lwjgl</groupId><artifactId>lwjgl-vulkan</artifactId><version>${lwjgl.version}</version><classifier>natives-macos</classifier></dependency>
+        <dependency><groupId>org.lwjgl</groupId><artifactId>lwjgl-vulkan</artifactId><version>${lwjgl.version}</version><classifier>natives-macos-arm64</classifier></dependency>
+
+        <!-- shaderc: compile GLSL → SPIR-V at runtime -->
+        <dependency><groupId>org.lwjgl</groupId><artifactId>lwjgl-shaderc</artifactId><version>${lwjgl.version}</version></dependency>
+        <dependency><groupId>org.lwjgl</groupId><artifactId>lwjgl-shaderc</artifactId><version>${lwjgl.version}</version><classifier>natives-macos</classifier></dependency>
+        <dependency><groupId>org.lwjgl</groupId><artifactId>lwjgl-shaderc</artifactId><version>${lwjgl.version}</version><classifier>natives-macos-arm64</classifier></dependency>
+        <dependency><groupId>org.lwjgl</groupId><artifactId>lwjgl-shaderc</artifactId><version>${lwjgl.version}</version><classifier>natives-windows</classifier></dependency>
+        <dependency><groupId>org.lwjgl</groupId><artifactId>lwjgl-shaderc</artifactId><version>${lwjgl.version}</version><classifier>natives-windows-arm64</classifier></dependency>
+        <dependency><groupId>org.lwjgl</groupId><artifactId>lwjgl-shaderc</artifactId><version>${lwjgl.version}</version><classifier>natives-linux</classifier></dependency>
+
         <dependency><groupId>org.joml</groupId><artifactId>joml</artifactId><version>${joml.version}</version></dependency>
     </dependencies>
 

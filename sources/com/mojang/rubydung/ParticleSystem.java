@@ -1,8 +1,10 @@
 package com.mojang.rubydung;
 
 import com.mojang.rubydung.level.Level;
+import com.mojang.rubydung.level.Tesselator;
 import com.mojang.rubydung.level.Tile;
-import org.lwjgl.opengl.GL11;
+import com.mojang.rubydung.render.vk.GameRenderer;
+import com.mojang.rubydung.render.vk.Pipelines;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -57,23 +59,25 @@ public class ParticleSystem {
         }
     }
 
+    private final Tesselator t = new Tesselator();
+
     public void render(float a) {
         if (particles.isEmpty()) return;
-        GL11.glDisable(GL11.GL_TEXTURE_2D);
-        GL11.glBegin(GL11.GL_QUADS);
+        GameRenderer r = GameRenderer.instance;
+        r.setPipeline(Pipelines.Pipeline.WORLD_OPAQUE);
+        r.bindWhite();
+        t.init();
         for (Particle p : particles) {
             float s = p.size;
-            GL11.glColor3f(p.r, p.g, p.b);
+            t.color(p.r, p.g, p.b, 1f);
             float x0 = p.x - s, x1 = p.x + s, y0 = p.y - s, y1 = p.y + s, z0 = p.z - s, z1 = p.z + s;
             // a tiny camera-agnostic cube (cheap; few faces visible anyway)
-            GL11.glVertex3f(x0,y0,z1); GL11.glVertex3f(x1,y0,z1); GL11.glVertex3f(x1,y1,z1); GL11.glVertex3f(x0,y1,z1);
-            GL11.glVertex3f(x1,y0,z0); GL11.glVertex3f(x0,y0,z0); GL11.glVertex3f(x0,y1,z0); GL11.glVertex3f(x1,y1,z0);
-            GL11.glVertex3f(x0,y1,z1); GL11.glVertex3f(x1,y1,z1); GL11.glVertex3f(x1,y1,z0); GL11.glVertex3f(x0,y1,z0);
-            GL11.glVertex3f(x0,y0,z0); GL11.glVertex3f(x1,y0,z0); GL11.glVertex3f(x1,y0,z1); GL11.glVertex3f(x0,y0,z1);
+            t.vertex(x0,y0,z1); t.vertex(x1,y0,z1); t.vertex(x1,y1,z1); t.vertex(x0,y1,z1);
+            t.vertex(x1,y0,z0); t.vertex(x0,y0,z0); t.vertex(x0,y1,z0); t.vertex(x1,y1,z0);
+            t.vertex(x0,y1,z1); t.vertex(x1,y1,z1); t.vertex(x1,y1,z0); t.vertex(x0,y1,z0);
+            t.vertex(x0,y0,z0); t.vertex(x1,y0,z0); t.vertex(x1,y0,z1); t.vertex(x0,y0,z1);
         }
-        GL11.glEnd();
-        GL11.glColor3f(1f, 1f, 1f);
-        GL11.glEnable(GL11.GL_TEXTURE_2D);
+        t.flush();
     }
 
     public void clear() { particles.clear(); }
