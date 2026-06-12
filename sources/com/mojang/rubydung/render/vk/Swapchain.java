@@ -54,8 +54,10 @@ public class Swapchain {
                 height = Math.max(caps.minImageExtent().height(), Math.min(caps.maxImageExtent().height(), fbHeight));
             }
 
-            // image count
-            int imageCount = caps.minImageCount() + 1;
+            // image count: want at least 3 so MAILBOX can pipeline (acquire next while
+            // two are in flight) instead of blocking on the drawable pool.
+            int desired = Math.max(caps.minImageCount() + 1, 3);
+            int imageCount = desired;
             if (caps.maxImageCount() > 0 && imageCount > caps.maxImageCount())
                 imageCount = caps.maxImageCount();
 
@@ -83,10 +85,18 @@ public class Swapchain {
                 vkGetPhysicalDeviceSurfacePresentModesKHR(ctx.physicalDevice, ctx.surface, pmCount, null);
                 IntBuffer modes = stack.mallocInt(pmCount.get(0));
                 vkGetPhysicalDeviceSurfacePresentModesKHR(ctx.physicalDevice, ctx.surface, pmCount, modes);
+                boolean hasMailbox = false, hasImmediate = false;
                 for (int i = 0; i < modes.capacity(); i++) {
-                    if (modes.get(i) == VK_PRESENT_MODE_IMMEDIATE_KHR) { presentMode = VK_PRESENT_MODE_IMMEDIATE_KHR; break; }
-                    if (modes.get(i) == VK_PRESENT_MODE_MAILBOX_KHR) presentMode = VK_PRESENT_MODE_MAILBOX_KHR;
+                    if (modes.get(i) == VK_PRESENT_MODE_MAILBOX_KHR) hasMailbox = true;
+                    if (modes.get(i) == VK_PRESENT_MODE_IMMEDIATE_KHR) hasImmediate = true;
                 }
+                // Uncapped: MAILBOX is ideal (tear-free, no wait); IMMEDIATE is the fallback
+                // (may tear). With 3 frames in flight, IMMEDIATE on MoltenVK runs at the
+                // display's max (the macOS compositor still bounds presented frames to the
+                // panel's refresh rate — there is no exclusive-fullscreen bypass on Metal).
+                if (hasMailbox) presentMode = VK_PRESENT_MODE_MAILBOX_KHR;
+                else if (hasImmediate) presentMode = VK_PRESENT_MODE_IMMEDIATE_KHR;
+                // else: stay FIFO
             }
 
             VkSwapchainCreateInfoKHR ci = VkSwapchainCreateInfoKHR.calloc(stack)

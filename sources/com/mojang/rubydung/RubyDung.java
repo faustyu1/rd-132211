@@ -91,9 +91,11 @@ public class RubyDung implements Runnable {
 
     // block breaking (survival) + particles
     private final ParticleSystem particles = new ParticleSystem();
+    private DroppedItems drops = null; // created with the level
     private int breakX, breakY, breakZ;
     private boolean breaking = false;
     private boolean miningHeld = false;
+    private boolean setSpawnKeyWasDown = false;
     private float breakProgress = 0f; // 0..1
     private long breakNextMs  = 0;   // ms timestamp: next allowed creative break
     private long placeNextMs  = 0;   // ms timestamp: next allowed place
@@ -101,6 +103,16 @@ public class RubyDung implements Runnable {
     // hotbar
     private final int[] hotbar = {1, 2, 3, 4, 5, 6, 7, 8, 9};
     private int selectedSlot = 0;
+    // collected block counts, indexed by block id (survival inventory tally)
+    private final int[] itemCounts = new int[256];
+    // creative inventory: block id currently carried on the cursor (0 = none)
+    private int cursorItem = 0;
+    // all placeable block ids shown in the creative palette
+    private static final int[] CREATIVE_BLOCKS = {
+        Tile.GRASS, Tile.DIRT, Tile.STONE, Tile.GRAVEL, Tile.SAND, Tile.SNOW,
+        Tile.WOOD, Tile.LEAVES, Tile.COAL, Tile.IRON, Tile.GOLD, Tile.DIAMOND,
+        Tile.BEDROCK, Tile.WATER
+    };
 
     // chat
     private boolean chatOpen = false;
@@ -112,10 +124,6 @@ public class RubyDung implements Runnable {
 
     // tab player list
     private boolean tabOpen = false;
-
-    // crafting (screen=7)
-    private byte[][] craftGrid = new byte[2][2];
-    private byte craftOutput = 0;
 
     // inventory (screen=6)
     private byte[] inventorySlots = new byte[36];
@@ -176,7 +184,7 @@ public class RubyDung implements Runnable {
 
     public void destroy() {
         stopMultiplayer();
-        if (level != null && !worldName.isEmpty()) level.save(worldDir(worldName));
+        saveWorld();
         settings.save();
         if (renderer != null) renderer.destroy();
         glfwDestroyWindow(window);
@@ -201,6 +209,10 @@ public class RubyDung implements Runnable {
                 if (screen == 11 && loadingDone) {
                     levelRenderer = new LevelRenderer(level);
                     player = new Player(level);
+                    drops = new DroppedItems(level);
+                    loadPlayer(worldDir(worldName));
+                    // first time in this world: remember where we spawned
+                    if (!player.hasSpawn) player.setSpawn(player.x, player.y, player.z);
                     screen = 0;
                     glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
                     Input.consumeMouseDelta();
@@ -217,7 +229,8 @@ public class RubyDung implements Runnable {
                 }
                 render(timer.a);
                 while (System.currentTimeMillis() >= lastTime + 1000) {
-                    System.out.printf("%d fps, %d chunk updates, fb=%dx%d win=%dx%d%n", displayFps, WorldChunk.updates, width, height, winWidth, winHeight);
+                    System.out.printf("%d fps, %d chunk updates, fb=%dx%d win=%dx%d%n",
+                        displayFps, WorldChunk.updates, width, height, winWidth, winHeight);
                     WorldChunk.updates = 0;
                     lastTime += 1000;
                 }
@@ -232,9 +245,13 @@ public class RubyDung implements Runnable {
     public void tick() {
         timeOfDay = (timeOfDay + 1f / (20 * 60 * 10)) % 1f;
         player.tick();
-        level.update(player.x, player.z, 8);
+        level.update(player.x, player.z, settings.chunkRadius());
         if (fluidTickCounter++ % 5 == 0) level.tickFluids();
         particles.tick();
+        if (drops != null) {
+            byte got = drops.tick(player);
+            if (got != 0) collectItem(got);
+        }
         if (miningHeld && hitResult != null) updateBreaking();
 
         if (server != null) {
@@ -375,8 +392,7 @@ public class RubyDung implements Runnable {
                 }
 
                 if (key == GLFW_KEY_ESCAPE) {
-                    if (screen == 7) { screen = 6; }
-                    else if (screen == 6) { screen = 0; glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED); Input.consumeMouseDelta(); }
+                    if (screen == 6) { cursorItem = 0; screen = 0; glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED); Input.consumeMouseDelta(); }
                     else if (screen == -1) { /* stay on main menu */ }
                     else if (screen == 9) { refreshWorldList(); screen = 8; menuCooldown = 2; }
                     else if (screen == 8) { screen = -1; menuCooldown = 2; }
@@ -442,9 +458,8 @@ public class RubyDung implements Runnable {
                         Input.consumeMouseDelta();
                     }
                 } else if (screen == 6 && key == GLFW_KEY_E) {
+                    cursorItem = 0;
                     screen = 0; glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED); Input.consumeMouseDelta();
-                } else if (screen == 7 && key == GLFW_KEY_E) {
-                    screen = 6;
                 }
             }
         }
@@ -503,6 +518,14 @@ public class RubyDung implements Runnable {
             if (scroll != 0) {
                 selectedSlot = ((selectedSlot - (int)Math.signum(scroll)) % 9 + 9) % 9;
             }
+
+            // B = set spawn point here (edge-triggered)
+            boolean bDown = Input.isKeyDown(GLFW_KEY_B);
+            if (bDown && !setSpawnKeyWasDown) {
+                player.setSpawn(player.x, player.y, player.z);
+                addChat("Spawn point set");
+            }
+            setSpawnKeyWasDown = bDown;
 
             long now = System.currentTimeMillis();
 
@@ -565,9 +588,31 @@ public class RubyDung implements Runnable {
         byte type = level.getBlock(x, y, z);
         if (type == 0 || Tile.hardness(type) < 0) return; // air / unbreakable
         particles.spawnBlockBreak(x, y, z, type);
+        if (drops != null) drops.spawn(x, y, z, dropFor(type));
         level.setTile(x, y, z, 0);
         if (client != null) client.sendSetTile(x, y, z, 0);
         else if (server != null) server.broadcastTile(x, y, z, 0);
+    }
+
+    /** Tally a picked-up block; ensure it's reachable on the hotbar. */
+    private void collectItem(byte type) {
+        int id = type & 0xFF;
+        itemCounts[id]++;
+        // if the block type isn't on the hotbar yet, surface it in an empty/low slot
+        for (int v : hotbar) if (v == id) return;
+        for (int i = 0; i < hotbar.length; i++) {
+            if (hotbar[i] == 0) { hotbar[i] = id; return; }
+        }
+        hotbar[selectedSlot] = id; // no free slot: replace the held one
+    }
+
+    /** What a broken block drops (e.g. grass -> dirt, leaves -> nothing). */
+    private static byte dropFor(byte type) {
+        return switch (type) {
+            case Tile.GRASS  -> Tile.DIRT;   // grass turns to dirt
+            case Tile.LEAVES -> 0;           // leaves drop nothing
+            default          -> type;
+        };
     }
 
     private void updateBreaking() {
@@ -613,10 +658,26 @@ public class RubyDung implements Runnable {
     public void render(float a) {
         handleInput(a);
 
-        // compute sky color for clear
-        float sunAngle = (float)(Math.cos(timeOfDay * Math.PI * 2));
-        float brightness = Math.max(0.05f, (sunAngle + 1) * 0.5f);
-        float sr = 0.5f * brightness, sg = 0.8f * brightness, sb = 1.0f * brightness;
+        // ── day/night cycle ── timeOfDay: 0=noon, 0.5=midnight
+        float sunAngle = (float) Math.cos(timeOfDay * Math.PI * 2); // +1 noon, -1 midnight
+        // smooth sky brightness: bright day, dark (not black) night, soft dawn/dusk
+        float dayT = Math.clamp((sunAngle + 0.2f) / 1.2f, 0f, 1f); // 0 night .. 1 day
+        // base day sky vs deep night sky, blended by dayT
+        float dr = 0.5f, dg = 0.8f, db = 1.0f;     // daytime sky
+        float nr = 0.02f, ng = 0.03f, nb = 0.08f;  // night sky
+        float sr = nr + (dr - nr) * dayT;
+        float sg = ng + (dg - ng) * dayT;
+        float sb = nb + (db - nb) * dayT;
+        // warm sunrise/sunset tint near the horizon band
+        float horizon = 1f - Math.min(1f, Math.abs(sunAngle) / 0.35f); // peaks at dawn/dusk
+        if (horizon > 0f) {
+            sr += horizon * 0.45f;
+            sg += horizon * 0.20f;
+            sb -= horizon * 0.05f;
+        }
+        sr = Math.clamp(sr, 0f, 1f); sg = Math.clamp(sg, 0f, 1f); sb = Math.clamp(sb, 0f, 1f);
+        // world light multiplier: never pitch black so caves stay readable
+        float worldBright = 0.18f + dayT * 0.82f;
 
         if (screen == -1) {
             if (!renderer.beginFrame(sr, sg, sb)) return;
@@ -654,7 +715,7 @@ public class RubyDung implements Runnable {
         setupCamera(screen != 0 ? 1.0f : a);
 
         float fogEnd = Settings.DIST_END[settings.renderDist];
-        renderer.setFog(sr, sg, sb, 0.0f, fogEnd);
+        renderer.setFog(sr, sg, sb, 0.0f, fogEnd, worldBright);
 
         levelRenderer.render(player, 0);
         levelRenderer.render(player, 1);
@@ -662,6 +723,7 @@ public class RubyDung implements Runnable {
         renderer.disableFog();
 
         particles.render(a);
+        if (drops != null) drops.render(a);
 
         if (hitResult != null && screen == 0) levelRenderer.renderHit(hitResult);
         if (breaking && breakProgress > 0f && screen == 0) renderBreakProgress();
@@ -669,14 +731,13 @@ public class RubyDung implements Runnable {
         renderRemotePlayers(timer.a);
         renderHud();
 
-        if      (screen == 0) { renderCrosshair(); renderHotbar(); renderChat(); renderTabList(); }
+        if      (screen == 0) { renderCrosshair(); renderHotbar(); renderHealth(); renderChat(); renderTabList(); }
         else if (screen == 1) renderPauseMenu();
         else if (screen == 2) renderSettingsMenu();
         else if (screen == 3) renderMultiplayerMenu();
         else if (screen == 4) renderJoinScreen();
         else if (screen == 5) renderServerList();
         else if (screen == 6) renderInventory();
-        else if (screen == 7) renderCrafting();
         else if (screen == 10) renderAddServer();
 
         renderer.endFrame();
@@ -1295,148 +1356,143 @@ public class RubyDung implements Runnable {
         endOrtho();
     }
 
-    private byte checkCraft() {
-        byte a=craftGrid[0][0], b=craftGrid[0][1], c=craftGrid[1][0], d=craftGrid[1][1];
-        if (a==1 && b==1 && c==1 && d==1) return 1;
-        if (a==2 && b==0 && c==0 && d==0) return 1;
-        return 0;
-    }
-
+    /**
+     * Creative inventory: a palette of every placeable block plus the live hotbar
+     * row. Left-click a palette block to pick it up onto the cursor; left-click a
+     * hotbar slot to drop the cursor item there. Click a hotbar slot with an empty
+     * cursor to pick that slot's block up (swap). Click outside to clear the cursor.
+     */
     private void renderInventory() {
         beginOrtho();
         renderOverlay();
-        drawTitle("INVENTORY", height / 2 - 180);
+        drawTitle("CREATIVE INVENTORY", height / 2 - 170);
 
-        int slotSize = 36, gap = 4;
-        int cols = 9;
-        int invW = cols * (slotSize + gap) - gap;
-        int invX = (width - invW) / 2, invY = height / 2 - 80;
-
+        int slot = 40, gap = 6, cols = 7;
+        int rows = (CREATIVE_BLOCKS.length + cols - 1) / cols;
+        int gridW = cols * (slot + gap) - gap;
+        int gridX = (width - gridW) / 2;
+        int gridY = height / 2 - 120;
         int mx = mouseScreenX(), my = mouseScreenY();
 
         GL.glEnable(GL.GL_BLEND);
         GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA);
 
-        for (int row = 0; row < 4; row++) {
-            int y = invY + row * (slotSize + gap + 2) + (row == 3 ? 10 : 0);
-            for (int col = 0; col < cols; col++) {
-                int x = invX + col * (slotSize + gap);
-                int slotIdx = row == 3 ? col : 9 + row * cols + col;
-                boolean sel = slotIdx < 9 && slotIdx == selectedSlot;
-                boolean hov = hover(mx, my, x, y, slotSize, slotSize);
-
-                GL.glColor4f(1, 1, 1, sel ? 0.5f : hov ? 0.3f : 0.15f);
-                GL.glBegin(GL.GL_QUADS);
-                GL.glVertex2f(x, y); GL.glVertex2f(x + slotSize, y);
-                GL.glVertex2f(x + slotSize, y + slotSize); GL.glVertex2f(x, y + slotSize);
-                GL.glEnd();
-                GL.glColor4f(1, 1, 1, sel || hov ? 1f : 0.4f);
-                GL.glLineWidth(sel || hov ? 2f : 1f);
-                GL.glBegin(GL.GL_LINE_LOOP);
-                GL.glVertex2f(x + 0.5f, y + 0.5f); GL.glVertex2f(x + slotSize - 0.5f, y + 0.5f);
-                GL.glVertex2f(x + slotSize - 0.5f, y + slotSize - 0.5f); GL.glVertex2f(x + 0.5f, y + slotSize - 0.5f);
-                GL.glEnd();
-            }
+        // palette
+        int hoveredPalette = -1;
+        for (int i = 0; i < CREATIVE_BLOCKS.length; i++) {
+            int r = i / cols, c = i % cols;
+            int x = gridX + c * (slot + gap), y = gridY + r * (slot + gap);
+            boolean hov = hover(mx, my, x, y, slot, slot);
+            if (hov) hoveredPalette = i;
+            drawItemSlot(x, y, slot, (byte) CREATIVE_BLOCKS[i], hov, false, -1);
         }
 
-        // crafting button
-        int btnY = invY + 4 * (slotSize + gap + 2) + 10 + 20;
-        boolean hCraft = hover(mx, my, (width - 120) / 2, btnY, 120, 30);
-        drawButton((width - 120) / 2, btnY, 120, 30, "CRAFT", hCraft);
+        // hotbar row label + slots along the bottom of the panel
+        int hbY = gridY + rows * (slot + gap) + 24;
+        drawSmallText("HOTBAR", gridX, hbY - 16);
+        int hotbarW = 9 * (slot + gap) - gap;
+        int hbX = (width - hotbarW) / 2;
+        int hoveredHotbar = -1;
+        for (int i = 0; i < 9; i++) {
+            int x = hbX + i * (slot + gap);
+            boolean hov = hover(mx, my, x, hbY, slot, slot);
+            if (hov) hoveredHotbar = i;
+            drawItemSlot(x, hbY, slot, (byte) hotbar[i], hov, i == selectedSlot, itemCounts[hotbar[i] & 0xFF]);
+        }
 
         // close button
-        int closeY = btnY + 40;
+        int closeY = hbY + slot + 24;
         boolean hClose = hover(mx, my, (width - 120) / 2, closeY, 120, 30);
         drawButton((width - 120) / 2, closeY, 120, 30, "CLOSE", hClose);
+
+        // cursor-carried item follows the mouse
+        if (cursorItem != 0) {
+            float[] col = blockSwatch((byte) cursorItem);
+            GL.glColor4f(col[0], col[1], col[2], 1f);
+            GL.glBegin(GL.GL_QUADS);
+            GL.glVertex2f(mx, my); GL.glVertex2f(mx + 24, my);
+            GL.glVertex2f(mx + 24, my + 24); GL.glVertex2f(mx, my + 24);
+            GL.glEnd();
+        }
+
+        // tooltip for hovered palette block
+        if (hoveredPalette >= 0 && cursorItem == 0) {
+            GL.glColor4f(1, 1, 1, 1);
+            drawSmallText(blockName((byte) CREATIVE_BLOCKS[hoveredPalette]), mx + 14, my - 4);
+        }
 
         GL.glDisable(GL.GL_BLEND);
 
         for (var e : Input.pollMouseEvents()) {
             if (e[0] == GLFW_MOUSE_BUTTON_1 && e[1] == GLFW_PRESS) {
-                if (hCraft) { screen = 7; }
-                if (hClose) { screen = 0; glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED); Input.consumeMouseDelta(); }
+                if (hClose) {
+                    cursorItem = 0;
+                    screen = 0; glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED); Input.consumeMouseDelta();
+                } else if (hoveredPalette >= 0) {
+                    cursorItem = CREATIVE_BLOCKS[hoveredPalette]; // pick up an infinite stack
+                } else if (hoveredHotbar >= 0) {
+                    if (cursorItem != 0) {
+                        hotbar[hoveredHotbar] = cursorItem;       // place into slot
+                    } else {
+                        cursorItem = hotbar[hoveredHotbar];       // pick the slot's block up
+                    }
+                } else {
+                    cursorItem = 0;                                // click empty space: clear cursor
+                }
+            } else if (e[0] == GLFW_MOUSE_BUTTON_2 && e[1] == GLFW_PRESS) {
+                if (hoveredHotbar >= 0) hotbar[hoveredHotbar] = 0; // right-click clears a slot
             }
         }
         endOrtho();
     }
 
-    private void renderCrafting() {
-        beginOrtho();
-        renderOverlay();
-        drawTitle("CRAFTING", height / 2 - 120);
-
-        int slotSize = 44, gap = 4;
-        int gridX = width / 2 - slotSize - gap - 30;
-        int gridY = height / 2 - slotSize - gap / 2;
-        int mx = mouseScreenX(), my = mouseScreenY();
-
-        craftOutput = checkCraft();
-
-        GL.glEnable(GL.GL_BLEND);
-        GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA);
-
-        // draw 2x2 craft grid
-        for (int row = 0; row < 2; row++) {
-            for (int col = 0; col < 2; col++) {
-                int sx = gridX + col * (slotSize + gap);
-                int sy = gridY + row * (slotSize + gap);
-                boolean hov = hover(mx, my, sx, sy, slotSize, slotSize);
-                GL.glColor4f(1,1,1, hov ? 0.3f : 0.15f);
-                GL.glBegin(GL.GL_QUADS);
-                GL.glVertex2f(sx,sy); GL.glVertex2f(sx+slotSize,sy);
-                GL.glVertex2f(sx+slotSize,sy+slotSize); GL.glVertex2f(sx,sy+slotSize);
-                GL.glEnd();
-                GL.glColor4f(1,1,1,0.8f);
-                GL.glBegin(GL.GL_LINE_LOOP);
-                GL.glVertex2f(sx+0.5f,sy+0.5f); GL.glVertex2f(sx+slotSize-0.5f,sy+0.5f);
-                GL.glVertex2f(sx+slotSize-0.5f,sy+slotSize-0.5f); GL.glVertex2f(sx+0.5f,sy+slotSize-0.5f);
-                GL.glEnd();
-                byte block = craftGrid[row][col];
-                if (block != 0) drawSmallText(String.valueOf(block), sx + 4, sy + 4);
-            }
-        }
-
-        // arrow
-        int arrowX = gridX + 2 * (slotSize + gap) + 10;
-        int arrowY = gridY + slotSize / 2 + gap / 2;
-        drawSmallText(">", arrowX, arrowY - 4);
-
-        // output slot
-        int outX = arrowX + 30, outY = gridY + gap / 2;
-        boolean hOut = hover(mx, my, outX, outY, slotSize, slotSize * 2 + gap);
-        GL.glColor4f(1,1,1, hOut && craftOutput != 0 ? 0.4f : 0.15f);
+    /** Draw one inventory slot: background, border, block swatch and optional count. */
+    private void drawItemSlot(int x, int y, int s, byte id, boolean hov, boolean sel, int count) {
+        GL.glColor4f(1, 1, 1, sel ? 0.5f : hov ? 0.32f : 0.15f);
         GL.glBegin(GL.GL_QUADS);
-        GL.glVertex2f(outX, outY); GL.glVertex2f(outX+slotSize, outY);
-        GL.glVertex2f(outX+slotSize, outY+slotSize); GL.glVertex2f(outX, outY+slotSize);
+        GL.glVertex2f(x, y); GL.glVertex2f(x + s, y);
+        GL.glVertex2f(x + s, y + s); GL.glVertex2f(x, y + s);
         GL.glEnd();
-        GL.glColor4f(1,1,1,0.8f);
-        GL.glBegin(GL.GL_LINE_LOOP);
-        GL.glVertex2f(outX+0.5f,outY+0.5f); GL.glVertex2f(outX+slotSize-0.5f,outY+0.5f);
-        GL.glVertex2f(outX+slotSize-0.5f,outY+slotSize-0.5f); GL.glVertex2f(outX+0.5f,outY+slotSize-0.5f);
-        GL.glEnd();
-        if (craftOutput != 0) drawSmallText(String.valueOf(craftOutput), outX + 4, outY + 4);
-
-        GL.glDisable(GL.GL_BLEND);
-
-        for (var e : Input.pollMouseEvents()) {
-            if (e[0] == GLFW_MOUSE_BUTTON_1 && e[1] == GLFW_PRESS) {
-                for (int row = 0; row < 2; row++) {
-                    for (int col = 0; col < 2; col++) {
-                        int sx = gridX + col * (slotSize + gap);
-                        int sy = gridY + row * (slotSize + gap);
-                        if (hover(mx, my, sx, sy, slotSize, slotSize)) {
-                            craftGrid[row][col] = (byte)((craftGrid[row][col] + 1) % 4);
-                        }
-                    }
-                }
-                if (hOut && craftOutput != 0) {
-                    hotbar[selectedSlot] = craftOutput;
-                    craftGrid = new byte[2][2];
-                    craftOutput = 0;
-                }
+        if (id != 0) {
+            float[] col = blockSwatch(id);
+            int pad = 6;
+            GL.glColor4f(col[0], col[1], col[2], 1f);
+            GL.glBegin(GL.GL_QUADS);
+            GL.glVertex2f(x + pad, y + pad); GL.glVertex2f(x + s - pad, y + pad);
+            GL.glVertex2f(x + s - pad, y + s - pad); GL.glVertex2f(x + pad, y + s - pad);
+            GL.glEnd();
+            if (count > 0) {
+                GL.glColor4f(1, 1, 1, 1);
+                drawSmallText(String.valueOf(count), x + s - 16, y + s - 12);
             }
         }
-        endOrtho();
+        GL.glColor4f(1, 1, 1, sel || hov ? 1f : 0.4f);
+        GL.glLineWidth(sel || hov ? 2f : 1f);
+        GL.glBegin(GL.GL_LINE_LOOP);
+        GL.glVertex2f(x + 0.5f, y + 0.5f); GL.glVertex2f(x + s - 0.5f, y + 0.5f);
+        GL.glVertex2f(x + s - 0.5f, y + s - 0.5f); GL.glVertex2f(x + 0.5f, y + s - 0.5f);
+        GL.glEnd();
+    }
+
+    /** Human-readable block name for inventory tooltips. */
+    private static String blockName(byte b) {
+        return switch (b) {
+            case Tile.GRASS   -> "GRASS";
+            case Tile.DIRT    -> "DIRT";
+            case Tile.STONE   -> "STONE";
+            case Tile.GRAVEL  -> "GRAVEL";
+            case Tile.SAND    -> "SAND";
+            case Tile.SNOW    -> "SNOW";
+            case Tile.WOOD    -> "WOOD";
+            case Tile.LEAVES  -> "LEAVES";
+            case Tile.COAL    -> "COAL ORE";
+            case Tile.IRON    -> "IRON ORE";
+            case Tile.GOLD    -> "GOLD ORE";
+            case Tile.DIAMOND -> "DIAMOND ORE";
+            case Tile.BEDROCK -> "BEDROCK";
+            case Tile.WATER   -> "WATER";
+            default           -> "BLOCK " + (b & 0xFF);
+        };
     }
 
     private void renderHud() {
@@ -1480,9 +1536,108 @@ public class RubyDung implements Runnable {
             GL.glVertex2f(x + 0.5f, y + 0.5f); GL.glVertex2f(x + slotSize - 0.5f, y + 0.5f);
             GL.glVertex2f(x + slotSize - 0.5f, y + slotSize - 0.5f); GL.glVertex2f(x + 0.5f, y + slotSize - 0.5f);
             GL.glEnd();
+
+            // block swatch + collected count
+            int id = hotbar[i];
+            if (id != 0) {
+                float[] col = blockSwatch((byte) id);
+                int pad = 8;
+                GL.glColor4f(col[0], col[1], col[2], 1f);
+                GL.glBegin(GL.GL_QUADS);
+                GL.glVertex2f(x + pad, y + pad); GL.glVertex2f(x + slotSize - pad, y + pad);
+                GL.glVertex2f(x + slotSize - pad, y + slotSize - pad); GL.glVertex2f(x + pad, y + slotSize - pad);
+                GL.glEnd();
+                int count = itemCounts[id & 0xFF];
+                if (count > 0) drawSmallText(String.valueOf(count), x + slotSize - 16, y + slotSize - 12);
+            }
         }
         GL.glDisable(GL.GL_BLEND);
         endOrtho();
+    }
+
+    /** Hotbar swatch colour for a block id (mirrors world tints). */
+    private static float[] blockSwatch(byte b) {
+        return switch (b) {
+            case Tile.GRASS  -> new float[]{0.35f, 0.65f, 0.25f};
+            case Tile.DIRT   -> new float[]{0.52f, 0.38f, 0.24f};
+            case Tile.SAND   -> new float[]{0.86f, 0.80f, 0.56f};
+            case Tile.SNOW   -> new float[]{0.95f, 0.97f, 1.00f};
+            case Tile.WOOD   -> new float[]{0.45f, 0.31f, 0.16f};
+            case Tile.LEAVES -> new float[]{0.42f, 0.62f, 0.30f};
+            case Tile.COAL   -> new float[]{0.28f, 0.28f, 0.30f};
+            case Tile.IRON   -> new float[]{0.78f, 0.66f, 0.52f};
+            case Tile.GOLD   -> new float[]{0.92f, 0.80f, 0.30f};
+            case Tile.DIAMOND-> new float[]{0.45f, 0.85f, 0.88f};
+            case Tile.GRAVEL -> new float[]{0.52f, 0.52f, 0.55f};
+            case Tile.BEDROCK-> new float[]{0.22f, 0.22f, 0.24f};
+            case Tile.WATER  -> new float[]{0.30f, 0.50f, 1.00f};
+            default          -> new float[]{0.58f, 0.58f, 0.60f}; // stone
+        };
+    }
+
+    /** Draw 10 hearts above the hotbar reflecting survival health (half-heart resolution). */
+    private void renderHealth() {
+        if (player == null || player.mode != Player.GameMode.SURVIVAL) return;
+        beginOrtho();
+        int slots = 9, slotSize = 40, gap = 2;
+        int totalW = slots * (slotSize + gap) - gap;
+        int startX = (width - totalW) / 2;
+        int hotbarTop = height - slotSize - 10;
+        int hs = 16;                  // heart size
+        int hgap = 2;
+        int y = hotbarTop - hs - 8;
+        boolean flash = player.hurtTime > 0 && (player.hurtTime % 4) >= 2;
+        GL.glEnable(GL.GL_BLEND);
+        GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA);
+        for (int i = 0; i < 10; i++) {
+            int x = startX + i * (hs + hgap);
+            int fill = player.health - i * 2; // 2=full, 1=half, <=0 empty
+            // empty heart container (dark)
+            drawHeart(x, y, hs, 0.18f, 0.18f, 0.20f, 1f);
+            if (fill >= 2)      drawHeart(x, y, hs, flash ? 1f : 0.92f, flash ? 1f : 0.12f, 0.14f, 1f);
+            else if (fill == 1) drawHalfHeart(x, y, hs, flash ? 1f : 0.92f, flash ? 1f : 0.12f, 0.14f, 1f);
+        }
+        GL.glDisable(GL.GL_BLEND);
+        endOrtho();
+    }
+
+    /** A blocky heart: two top bumps + a body, drawn as filled quads. */
+    private void drawHeart(int x, int y, int s, float r, float g, float b, float a) {
+        float u = s / 8f; // unit cell
+        GL.glColor4f(r, g, b, a);
+        GL.glBegin(GL.GL_QUADS);
+        // top-left bump
+        heartCell(x, y, u, 1, 0, 3, 2);
+        // top-right bump
+        heartCell(x, y, u, 4, 0, 3, 2);
+        // wide middle band
+        heartCell(x, y, u, 0, 2, 8, 3);
+        // tapering bottom
+        heartCell(x, y, u, 1, 5, 6, 1);
+        heartCell(x, y, u, 2, 6, 4, 1);
+        heartCell(x, y, u, 3, 7, 2, 1);
+        GL.glEnd();
+    }
+
+    /** Left half of the blocky heart (for half-heart health). */
+    private void drawHalfHeart(int x, int y, int s, float r, float g, float b, float a) {
+        float u = s / 8f;
+        GL.glColor4f(r, g, b, a);
+        GL.glBegin(GL.GL_QUADS);
+        heartCell(x, y, u, 1, 0, 3, 2); // top-left bump
+        heartCell(x, y, u, 0, 2, 4, 3); // left half of middle band
+        heartCell(x, y, u, 1, 5, 3, 1);
+        heartCell(x, y, u, 2, 6, 2, 1);
+        heartCell(x, y, u, 3, 7, 1, 1);
+        GL.glEnd();
+    }
+
+    /** Emit one quad cell of a heart sprite (grid coords, cell size u). */
+    private void heartCell(int x, int y, float u, int cx, int cy, int cw, int ch) {
+        float x0 = x + cx * u, y0 = y + cy * u;
+        float x1 = x0 + cw * u, y1 = y0 + ch * u;
+        GL.glVertex2f(x0, y0); GL.glVertex2f(x1, y0);
+        GL.glVertex2f(x1, y1); GL.glVertex2f(x0, y1);
     }
 
     private void renderCrosshair() {
@@ -1533,10 +1688,10 @@ public class RubyDung implements Runnable {
                 worldSeedValue = level.getSeed();
             }
             loadingStatus = "GENERATING TERRAIN...";
-            for (int dx = -4; dx <= 4; dx++)
-                for (int dz = -4; dz <= 4; dz++)
-                    level.getOrLoadChunk(dx, dz);
-            level.update(0, 0, 8);
+            // preload a fast core synchronously; stream the rest in the background
+            int pre = Math.min(settings.chunkRadius(), 5);
+            level.preloadRegion(-pre, pre, -pre, pre);
+            level.update(0, 0, settings.chunkRadius());
             loadingStatus = "SPAWNING...";
             loadingDone = true;
         }, "world-loader");
@@ -1546,12 +1701,13 @@ public class RubyDung implements Runnable {
 
     /** Save the active world and return to the main menu, fully tearing down level state. */
     private void exitToMenu() {
-        if (level != null && !worldName.isEmpty()) level.save(worldDir(worldName));
+        saveWorld();
         stopMultiplayer();
         level = null;
         levelRenderer = null;
         player = null;
         particles.clear();
+        drops = null;
         worldName = "";
         screen = -1;
         menuCooldown = 3;
@@ -1560,8 +1716,76 @@ public class RubyDung implements Runnable {
         Input.consumeMouseDelta();
     }
 
+    /** Persist the level and player state if a world is active. */
+    private void saveWorld() {
+        if (level != null && !worldName.isEmpty()) {
+            java.io.File dir = worldDir(worldName);
+            level.save(dir);
+            savePlayer(dir);
+        }
+    }
+
     private static java.io.File worldDir(String name) {
         return new java.io.File(SAVES_DIR, sanitize(name));
+    }
+
+    /** Persist player position, spawn, health, mode, hotbar and inventory to player.dat. */
+    private void savePlayer(java.io.File dir) {
+        if (player == null) return;
+        java.io.File f = new java.io.File(dir, "player.dat");
+        try (var dos = new java.io.DataOutputStream(new java.util.zip.GZIPOutputStream(new java.io.FileOutputStream(f)))) {
+            dos.writeInt(2); // version
+            dos.writeFloat(player.x); dos.writeFloat(player.y); dos.writeFloat(player.z);
+            dos.writeFloat(player.yRot); dos.writeFloat(player.xRot);
+            dos.writeBoolean(player.hasSpawn);
+            dos.writeFloat(player.spawnX); dos.writeFloat(player.spawnY); dos.writeFloat(player.spawnZ);
+            dos.writeInt(player.health);
+            dos.writeInt(player.mode.ordinal());
+            dos.writeInt(hotbar.length);
+            for (int v : hotbar) dos.writeInt(v);
+            dos.writeInt(inventorySlots.length);
+            dos.write(inventorySlots);
+            dos.writeInt(itemCounts.length);
+            for (int v : itemCounts) dos.writeInt(v);
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+
+    /** Restore player state from player.dat if present (call after the player exists). */
+    private void loadPlayer(java.io.File dir) {
+        java.io.File f = new java.io.File(dir, "player.dat");
+        if (player == null || !f.exists()) return;
+        try (var dis = new java.io.DataInputStream(new java.util.zip.GZIPInputStream(new java.io.FileInputStream(f)))) {
+            dis.readInt(); // version
+            float px = dis.readFloat(), py = dis.readFloat(), pz = dis.readFloat();
+            float yaw = dis.readFloat(), pitch = dis.readFloat();
+            boolean hasSpawn = dis.readBoolean();
+            float sx = dis.readFloat(), sy = dis.readFloat(), sz = dis.readFloat();
+            int health = dis.readInt();
+            int modeOrd = dis.readInt();
+            int hn = dis.readInt();
+            for (int i = 0; i < hn; i++) { int v = dis.readInt(); if (i < hotbar.length) hotbar[i] = v; }
+            int in = dis.readInt();
+            byte[] inv = new byte[in];
+            int off = 0, r;
+            while (off < in && (r = dis.read(inv, off, in - off)) > 0) off += r;
+            System.arraycopy(inv, 0, inventorySlots, 0, Math.min(in, inventorySlots.length));
+            // apply core state first so a truncated/older file still restores the player
+            player.hasSpawn = hasSpawn;
+            player.spawnX = sx; player.spawnY = sy; player.spawnZ = sz;
+            player.health = Math.clamp(health, 0, Player.MAX_HEALTH);
+            var modes = Player.GameMode.values();
+            player.mode = modes[Math.clamp(modeOrd, 0, modes.length - 1)];
+            player.teleport(px, py, pz, yaw, pitch);
+            // v2+: collected item counts (absent in v1 -> EOFException, harmless)
+            try {
+                int cn = dis.readInt();
+                for (int i = 0; i < cn; i++) { int v = dis.readInt(); if (i < itemCounts.length) itemCounts[i] = v; }
+            } catch (java.io.EOFException ignored) {}
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
     }
 
     private static String sanitize(String name) {
@@ -1832,7 +2056,7 @@ public class RubyDung implements Runnable {
                 if (h2) { refreshServerList(); screen = 5; }
                 if (h3) { screen = 2; }
                 if (h4) { exitToMenu(); }
-                if (h5) { if (level != null && !worldName.isEmpty()) level.save(worldDir(worldName)); shouldQuit = true; }
+                if (h5) { saveWorld(); shouldQuit = true; }
             }
         }
         endOrtho();

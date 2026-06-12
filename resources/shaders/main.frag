@@ -10,8 +10,8 @@ layout(set = 0, binding = 1) uniform FogUBO {
     vec4 color;   // rgb = fog color, a unused
     float start;
     float end;
-    float enabled; // >0.5 = on
-    float _pad;
+    float enabled;   // >0.5 = on
+    float brightness; // global day/night light multiplier (1.0 = full daylight)
 } fog;
 
 layout(location = 0) out vec4 outColor;
@@ -19,6 +19,9 @@ layout(location = 0) out vec4 outColor;
 void main() {
     vec4 c = texture(tex, vUV) * vColor;
     if (c.a < (1.0 / 255.0)) discard;
+
+    // global day/night darkening (applied to lit geometry; UI uses brightness=1)
+    c.rgb *= fog.brightness;
 
     if (fog.enabled > 0.5) {
         float dist = length(vViewPos);

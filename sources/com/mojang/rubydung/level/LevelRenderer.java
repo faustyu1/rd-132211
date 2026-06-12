@@ -14,6 +14,10 @@ public class LevelRenderer implements LevelListener {
     private final Tesselator t = new Tesselator();
     private VkTexture terrain;
 
+    // visible chunk list, computed once on the opaque pass and reused for translucent
+    private final java.util.List<WorldChunk> visible = new java.util.ArrayList<>();
+    private Frustum frustum;
+
     public LevelRenderer(Level level) {
         this.level = level;
         level.addListener(this);
@@ -25,14 +29,19 @@ public class LevelRenderer implements LevelListener {
     }
 
     public void render(Player player, int layer) {
-        WorldChunk.rebuiltThisFrame = 0;
         GameRenderer r = GameRenderer.instance;
+        if (layer == 0) {
+            WorldChunk.rebuiltThisFrame = 0;
+            // recompute the visible set once per frame on the first (opaque) pass
+            visible.clear();
+            frustum = Frustum.getFrustum();
+            for (var chunk : level.getLoadedChunks()) {
+                if (frustum.cubeInFrustum(chunk.aabb)) visible.add(chunk);
+            }
+        }
         r.setPipeline(layer == 0 ? Pipelines.Pipeline.WORLD_OPAQUE : Pipelines.Pipeline.WORLD_TRANSLUCENT);
         r.bindTexture(terrain());
-        var frustum = Frustum.getFrustum();
-        for (var chunk : level.getLoadedChunks()) {
-            if (frustum.cubeInFrustum(chunk.aabb)) chunk.render(layer);
-        }
+        for (var chunk : visible) chunk.render(layer, frustum);
     }
 
     public void renderHit(HitResult h) {
@@ -69,19 +78,26 @@ public class LevelRenderer implements LevelListener {
     }
 
     private void setDirty(int x0, int y0, int z0, int x1, int y1, int z1) {
+        setDirty(x0, y0, z0, x1, y1, z1, false);
+    }
+
+    private void setDirty(int x0, int y0, int z0, int x1, int y1, int z1, boolean urgent) {
         int cx0 = Math.floorDiv(x0, CHUNK_SIZE);
         int cx1 = Math.floorDiv(x1, CHUNK_SIZE);
         int cz0 = Math.floorDiv(z0, CHUNK_SIZE);
         int cz1 = Math.floorDiv(z1, CHUNK_SIZE);
         for (var chunk : level.getLoadedChunks()) {
-            if (chunk.cx >= cx0 && chunk.cx <= cx1 && chunk.cz >= cz0 && chunk.cz <= cz1)
-                chunk.setDirty();
+            if (chunk.cx >= cx0 && chunk.cx <= cx1 && chunk.cz >= cz0 && chunk.cz <= cz1) {
+                // only the sections covering the touched Y-range rebuild, not the whole column
+                chunk.setDirtyRange(y0, y1, urgent);
+            }
         }
     }
 
     @Override
     public void tileChanged(int x, int y, int z) {
-        setDirty(x - 1, y - 1, z - 1, x + 1, y + 1, z + 1);
+        // player block edit: rebuild affected chunks this frame to avoid visible lag
+        setDirty(x - 1, y - 1, z - 1, x + 1, y + 1, z + 1, true);
     }
 
     @Override

@@ -94,6 +94,11 @@ public class ChunkGenerator {
         // octave noise clusters near 0.5; stretch it so climate bands are reachable
         double t  = stretch(temperature.octave(wx / 340.0, wz / 340.0, 3));
         double hu = stretch(humidity.octave(wx / 300.0, wz / 300.0, 3));
+        // jitter climate with fine detail noise so biome borders meander naturally
+        // (breaks up the dead-straight threshold lines without changing broad bands)
+        double edge = (detail.octave(wx / 28.0, wz / 28.0, 2) - 0.5) * 0.08;
+        t  = clamp01(t  + edge);
+        hu = clamp01(hu - edge);
         if (surf <= SEA_LEVEL - 2) return OCEAN;
         if (surf <= SEA_LEVEL + 1) return BEACH;
         if (surf >= 88)            return MOUNTAINS;
@@ -181,45 +186,97 @@ public class ChunkGenerator {
     }
 
     // ---- 4. caves (MC-style worm carver) ----
-    // Each chunk seeds its own tunnels; tunnels wander across chunk borders so
-    // we also process neighbouring chunks' tunnels that could reach into ours.
+    // Each region deterministically seeds its own tunnels; tunnels wander across
+    // chunk borders so we process every region within reach of the current chunk.
+    // A region's tunnel geometry depends only on its seed, and up to (2*R+1)^2
+    // neighbouring chunks replay it — so we compute each region's carve spheres
+    // once and cache them, instead of re-running the RNG walk per chunk.
     private static final int CAVE_SEARCH_RADIUS = 8; // chunks to search around current chunk
 
+    // packed carve spheres per region: [cx, cy, cz, radius] repeating. Thread-safe;
+    // entries are pure functions of the seed, so eviction only costs recomputation.
+    private final java.util.concurrent.ConcurrentHashMap<Long, float[]> caveCache =
+        new java.util.concurrent.ConcurrentHashMap<>();
+    private static final int CAVE_CACHE_MAX = 8192;
+
     private void carveCaves(WorldChunk chunk, int bx0, int bz0, int[] surf) {
+        int cxMin = bx0, cxMax = bx0 + S - 1;
+        int czMin = bz0, czMax = bz0 + S - 1;
         for (int ox = -CAVE_SEARCH_RADIUS; ox <= CAVE_SEARCH_RADIUS; ox++) {
             for (int oz = -CAVE_SEARCH_RADIUS; oz <= CAVE_SEARCH_RADIUS; oz++) {
-                int ncx = chunk.cx + ox, ncz = chunk.cz + oz;
-                long rseed = regionSeed(ncx, ncz);
-                Random rng = new Random(rseed);
-                // ~1 tunnel per 2 chunks (matching MC Alpha density)
-                int tunnels = rng.nextInt(6) == 0 ? 2 : (rng.nextInt(5) == 0 ? 1 : 0);
-                // room caves very rarely
-                if (rng.nextInt(16) == 0) {
-                    float rx = ncx * S + rng.nextFloat() * S;
-                    float ry = 8 + rng.nextFloat() * 40f;
-                    float rz = ncz * S + rng.nextFloat() * S;
-                    carveTunnel(chunk, bx0, bz0, surf, new Random(rng.nextLong()),
-                        rx, ry, rz,
-                        rng.nextFloat() * (float)(Math.PI * 2),
-                        (rng.nextFloat() - 0.5f) * 0.25f,
-                        0, 2.5f + rng.nextFloat(), 0);
-                }
-                for (int t = 0; t < tunnels; t++) {
-                    float sx = ncx * S + rng.nextFloat() * S;
-                    float sy = 8 + rng.nextFloat() * 48f;
-                    float sz = ncz * S + rng.nextFloat() * S;
-                    float yaw   = rng.nextFloat() * (float)(Math.PI * 2);
-                    float pitch = (rng.nextFloat() - 0.5f) * 0.25f;
-                    int len = 80 + rng.nextInt(80);
-                    carveTunnel(chunk, bx0, bz0, surf, new Random(rng.nextLong()),
-                        sx, sy, sz, yaw, pitch, len, 1.0f, 0);
+                float[] spheres = caveSpheres(chunk.cx + ox, chunk.cz + oz);
+                for (int i = 0; i + 3 < spheres.length; i += 4) {
+                    float sx = spheres[i], sy = spheres[i + 1], sz = spheres[i + 2], r = spheres[i + 3];
+                    // skip spheres whose bounding box can't touch this chunk
+                    if (sx + r < cxMin || sx - r > cxMax) continue;
+                    if (sz + r < czMin || sz - r > czMax) continue;
+                    applySphere(chunk, bx0, bz0, surf, sx, sy, sz, r);
                 }
             }
         }
     }
 
-    private void carveTunnel(WorldChunk chunk, int bx0, int bz0, int[] surf,
-                              Random rng, float ox, float oy, float oz,
+    /** Carve one sphere into the chunk (clipped to chunk + surface), mirroring the original loop. */
+    private void applySphere(WorldChunk chunk, int bx0, int bz0, int[] surf,
+                             float ox, float oy, float oz, float r) {
+        float r2 = r * r;
+        int x0 = Math.max((int)(ox - r) - 1, bx0), x1 = Math.min((int)(ox + r) + 1, bx0 + S - 1);
+        int z0 = Math.max((int)(oz - r) - 1, bz0), z1 = Math.min((int)(oz + r) + 1, bz0 + S - 1);
+        int y0c = Math.max(5, (int)(oy - r) - 1), y1c = (int)(oy + r) + 1;
+        for (int wx = x0; wx <= x1; wx++) {
+            int lx = wx - bx0;
+            float fx = wx + 0.5f - ox; float fx2 = fx * fx;
+            for (int wz = z0; wz <= z1; wz++) {
+                int lz = wz - bz0;
+                float fz = wz + 0.5f - oz;
+                if (fx2 + fz * fz > r2) continue;
+                int surfY = surf[lz * S + lx];
+                for (int wy = y0c; wy < Math.min(y1c, surfY); wy++) {
+                    float fy = wy + 0.5f - oy;
+                    if (fx2 + fy * fy + fz * fz < r2) carve(chunk, lx, wy, lz);
+                }
+            }
+        }
+    }
+
+    /** Deterministic carve-sphere geometry for a region's tunnels (cached). */
+    private float[] caveSpheres(int ncx, int ncz) {
+        long key = ((long) ncx << 32) ^ (ncz & 0xFFFFFFFFL);
+        float[] cached = caveCache.get(key);
+        if (cached != null) return cached;
+
+        FloatBuf out = new FloatBuf();
+        Random rng = new Random(regionSeed(ncx, ncz));
+        // ~1 tunnel per 2 chunks (matching MC Alpha density)
+        int tunnels = rng.nextInt(6) == 0 ? 2 : (rng.nextInt(5) == 0 ? 1 : 0);
+        // room caves very rarely
+        if (rng.nextInt(16) == 0) {
+            float rx = ncx * S + rng.nextFloat() * S;
+            float ry = 8 + rng.nextFloat() * 40f;
+            float rz = ncz * S + rng.nextFloat() * S;
+            recordTunnel(out, new Random(rng.nextLong()), rx, ry, rz,
+                rng.nextFloat() * (float)(Math.PI * 2),
+                (rng.nextFloat() - 0.5f) * 0.25f,
+                0, 2.5f + rng.nextFloat(), 0);
+        }
+        for (int t = 0; t < tunnels; t++) {
+            float sx = ncx * S + rng.nextFloat() * S;
+            float sy = 8 + rng.nextFloat() * 48f;
+            float sz = ncz * S + rng.nextFloat() * S;
+            float yaw   = rng.nextFloat() * (float)(Math.PI * 2);
+            float pitch = (rng.nextFloat() - 0.5f) * 0.25f;
+            int len = 80 + rng.nextInt(80);
+            recordTunnel(out, new Random(rng.nextLong()), sx, sy, sz, yaw, pitch, len, 1.0f, 0);
+        }
+
+        float[] result = out.toArray();
+        if (caveCache.size() >= CAVE_CACHE_MAX) caveCache.clear(); // bounded; deterministic refill
+        caveCache.putIfAbsent(key, result);
+        return result;
+    }
+
+    /** Replays the tunnel RNG walk, emitting carve spheres instead of carving (identical math). */
+    private void recordTunnel(FloatBuf out, Random rng, float ox, float oy, float oz,
                               float yaw, float pitch, int maxLen, float radiusMul, int depth) {
         float ddyaw = 0f, ddpitch = 0f;
         for (int step = 0; step < (maxLen == 0 ? 1 : maxLen); step++) {
@@ -235,28 +292,7 @@ public class ChunkGenerator {
             float r = radiusMul * (1.5f + (float) Math.sin(step * 0.18f) * 0.8f);
             if (r < 0.5f) r = 0.5f;
 
-            // early-out: bounding box doesn't intersect this chunk
-            if (ox + r < bx0 || ox - r >= bx0 + S) { pitch *= 0.85f; continue; }
-            if (oz + r < bz0 || oz - r >= bz0 + S) { pitch *= 0.85f; continue; }
-
-            float r2 = r * r;
-            int x0 = Math.max((int)(ox - r) - 1, bx0), x1 = Math.min((int)(ox + r) + 1, bx0 + S - 1);
-            int z0 = Math.max((int)(oz - r) - 1, bz0), z1 = Math.min((int)(oz + r) + 1, bz0 + S - 1);
-            int y0c = Math.max(5, (int)(oy - r) - 1), y1c = (int)(oy + r) + 1;
-            for (int wx = x0; wx <= x1; wx++) {
-                int lx = wx - bx0;
-                float fx = wx + 0.5f - ox; float fx2 = fx * fx;
-                for (int wz = z0; wz <= z1; wz++) {
-                    int lz = wz - bz0;
-                    float fz = wz + 0.5f - oz;
-                    if (fx2 + fz * fz > r2) continue;
-                    int surfY = surf[lz * S + lx];
-                    for (int wy = y0c; wy < Math.min(y1c, surfY); wy++) {
-                        float fy = wy + 0.5f - oy;
-                        if (fx2 + fy * fy + fz * fz < r2) carve(chunk, lx, wy, lz);
-                    }
-                }
-            }
+            out.add(ox); out.add(oy); out.add(oz); out.add(r);
 
             ddyaw   += (rng.nextFloat() - 0.5f) * 0.12f;
             ddpitch += (rng.nextFloat() - 0.5f) * 0.08f;
@@ -266,11 +302,22 @@ public class ChunkGenerator {
             if (radiusMul > 1.0f) radiusMul = Math.max(1.0f, radiusMul - 0.06f);
 
             if (depth == 0 && rng.nextInt(10) == 0 && step > 10) {
-                carveTunnel(chunk, bx0, bz0, surf, new Random(rng.nextLong()),
+                recordTunnel(out, new Random(rng.nextLong()),
                     ox, oy, oz, yaw + (rng.nextFloat() - 0.5f) * 1.6f,
                     pitch * 0.5f, maxLen - step, 1.0f, 1);
             }
         }
+    }
+
+    /** Minimal growable float buffer (avoids boxing). */
+    private static final class FloatBuf {
+        private float[] a = new float[256];
+        private int n = 0;
+        void add(float v) {
+            if (n == a.length) a = java.util.Arrays.copyOf(a, a.length * 2);
+            a[n++] = v;
+        }
+        float[] toArray() { return java.util.Arrays.copyOf(a, n); }
     }
 
     private long regionSeed(int cx, int cz) {

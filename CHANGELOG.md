@@ -8,6 +8,42 @@ This project follows [Semantic Versioning](https://semver.org/) while in `0.x`:
 
 Do not bump versions for every commit; group changes into a release and tag once.
 
+## [0.4.0] - 2026-06-13
+
+### Added
+- **Survival mode**: player health (0–20 half-hearts), fall damage, void damage,
+  invulnerability frames, passive regeneration, respawn, and a blocky heart HUD.
+- **Dropped items** (`DroppedItems`): broken blocks spawn spinning, gravity-affected,
+  collidable item entities with magnet pickup, pickup delay, and despawn timer.
+- **Creative inventory** (screen 6): block palette grid with cursor-carry, hotbar
+  editing, item counts, and block-name tooltips. Replaces the old crafting screen.
+- **Day/night cycle**: animated sky colour, warm dawn/dusk horizon tint, and a global
+  brightness multiplier driven through the fog UBO and fragment shader.
+- **Chunk sections (16³)**: meshing and rendering split into 8 vertical slices per
+  chunk with per-section frustum culling and dirty/urgent tracking.
+- **Player persistence** (`player.dat`): position, rotation, spawn point, health, game
+  mode, hotbar, and inventory saved per world. `B` sets the spawn point.
+- **Sky-light flood-fill**: per-chunk BFS sky lighting (0–15) with smooth face shading.
+- **Configurable render distance**: TINY/SHORT/NORMAL/FAR/EXTREME presets that load and
+  unload chunks live, not just adjust fog.
+
+### Changed
+- **Parallel chunk streaming**: chunk generation moved off the main thread to a worker
+  pool (nearest-first), eliminating walk microfreezes.
+- **Fast world preload**: `Level.preloadRegion` generates a 1-ring-wider area in parallel
+  so every mesh sees real neighbours — seamless borders with no re-mesh.
+- **Cave generation** rewritten with a deterministic sphere cache for seamless,
+  reproducible tunnels; biome borders now meander instead of forming straight lines.
+- Block edits rebuild affected sections synchronously for same-frame feedback.
+
+### Fixed
+- **Chunk seams**: neighbours are re-meshed when a new chunk loads, removing the light
+  band that appeared every 16 blocks at chunk borders.
+- **Water vs caves**: still water adjacent to a cave mouth now wakes the fluid sim and
+  flows in on chunk load instead of staying frozen.
+- **Item pickup**: picked-up blocks are no longer silently consumed; hotbar slots show a
+  block-colour swatch and count.
+
 ## [0.3.0] - 2026-06-10
 
 ### Changed

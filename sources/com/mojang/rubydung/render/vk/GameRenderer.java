@@ -49,6 +49,13 @@ public class GameRenderer {
     private boolean fogEnabled = false;
     private Pipelines.Pipeline currentPipeline = null;
     private long boundPipelineHandle = VK_NULL_HANDLE;
+    private long boundDescriptorSet = VK_NULL_HANDLE;
+    private boolean indexBound = false;
+    // reusable single-element buffers to avoid stackPush() in the hot draw path
+    private final java.nio.LongBuffer vbHandle = org.lwjgl.system.MemoryUtil.memAllocLong(1);
+    private final java.nio.LongBuffer vbOffset = org.lwjgl.system.MemoryUtil.memAllocLong(1);
+    private final java.nio.LongBuffer descSet  = org.lwjgl.system.MemoryUtil.memAllocLong(1);
+    private final java.nio.ByteBuffer pcBuf     = org.lwjgl.system.MemoryUtil.memAlloc(128);
 
     private boolean vsync;
     private volatile boolean resizeRequested = false;
@@ -116,6 +123,8 @@ public class GameRenderer {
         currentTexture = null;
         currentPipeline = null;
         boundPipelineHandle = VK_NULL_HANDLE;
+        boundDescriptorSet = VK_NULL_HANDLE;
+        indexBound = false;
         matricesDirty = true;
 
         setViewportScissor();
@@ -187,7 +196,12 @@ public class GameRenderer {
     public void bindWhite() { currentTexture = whiteTexture; }
 
     public void setFog(float r, float g, float b, float start, float end) {
-        descriptors.updateFogOn(frames.frameIndex(), r, g, b, start, end);
+        setFog(r, g, b, start, end, 1.0f);
+    }
+
+    /** Fog + global day/night brightness multiplier applied to lit geometry. */
+    public void setFog(float r, float g, float b, float start, float end, float brightness) {
+        descriptors.updateFogOn(frames.frameIndex(), r, g, b, start, end, brightness);
         fogEnabled = true;
     }
     public void disableFog() { fogEnabled = false; }
@@ -205,12 +219,9 @@ public class GameRenderer {
 
     private void pushConstantsIfNeeded() {
         if (!matricesDirty) return;
-        try (MemoryStack stack = stackPush()) {
-            ByteBuffer pc = stack.malloc(128);
-            projection.get(0, pc);
-            modelView.get(64, pc);
-            vkCmdPushConstants(frames.cmd(), pipelines.pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, pc);
-        }
+        projection.get(0, pcBuf);
+        modelView.get(64, pcBuf);
+        vkCmdPushConstants(frames.cmd(), pipelines.pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, pcBuf);
         matricesDirty = false;
     }
 
@@ -218,10 +229,17 @@ public class GameRenderer {
         VkTexture tex = currentTexture != null ? currentTexture : whiteTexture;
         int fogMode = fogEnabled ? 1 : 0;
         long set = tex.descSets[DescriptorAllocator.setIndex(fogMode, frames.frameIndex())];
-        try (MemoryStack stack = stackPush()) {
-            vkCmdBindDescriptorSets(frames.cmd(), VK_PIPELINE_BIND_POINT_GRAPHICS,
-                pipelines.pipelineLayout, 0, stack.longs(set), null);
-        }
+        if (set == boundDescriptorSet) return;
+        descSet.put(0, set);
+        vkCmdBindDescriptorSets(frames.cmd(), VK_PIPELINE_BIND_POINT_GRAPHICS,
+            pipelines.pipelineLayout, 0, descSet, null);
+        boundDescriptorSet = set;
+    }
+
+    private void bindQuadIndexIfNeeded() {
+        if (indexBound) return;
+        vkCmdBindIndexBuffer(frames.cmd(), quadIndex.buffer.buffer, 0, VK_INDEX_TYPE_UINT32);
+        indexBound = true;
     }
 
     /** Draw a persistent quad vertex buffer (e.g. a chunk layer). vertexCount = number of quad-corners. */
@@ -231,10 +249,9 @@ public class GameRenderer {
         bindPipelineIfNeeded();
         pushConstantsIfNeeded();
         bindDescriptor();
-        try (MemoryStack stack = stackPush()) {
-            vkCmdBindVertexBuffers(cmd, 0, stack.longs(vb.buffer), stack.longs(0L));
-        }
-        vkCmdBindIndexBuffer(cmd, quadIndex.buffer.buffer, 0, VK_INDEX_TYPE_UINT32);
+        vbHandle.put(0, vb.buffer); vbOffset.put(0, 0L);
+        vkCmdBindVertexBuffers(cmd, 0, vbHandle, vbOffset);
+        bindQuadIndexIfNeeded();
         vkCmdDrawIndexed(cmd, vertexCount / 4 * 6, 1, 0, 0, 0);
     }
 
@@ -249,10 +266,9 @@ public class GameRenderer {
         bindPipelineIfNeeded();
         pushConstantsIfNeeded();
         bindDescriptor();
-        try (MemoryStack stack = stackPush()) {
-            vkCmdBindVertexBuffers(cmd, 0, stack.longs(sb.buffer().buffer), stack.longs(byteOffset));
-        }
-        vkCmdBindIndexBuffer(cmd, quadIndex.buffer.buffer, 0, VK_INDEX_TYPE_UINT32);
+        vbHandle.put(0, sb.buffer().buffer); vbOffset.put(0, byteOffset);
+        vkCmdBindVertexBuffers(cmd, 0, vbHandle, vbOffset);
+        bindQuadIndexIfNeeded();
         vkCmdDrawIndexed(cmd, vertexCount / 4 * 6, 1, 0, 0, 0);
     }
 
@@ -267,9 +283,8 @@ public class GameRenderer {
         bindPipelineIfNeeded();
         pushConstantsIfNeeded();
         bindDescriptor();
-        try (MemoryStack stack = stackPush()) {
-            vkCmdBindVertexBuffers(cmd, 0, stack.longs(sb.buffer().buffer), stack.longs(byteOffset));
-        }
+        vbHandle.put(0, sb.buffer().buffer); vbOffset.put(0, byteOffset);
+        vkCmdBindVertexBuffers(cmd, 0, vbHandle, vbOffset);
         vkCmdDraw(cmd, vertexCount, 1, 0, 0);
     }
 

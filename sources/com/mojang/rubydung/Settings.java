@@ -5,18 +5,23 @@ import java.util.Properties;
 
 public class Settings {
     public boolean vsync       = true;
-    public int     renderDist  = 1;
+    public int     renderDist  = 2;
     public int     sensitivity = 2;
     public int     fovIndex    = 0;
     public int     resIndex    = 1;   // index into RESOLUTIONS
     public boolean fullscreen  = false;
 
     public static final float[]  FOV_VALUES  = {70, 80, 90, 100, 110};
-    public static final float[]  DIST_END    = {80, 160, 240};
+    // render distance: chunk radius loaded around the player + matching fog end (blocks)
+    public static final int[]    DIST_CHUNKS = {3, 6, 10, 16, 24};
+    public static final float[]  DIST_END    = {48, 96, 152, 240, 360};
     public static final float[]  SENS_VALUES = {0.08f, 0.12f, 0.15f, 0.22f};
-    public static final String[] DIST_LABELS = {"SHORT", "NORMAL", "FAR"};
+    public static final String[] DIST_LABELS = {"TINY", "SHORT", "NORMAL", "FAR", "EXTREME"};
     public static final String[] SENS_LABELS = {"LOW", "MED", "HIGH", "MAX"};
     public static final String[] FOV_LABELS  = {"70", "80", "90", "100", "110"};
+
+    /** Chunk radius to stream around the player for the current render-distance setting. */
+    public int chunkRadius() { return DIST_CHUNKS[renderDist]; }
 
     public static final int[][] RESOLUTIONS = {
         {854, 480}, {1024, 768}, {1280, 720}, {1280, 800},
@@ -35,7 +40,7 @@ public class Settings {
             p.load(r);
             vsync      = Boolean.parseBoolean(p.getProperty("vsync",       "true"));
             fullscreen = Boolean.parseBoolean(p.getProperty("fullscreen",  "false"));
-            renderDist = Math.clamp(Integer.parseInt(p.getProperty("renderDist",  "1")), 0, DIST_END.length - 1);
+            renderDist = Math.clamp(Integer.parseInt(p.getProperty("renderDist",  "2")), 0, DIST_END.length - 1);
             sensitivity= Math.clamp(Integer.parseInt(p.getProperty("sensitivity", "2")), 0, SENS_VALUES.length - 1);
             fovIndex   = Math.clamp(Integer.parseInt(p.getProperty("fovIndex",    "0")), 0, FOV_VALUES.length - 1);
             resIndex   = Math.clamp(Integer.parseInt(p.getProperty("resIndex",    "1")), 0, RESOLUTIONS.length - 1);

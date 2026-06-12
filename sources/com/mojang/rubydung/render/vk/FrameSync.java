@@ -14,7 +14,7 @@ import static org.lwjgl.vulkan.VK12.VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
 
 /** Manages frames-in-flight: command pools, sync primitives, and begin/end rendering. */
 public class FrameSync {
-    public static final int FRAMES_IN_FLIGHT = 2;
+    public static final int FRAMES_IN_FLIGHT = 3;
 
     private final VkContext ctx;
     private final Swapchain swapchain;

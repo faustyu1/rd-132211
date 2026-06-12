@@ -134,8 +134,7 @@ public class Tile {
         if (!level.isSolidOrSameFluid(x, y - 1, z, w)) {
             float[] c = uv(texBottom);
             float br = level.getBrightness(x, y - 1, z);
-            boolean lit = br >= 1.0f;
-            if (translucent ? (layer == 1) : (lit ^ (layer == 1))) {
+            if (translucent ? (layer == 1) : (layer == 0)) {
                 float a00 = ao(level, x, y - 1, z, -1, 0, 0, 1) * br,
                     a10 = ao(level, x, y - 1, z, 1, 0, 0, 1) * br;
                 float a01 = ao(level, x, y - 1, z, -1, 0, 0, -1) * br,
@@ -157,9 +156,8 @@ public class Tile {
         // top face
         if (!level.isSolidOrSameFluid(x, y + 1, z, w)) {
             float[] c = uv(texTop);
-            float br = level.getBrightness(x, y, z);
-            boolean lit = br >= 1.0f;
-            if (translucent ? (layer == 1) : (lit ^ (layer == 1))) {
+            float br = level.getBrightness(x, y + 1, z);
+            if (translucent ? (layer == 1) : (layer == 0)) {
                 float a11 = ao(level, x, y + 1, z, 1, 0, 0, 1) * br,
                     a10 = ao(level, x, y + 1, z, 1, 0, 0, -1) * br;
                 float a00 = ao(level, x, y + 1, z, -1, 0, 0, -1) * br,
@@ -183,8 +181,7 @@ public class Tile {
             float[] c = uv(texSide);
             float rawBr = level.getBrightness(x, y, z - 1);
             float br = rawBr * 0.8f;
-            boolean lit = rawBr >= 1.0f;
-            if (translucent ? (layer == 1) : (lit ^ (layer == 1))) {
+            if (translucent ? (layer == 1) : (layer == 0)) {
                 float a00 = ao(level, x, y, z - 1, -1, 0, 0, -1) * br,
                     a10 = ao(level, x, y, z - 1, 1, 0, 0, -1) * br;
                 float a01 = ao(level, x, y, z - 1, -1, 0, 0, 1) * br,
@@ -208,8 +205,7 @@ public class Tile {
             float[] c = uv(texSide);
             float rawBr = level.getBrightness(x, y, z + 1);
             float br = rawBr * 0.8f;
-            boolean lit = rawBr >= 1.0f;
-            if (translucent ? (layer == 1) : (lit ^ (layer == 1))) {
+            if (translucent ? (layer == 1) : (layer == 0)) {
                 float a00 = ao(level, x, y, z + 1, -1, 0, 0, 1) * br,
                     a10 = ao(level, x, y, z + 1, 1, 0, 0, 1) * br;
                 float a01 = ao(level, x, y, z + 1, -1, 0, 0, -1) * br,
@@ -233,8 +229,7 @@ public class Tile {
             float[] c = uv(texSide);
             float rawBr = level.getBrightness(x - 1, y, z);
             float br = rawBr * 0.6f;
-            boolean lit = rawBr >= 1.0f;
-            if (translucent ? (layer == 1) : (lit ^ (layer == 1))) {
+            if (translucent ? (layer == 1) : (layer == 0)) {
                 float a00 = ao(level, x - 1, y, z, 0, -1, -1, 0) * br,
                     a10 = ao(level, x - 1, y, z, 0, 1, -1, 0) * br;
                 float a01 = ao(level, x - 1, y, z, 0, -1, 1, 0) * br,
@@ -258,8 +253,7 @@ public class Tile {
             float[] c = uv(texSide);
             float rawBr = level.getBrightness(x + 1, y, z);
             float br = rawBr * 0.6f;
-            boolean lit = rawBr >= 1.0f;
-            if (translucent ? (layer == 1) : (lit ^ (layer == 1))) {
+            if (translucent ? (layer == 1) : (layer == 0)) {
                 float a00 = ao(level, x + 1, y, z, 0, -1, 1, 0) * br,
                     a10 = ao(level, x + 1, y, z, 0, 1, 1, 0) * br;
                 float a01 = ao(level, x + 1, y, z, 0, -1, -1, 0) * br,

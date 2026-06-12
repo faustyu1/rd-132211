@@ -32,27 +32,27 @@ public class DescriptorAllocator {
         createPool();
 
         fogOff = new VkBuf(ctx, FOG_UBO_SIZE, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
-        writeFog(fogOff, 0, 0, 0, 0, 0, false); // disabled
+        writeFog(fogOff, 0, 0, 0, 0, 0, false, 1.0f); // disabled, full brightness (UI/HUD)
         for (int i = 0; i < FrameSync.FRAMES_IN_FLIGHT; i++) {
             fogOn[i] = new VkBuf(ctx, FOG_UBO_SIZE, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
-            writeFog(fogOn[i], 0.5f, 0.8f, 1.0f, 0f, 128f, true);
+            writeFog(fogOn[i], 0.5f, 0.8f, 1.0f, 0f, 128f, true, 1.0f);
         }
     }
 
     // last-written fog params per frame, to skip redundant rewrites
-    private final float[][] fogOnState = new float[FrameSync.FRAMES_IN_FLIGHT][5];
+    private final float[][] fogOnState = new float[FrameSync.FRAMES_IN_FLIGHT][6];
 
-    public void updateFogOn(int frame, float r, float g, float b, float start, float end) {
+    public void updateFogOn(int frame, float r, float g, float b, float start, float end, float brightness) {
         float[] s = fogOnState[frame];
-        if (s[0] == r && s[1] == g && s[2] == b && s[3] == start && s[4] == end) return;
-        s[0] = r; s[1] = g; s[2] = b; s[3] = start; s[4] = end;
-        writeFog(fogOn[frame], r, g, b, start, end, true);
+        if (s[0] == r && s[1] == g && s[2] == b && s[3] == start && s[4] == end && s[5] == brightness) return;
+        s[0] = r; s[1] = g; s[2] = b; s[3] = start; s[4] = end; s[5] = brightness;
+        writeFog(fogOn[frame], r, g, b, start, end, true, brightness);
     }
 
-    private void writeFog(VkBuf buf, float r, float g, float b, float start, float end, boolean enabled) {
+    private void writeFog(VkBuf buf, float r, float g, float b, float start, float end, boolean enabled, float brightness) {
         ByteBuffer bb = buf.map();
         bb.putFloat(r).putFloat(g).putFloat(b).putFloat(1.0f); // color vec4
-        bb.putFloat(start).putFloat(end).putFloat(enabled ? 1.0f : 0.0f).putFloat(0.0f);
+        bb.putFloat(start).putFloat(end).putFloat(enabled ? 1.0f : 0.0f).putFloat(brightness);
     }
 
     private void createSetLayout() {

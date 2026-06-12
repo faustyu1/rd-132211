@@ -22,6 +22,13 @@ public class Player {
     public GameMode mode = GameMode.CREATIVE;
     public float fallDistance = 0;
 
+    // survival health, measured in half-hearts (0..20, i.e. 10 full hearts)
+    public static final int MAX_HEALTH = 20;
+    public int health = MAX_HEALTH;
+    public int hurtTime = 0;          // ticks of red flash after taking damage
+    public int invulnTime = 0;        // ticks of damage immunity
+    private int regenTimer = 0;       // ticks until next natural regen point
+
     // double-tap W detection
     private long lastWTap  = 0;
     private boolean wWasUp = true;
@@ -34,9 +41,55 @@ public class Player {
         resetPos();
     }
 
+    // persistent spawn point (defaults to world origin column)
+    public boolean hasSpawn = false;
+    public float spawnX = 0.5f, spawnY, spawnZ = 0.5f;
+
+    /** Set the respawn/reset point to a world position. */
+    public void setSpawn(float sx, float sy, float sz) {
+        spawnX = sx; spawnY = sy; spawnZ = sz; hasSpawn = true;
+    }
+
     private void resetPos() {
-        int sy = level.getSurfaceY(0, 0);
-        setPos(0.5f, sy + 2 + 1.62f, 0.5f);
+        if (hasSpawn) {
+            setPos(spawnX, spawnY, spawnZ);
+        } else {
+            int sy = level.getSurfaceY(0, 0);
+            setPos(0.5f, sy + 2 + 1.62f, 0.5f);
+        }
+    }
+
+    /** Teleport to an explicit position (used when restoring a saved game). */
+    public void teleport(float px, float py, float pz, float yaw, float pitch) {
+        setPos(px, py, pz);
+        yRot = yaw; xRot = pitch;
+        xd = yd = zd = 0; fallDistance = 0;
+    }
+
+    /** Apply damage in half-hearts; ignored in creative/spectator or while invulnerable. */
+    public void hurt(int amount) {
+        if (mode != GameMode.SURVIVAL || amount <= 0) return;
+        if (invulnTime > 0) return;
+        health = Math.max(0, health - amount);
+        hurtTime = 10;
+        invulnTime = 10;
+        regenTimer = 0;
+        if (health <= 0) respawn();
+    }
+
+    public void heal(int amount) {
+        health = Math.min(MAX_HEALTH, health + amount);
+    }
+
+    public boolean isDead() { return mode == GameMode.SURVIVAL && health <= 0; }
+
+    private void respawn() {
+        health = MAX_HEALTH;
+        hurtTime = 0;
+        invulnTime = 20;
+        fallDistance = 0;
+        xd = yd = zd = 0;
+        resetPos();
     }
 
     private void setPos(float x, float y, float z) {
@@ -64,11 +117,21 @@ public class Player {
         yo = y;
         zo = z;
 
+        if (hurtTime > 0) hurtTime--;
+        if (invulnTime > 0) invulnTime--;
+        // slow natural regen in survival: 1 half-heart per ~4s while not at full
+        if (mode == GameMode.SURVIVAL && health > 0 && health < MAX_HEALTH) {
+            if (++regenTimer >= 80) { regenTimer = 0; health++; }
+        }
+        // void damage instead of the old free teleport-on-fall
+        if (y < -40) hurt(MAX_HEALTH);
+
         float xa = 0.0f;
         float ya = 0.0f;
 
         if (Input.isKeyDown(GLFW_KEY_R)) resetPos();
-        if (y < -20) resetPos();
+        // non-survival: free teleport back up if you fall out. survival takes void damage (above).
+        if (y < -20 && mode != GameMode.SURVIVAL) resetPos();
 
         boolean wDown = Input.isKeyDown(GLFW_KEY_UP) || Input.isKeyDown(GLFW_KEY_W);
         if (Input.isKeyDown(GLFW_KEY_DOWN) || Input.isKeyDown(GLFW_KEY_S)) ya += 1.0f;
@@ -147,11 +210,13 @@ public class Player {
         if (!onGround && !inWater() && yd < 0) {
             fallDistance -= yd;
         } else if (onGround) {
-            if (mode == GameMode.SURVIVAL && fallDistance > 5) {
-                // fall damage: just reset for now (health not yet implemented)
+            if (mode == GameMode.SURVIVAL && fallDistance > 3.0f) {
+                // 1 half-heart per block fallen beyond 3 (water/landing already excluded)
+                hurt((int) Math.floor(fallDistance - 3.0f));
             }
             fallDistance = 0;
         }
+        if (inWater()) fallDistance = 0;
 
         // sneak: prevent walking off edges
         if (sneaking && onGround) {

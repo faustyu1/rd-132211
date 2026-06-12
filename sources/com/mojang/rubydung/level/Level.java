@@ -16,6 +16,12 @@ public class Level {
     public static final int sizeY = WorldChunk.HEIGHT;
 
     private final ConcurrentHashMap<Long, WorldChunk> chunks = new ConcurrentHashMap<>();
+    // chunk keys currently being generated on the background pool (avoid duplicate work)
+    private final java.util.Set<Long> generating = ConcurrentHashMap.newKeySet();
+    private final java.util.concurrent.ExecutorService genPool =
+        java.util.concurrent.Executors.newFixedThreadPool(
+            Math.max(2, Runtime.getRuntime().availableProcessors() - 1),
+            r -> { Thread t = new Thread(r, "chunk-gen"); t.setDaemon(true); return t; });
     private final ChunkGenerator generator;
     private long seed;
     private final List<LevelListener> levelListeners = new ArrayList<>();
@@ -33,34 +39,120 @@ public class Level {
     }
 
     public WorldChunk getOrLoadChunk(int cx, int cz) {
-        return chunks.computeIfAbsent(chunkKey(cx, cz), k -> {
-            WorldChunk chunk = new WorldChunk(cx, cz, this);
-            generator.generate(chunk);
+        boolean[] created = {false};
+        WorldChunk chunk = chunks.computeIfAbsent(chunkKey(cx, cz), k -> {
+            created[0] = true;
+            WorldChunk c = new WorldChunk(cx, cz, this);
+            generator.generate(c);
+            wakeBorderWater(c);
+            return c;
+        });
+        if (created[0]) {
+            // a freshly streamed-in chunk invalidates its neighbours' edge faces,
+            // brightness and AO, so re-mesh the four that already exist
+            markNeighborDirty(cx - 1, cz);
+            markNeighborDirty(cx + 1, cz);
+            markNeighborDirty(cx, cz - 1);
+            markNeighborDirty(cx, cz + 1);
             chunk.scheduleBuild();
-            // wake only border water blocks (where water may flow to/from neighbours)
-            int bx0 = cx * WorldChunk.SIZE, bz0 = cz * WorldChunk.SIZE;
-            int S = WorldChunk.SIZE;
-            for (int y = 0; y < WorldChunk.HEIGHT; y++) {
-                for (int lx = 0; lx < S; lx++) {
-                    if (Tile.isWater(chunk.getBlock(lx, y, 0)))   fluidPending.add(packPos(bx0+lx, y, bz0));
-                    if (Tile.isWater(chunk.getBlock(lx, y, S-1))) fluidPending.add(packPos(bx0+lx, y, bz0+S-1));
-                }
+        }
+        return chunk;
+    }
+
+    /** Generate a chunk's block data only — no mesh build, no neighbour invalidation. */
+    private WorldChunk loadChunkData(int cx, int cz) {
+        return chunks.computeIfAbsent(chunkKey(cx, cz), k -> {
+            WorldChunk c = new WorldChunk(cx, cz, this);
+            generator.generate(c);
+            wakeBorderWater(c);
+            return c;
+        });
+    }
+
+    private void markNeighborDirty(int cx, int cz) {
+        WorldChunk c = chunks.get(chunkKey(cx, cz));
+        if (c != null) c.setDirty();
+    }
+
+    /**
+     * Wake water blocks that can flow on chunk load:
+     *  - blocks on a chunk border (water may flow to/from a neighbour), and
+     *  - any water exposed to air on a side or below (e.g. a lake/ocean next to a
+     *    carved cave mouth) so the fluid sim floods the opening instead of leaving
+     *    a frozen wall of static water beside the cave.
+     */
+    private void wakeBorderWater(WorldChunk chunk) {
+        int bx0 = chunk.cx * WorldChunk.SIZE, bz0 = chunk.cz * WorldChunk.SIZE;
+        int S = WorldChunk.SIZE;
+        for (int y = 0; y < WorldChunk.HEIGHT; y++) {
+            for (int lx = 0; lx < S; lx++) {
                 for (int lz = 0; lz < S; lz++) {
-                    if (Tile.isWater(chunk.getBlock(0,   y, lz))) fluidPending.add(packPos(bx0, y, bz0+lz));
-                    if (Tile.isWater(chunk.getBlock(S-1, y, lz))) fluidPending.add(packPos(bx0+S-1, y, bz0+lz));
+                    if (!Tile.isWater(chunk.getBlock(lx, y, lz))) continue;
+                    boolean border = lx == 0 || lx == S - 1 || lz == 0 || lz == S - 1;
+                    if (border || touchesAir(chunk, lx, y, lz))
+                        fluidPending.add(packPos(bx0 + lx, y, bz0 + lz));
                 }
             }
-            return chunk;
+        }
+    }
+
+    /** True if any side/below neighbour of a water cell is open air it could flow into. */
+    private static boolean touchesAir(WorldChunk c, int lx, int y, int lz) {
+        return c.getBlock(lx, y - 1, lz) == Tile.AIR
+            || c.getBlock(lx + 1, y, lz) == Tile.AIR
+            || c.getBlock(lx - 1, y, lz) == Tile.AIR
+            || c.getBlock(lx, y, lz + 1) == Tile.AIR
+            || c.getBlock(lx, y, lz - 1) == Tile.AIR;
+    }
+
+    /**
+     * Generate and mesh a whole square region up front, in parallel.
+     * Block data is generated one ring wider than the build area so that every
+     * built mesh sees real neighbours (seamless borders, no later re-mesh), then
+     * all meshes are built concurrently. Blocks until meshes are ready to upload.
+     */
+    public void preloadRegion(int cx0, int cx1, int cz0, int cz1) {
+        List<int[]> dataCoords = new ArrayList<>();
+        for (int cx = cx0 - 1; cx <= cx1 + 1; cx++)
+            for (int cz = cz0 - 1; cz <= cz1 + 1; cz++)
+                dataCoords.add(new int[]{cx, cz});
+        dataCoords.parallelStream().forEach(c -> loadChunkData(c[0], c[1]));
+
+        List<int[]> buildCoords = new ArrayList<>();
+        for (int cx = cx0; cx <= cx1; cx++)
+            for (int cz = cz0; cz <= cz1; cz++)
+                buildCoords.add(new int[]{cx, cz});
+        buildCoords.parallelStream().forEach(c -> {
+            WorldChunk ch = chunks.get(chunkKey(c[0], c[1]));
+            if (ch != null) ch.buildNow();
         });
     }
 
     public void update(float playerX, float playerZ, int renderDist) {
         int pcx = (int) Math.floor(playerX / WorldChunk.SIZE);
         int pcz = (int) Math.floor(playerZ / WorldChunk.SIZE);
-        // load chunks in range
+        // queue missing chunks for background generation, nearest first
+        List<long[]> wanted = new ArrayList<>();
         for (int dx = -renderDist; dx <= renderDist; dx++)
-            for (int dz = -renderDist; dz <= renderDist; dz++)
-                getOrLoadChunk(pcx + dx, pcz + dz);
+            for (int dz = -renderDist; dz <= renderDist; dz++) {
+                int cx = pcx + dx, cz = pcz + dz;
+                long key = chunkKey(cx, cz);
+                if (chunks.containsKey(key) || generating.contains(key)) continue;
+                wanted.add(new long[]{(long) dx * dx + (long) dz * dz, cx, cz});
+            }
+        wanted.sort((a, b) -> Long.compare(a[0], b[0]));
+        for (long[] w : wanted) {
+            int cx = (int) w[1], cz = (int) w[2];
+            long key = chunkKey(cx, cz);
+            if (!generating.add(key)) continue;
+            genPool.execute(() -> {
+                try {
+                    streamChunk(cx, cz);
+                } finally {
+                    generating.remove(key);
+                }
+            });
+        }
         // unload far chunks
         int unloadDist = renderDist + 2;
         chunks.entrySet().removeIf(e -> {
@@ -71,6 +163,23 @@ public class Level {
             }
             return false;
         });
+    }
+
+    /** Background-thread chunk generation: create, generate, publish, then mesh + fix neighbours. */
+    private void streamChunk(int cx, int cz) {
+        long key = chunkKey(cx, cz);
+        if (chunks.containsKey(key)) return;
+        WorldChunk c = new WorldChunk(cx, cz, this);
+        generator.generate(c);
+        wakeBorderWater(c);
+        if (chunks.putIfAbsent(key, c) != null) return; // lost the race, discard
+        // symmetric neighbour invalidation: whichever chunk publishes last sees the
+        // other present and re-meshes it, so borders converge to seamless either way
+        markNeighborDirty(cx - 1, cz);
+        markNeighborDirty(cx + 1, cz);
+        markNeighborDirty(cx, cz - 1);
+        markNeighborDirty(cx, cz + 1);
+        c.scheduleBuild();
     }
 
     public Collection<WorldChunk> getLoadedChunks() {
