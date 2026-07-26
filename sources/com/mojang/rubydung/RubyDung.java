@@ -18,6 +18,9 @@ import static org.lwjgl.glfw.GLFW.*;
 import static org.lwjgl.glfw.GLFWVulkan.glfwVulkanSupported;
 
 public class RubyDung implements Runnable {
+    /** Shown on the main menu; keep in step with the CHANGELOG release being tagged. */
+    private static final String VERSION = "0.4.1";
+
     private int width;
     private int height;
     private int winWidth;   // logical window size (for mouse coords)
@@ -1924,8 +1927,7 @@ public class RubyDung implements Runnable {
 
         // version strings
         GL.glColor4f(1f, 1f, 1f, 0.7f);
-        String ver = "RUBYDUNG ALPHA 0.1";
-        drawText(ver, 8, height - 22, 8, 12, 11);
+        drawText("RUBYDUNG ALPHA " + VERSION, 8, height - 22, 8, 12, 11);
 
         var menuEvents = Input.pollMouseEvents();
         if (menuCooldown > 0) { menuCooldown--; menuEvents.clear(); }
