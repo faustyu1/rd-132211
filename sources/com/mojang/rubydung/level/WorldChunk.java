@@ -25,6 +25,9 @@ public class WorldChunk {
     final int[] lightDepths = new int[SIZE * SIZE];
     // propagated sky light 0..15 per block (BFS): full overhead sky = 15, decays 1 per block
     final byte[] skyLight = new byte[SIZE * HEIGHT * SIZE];
+    // propagated block light 0..15 from emitters (torches). Kept separate from sky light
+    // because only the sky half follows the day/night cycle.
+    final byte[] blockLight = new byte[SIZE * HEIGHT * SIZE];
     private static final int MAX_LIGHT = 15;
     // BFS scratch queue: relighting runs on the chunk-gen threads, the mesh pool and the
     // main thread, so it is per-thread — a shared buffer would race, and a per-chunk one
@@ -49,7 +52,7 @@ public class WorldChunk {
         }
     }
 
-    // interleaved vertex array per layer (pos3+uv2+color4 = 9 floats/vertex)
+    // interleaved vertex array per layer (pos3+uv2+color4+light2 = 11 floats/vertex)
     private record MeshData(float[][] verts, int[] floatCount, int[] count) {}
 
     private final Section[] sections = new Section[SECTIONS];
@@ -82,7 +85,9 @@ public class WorldChunk {
 
     public void setBlock(int lx, int y, int lz, byte type) {
         if (lx < 0 || lx >= SIZE || y < 0 || y >= HEIGHT || lz < 0 || lz >= SIZE) return;
-        blocks[y * SIZE * SIZE + lz * SIZE + lx] = type;
+        int idx = y * SIZE * SIZE + lz * SIZE + lx;
+        if (Tile.lightEmission(blocks[idx]) > 0 || Tile.lightEmission(type) > 0) emitters = null;
+        blocks[idx] = type;
         markSectionDirty(y, false);
     }
 
@@ -104,6 +109,7 @@ public class WorldChunk {
             }
         }
         calcSkyLight();
+        calcBlockLight();
     }
 
     /**
@@ -114,6 +120,7 @@ public class WorldChunk {
         if (lx < 0 || lx >= SIZE || lz < 0 || lz >= SIZE) return;
         lightDepths[lz * SIZE + lx] = surfaceDepth(lx, lz);
         calcSkyLight();
+        calcBlockLight();
     }
 
     /** Highest y in this column that still blocks light (0 if the column is fully open). */
@@ -127,8 +134,8 @@ public class WorldChunk {
     }
 
     private static boolean blocksLight(byte b) {
-        // air, leaves and water let light through (leaves give dappled, not full block)
-        return b != 0 && b != 3 && !Tile.isWater(b);
+        // air, leaves, water and torches let light through (leaves give dappled, not full block)
+        return Tile.isSolid(b);
     }
 
     /**
@@ -173,13 +180,93 @@ public class WorldChunk {
     }
 
     private int pushLight(int lx, int y, int lz, int level, int[] queue, int tail) {
+        return push(skyLight, lx, y, lz, level, queue, tail);
+    }
+
+    /** Raise one cell of a light map to {@code level} and queue it, if that is an increase. */
+    private int push(byte[] map, int lx, int y, int lz, int level, int[] queue, int tail) {
         if (lx < 0 || lx >= SIZE || y < 0 || y >= HEIGHT || lz < 0 || lz >= SIZE) return tail;
         if (blocksLight(getBlock(lx, y, lz))) return tail;
         int idx = y * SIZE * SIZE + lz * SIZE + lx;
-        if (skyLight[idx] >= level) return tail;
-        skyLight[idx] = (byte) level;
+        if (map[idx] >= level) return tail;
+        map[idx] = (byte) level;
         queue[tail++] = idx;
         return tail;
+    }
+
+    /**
+     * Block light from this chunk's own emitters only. Light that crosses a chunk border is
+     * added afterwards by Level's world-space reflood: seeding a chunk from its neighbours'
+     * light instead would be circular — two chunks would keep feeding each other the light of
+     * a torch that has already been removed.
+     */
+    public void calcBlockLight() {
+        java.util.Arrays.fill(blockLight, (byte) 0);
+        final int SS = SIZE * SIZE;
+        int[] queue = lightQueue.get();
+        int head = 0, tail = 0;
+        for (int idx : emitters()) {
+            blockLight[idx] = (byte) Tile.lightEmission(blocks[idx]);
+            queue[tail++] = idx;
+        }
+        while (head < tail) {
+            int idx = queue[head++];
+            int y = idx / SS;
+            int rem = idx - y * SS;
+            int lz = rem / SIZE;
+            int lx = rem - lz * SIZE;
+            int next = blockLight[idx] - 1;
+            if (next <= 0) continue;
+            tail = push(blockLight, lx - 1, y, lz, next, queue, tail);
+            tail = push(blockLight, lx + 1, y, lz, next, queue, tail);
+            tail = push(blockLight, lx, y - 1, lz, next, queue, tail);
+            tail = push(blockLight, lx, y + 1, lz, next, queue, tail);
+            tail = push(blockLight, lx, y, lz - 1, next, queue, tail);
+            tail = push(blockLight, lx, y, lz + 1, next, queue, tail);
+        }
+    }
+
+    // Emitting blocks are rare and only ever appear through Level.setTile, so their positions
+    // are scanned once and cached rather than re-found on every relight.
+    private static final int[] NO_EMITTERS = new int[0];
+    private volatile int[] emitters;
+
+    int[] emitters() {
+        int[] e = emitters;
+        if (e == null) {
+            int n = 0;
+            int[] found = null;
+            for (int idx = 0; idx < blocks.length; idx++) {
+                if (Tile.lightEmission(blocks[idx]) <= 0) continue;
+                if (found == null) found = new int[16];
+                else if (n == found.length) found = java.util.Arrays.copyOf(found, n * 2);
+                found[n++] = idx;
+            }
+            e = (n == 0) ? NO_EMITTERS : java.util.Arrays.copyOf(found, n);
+            emitters = e;
+        }
+        return e;
+    }
+
+    void invalidateEmitters() { emitters = null; }
+
+    /** Raise one cell of block light, in chunk-local coords. Returns true if it changed. */
+    boolean raiseBlockLight(int lx, int y, int lz, int level) {
+        if (level <= 0 || lx < 0 || lx >= SIZE || y < 0 || y >= HEIGHT || lz < 0 || lz >= SIZE) return false;
+        if (blocksLight(getBlock(lx, y, lz))) return false;
+        int idx = y * SIZE * SIZE + lz * SIZE + lx;
+        if (blockLight[idx] >= level) return false;
+        blockLight[idx] = (byte) level;
+        return true;
+    }
+
+    void clearBlockLight(int lx, int y, int lz) {
+        if (lx < 0 || lx >= SIZE || y < 0 || y >= HEIGHT || lz < 0 || lz >= SIZE) return;
+        blockLight[y * SIZE * SIZE + lz * SIZE + lx] = 0;
+    }
+
+    int blockLightAt(int lx, int y, int lz) {
+        return blockLight[y * SIZE * SIZE + lz * SIZE + lx];
     }
 
     public float getBrightness(int lx, int y, int lz) {
@@ -187,6 +274,12 @@ public class WorldChunk {
         int light = skyLight[y * SIZE * SIZE + lz * SIZE + lx];
         // map 0..15 -> 0.35..1.0 so deep dark stays moody but never pitch black
         return 0.35f + (light / (float) MAX_LIGHT) * 0.65f;
+    }
+
+    /** Block light 0..1 at a cell; 0 outside the chunk, since darkness is the default. */
+    public float getBlockBrightness(int lx, int y, int lz) {
+        if (lx < 0 || lx >= SIZE || lz < 0 || lz >= SIZE || y < 0 || y >= HEIGHT) return 0f;
+        return blockLight[y * SIZE * SIZE + lz * SIZE + lx] / (float) MAX_LIGHT;
     }
 
     public void setDirty() { for (Section s : sections) s.dirty = true; }
@@ -269,7 +362,7 @@ public class WorldChunk {
             }
             verts[layer] = t.getBackingArray();
             count[layer] = t.getVertexCount();
-            floatCount[layer] = count[layer] * 9;
+            floatCount[layer] = count[layer] * Tesselator.FLOATS_PER_VERTEX;
         }
         sec.pendingMesh.set(new MeshData(verts, floatCount, count));
     }
@@ -290,6 +383,7 @@ public class WorldChunk {
             case 12 -> Tile.grass;
             case 13 -> Tile.dirt;
             case 14 -> Tile.snow;
+            case Tile.TORCH -> Tile.torch;
             default -> Tile.stone;
         };
     }

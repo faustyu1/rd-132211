@@ -33,6 +33,12 @@ public class Player {
     private static final int RESPAWN_TICKS = Timer.seconds(1.0);
     private static final int REGEN_TICKS   = Timer.seconds(4.0);
 
+    // breath: full lungs last MAX_AIR ticks under water, then one heart per second
+    public static final int MAX_AIR = Timer.seconds(15.0);
+    public int air = MAX_AIR;
+    private int drownTimer = 0;
+    private static final int DROWN_INTERVAL = Timer.seconds(1.0);
+
     // double-tap W detection
     private long lastWTap  = 0;
     private boolean wWasUp = true;
@@ -91,6 +97,8 @@ public class Player {
         health = MAX_HEALTH;
         hurtTime = 0;
         invulnTime = RESPAWN_TICKS;
+        air = MAX_AIR;
+        drownTimer = 0;
         fallDistance = 0;
         xd = yd = zd = 0;
         resetPos();
@@ -129,6 +137,7 @@ public class Player {
         }
         // void damage instead of the old free teleport-on-fall
         if (y < -40) hurt(MAX_HEALTH);
+        tickBreath();
 
         float xa = 0.0f;
         float ya = 0.0f;
@@ -161,13 +170,16 @@ public class Player {
 
         boolean spaceDown = Input.isKeyDown(GLFW_KEY_SPACE) || Input.isKeyDown(GLFW_KEY_LEFT_ALT);
 
-        // SPECTATOR: always flying, direct position update (noclip)
+        // SPECTATOR: always flying, direct position update (noclip). Deliberately much
+        // faster than creative flight — its job is covering ground, and it is the only
+        // mode that cannot touch the world, so speed costs nothing.
         if (mode == GameMode.SPECTATOR) {
             flying = true;
             yd = 0;
-            if (spaceDown) yd = 0.1f;
-            if (sneaking)  yd = -0.1f;
-            moveRelative(xa, ya, 0.08f);
+            float lift = sprinting ? 0.5f : 0.25f;
+            if (spaceDown) yd = lift;
+            if (sneaking)  yd = -lift;
+            moveRelative(xa, ya, sprinting ? 0.35f : 0.15f);
             x += xd; y += yd; z += zd;
             bb = new AABB(x-0.3f, y-0.9f, z-0.3f, x+0.3f, y+0.9f, z+0.3f);
             xd *= 0.8f; yd = 0; zd *= 0.8f;
@@ -255,6 +267,32 @@ public class Player {
         int by = (int) Math.floor(y - 0.5f);
         int bz = (int) Math.floor(z);
         return com.mojang.rubydung.level.Tile.isWater(level.getBlock(bx, by, bz));
+    }
+
+    /** True when the block at eye level is water — that is what stops you breathing. */
+    public boolean headUnderWater() {
+        int bx = (int) Math.floor(x);
+        int by = (int) Math.floor(y);
+        int bz = (int) Math.floor(z);
+        return com.mojang.rubydung.level.Tile.isWater(level.getBlock(bx, by, bz));
+    }
+
+    /** Drain breath while submerged and drown when it runs out; refill instantly at the surface. */
+    private void tickBreath() {
+        if (!headUnderWater()) {
+            air = MAX_AIR;
+            drownTimer = 0;
+            return;
+        }
+        if (mode != GameMode.SURVIVAL) return;
+        if (air > 0) {
+            air--;
+            return;
+        }
+        if (++drownTimer >= DROWN_INTERVAL) {
+            drownTimer = 0;
+            hurt(2);
+        }
     }
 
     public void move(float xa, float ya, float za) {

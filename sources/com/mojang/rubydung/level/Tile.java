@@ -5,13 +5,56 @@ public class Tile {
     // --- Block ids (stored in WorldChunk.blocks) ---
     public static final byte AIR = 0, STONE = 1, WOOD = 2, LEAVES = 3, WATER = 4,
         BEDROCK = 5, COAL = 6, IRON = 7, GOLD = 8, DIAMOND = 9, SAND = 10,
-        GRAVEL = 11, GRASS = 12, DIRT = 13, SNOW = 14;
+        GRAVEL = 11, GRASS = 12, DIRT = 13, SNOW = 14, TORCH = 22;
 
     // Flowing water: 7 decreasing levels (1 = nearly full ... 7 = thin edge).
     // WATER (id 4) is the permanent full "source"; flowing ids reuse the water tile.
     public static final byte WATER_FLOW1 = 15, WATER_FLOW7 = 21;
 
     public static boolean isWater(int b) { return b == WATER || (b >= WATER_FLOW1 && b <= WATER_FLOW7); }
+
+    /**
+     * A full solid cube: blocks movement, blocks light, and lets a neighbouring face be
+     * culled. Air, leaves, water and torches are all see-through and walk-through, so the
+     * collision, lighting and meshing code all ask this one question.
+     */
+    public static boolean isSolid(int b) {
+        return b != AIR && b != LEAVES && b != TORCH && !isWater(b);
+    }
+
+    /** A real, placeable block id — excludes AIR and the internal flowing-water states. */
+    public static boolean isKnownBlock(byte b) {
+        return (b >= STONE && b <= SNOW) || b == TORCH;
+    }
+
+    /** Human-readable block name, shared by the inventory, tooltips and the crafting list. */
+    public static String name(byte b) {
+        return switch (b) {
+            case AIR     -> "EMPTY";
+            case GRASS   -> "GRASS";
+            case DIRT    -> "DIRT";
+            case STONE   -> "STONE";
+            case GRAVEL  -> "GRAVEL";
+            case SAND    -> "SAND";
+            case SNOW    -> "SNOW";
+            case WOOD    -> "WOOD";
+            case LEAVES  -> "LEAVES";
+            case COAL    -> "COAL ORE";
+            case IRON    -> "IRON ORE";
+            case GOLD    -> "GOLD ORE";
+            case DIAMOND -> "DIAMOND ORE";
+            case BEDROCK -> "BEDROCK";
+            case WATER   -> "WATER";
+            case TORCH   -> "TORCH";
+            default      -> "BLOCK " + (b & 0xFF);
+        };
+    }
+
+    /** Light a block emits by itself, 0..15. Only torches glow for now. */
+    public static int lightEmission(int b) { return b == TORCH ? 14 : 0; }
+
+    /** A torch needs something under it; it pops off when that support goes away. */
+    public static boolean needsSupport(int b) { return b == TORCH; }
     /** 0 for a source, 1..7 for flowing water. */
     public static int waterLevel(int b) { return b == WATER ? 0 : (b - 14); }
     /** level<=0 -> source, otherwise flowing id for level 1..7. */
@@ -21,6 +64,7 @@ public class Tile {
     public static float hardness(int b) {
         return switch (b) {
             case BEDROCK -> -1f;
+            case TORCH   -> 0f;
             case LEAVES  -> 0.2f;
             case GRASS, DIRT, SAND, SNOW, GRAVEL -> 0.5f;
             case WOOD    -> 1.5f;
@@ -48,6 +92,7 @@ public class Tile {
     private static final float[] SW_BEDROCK = { 0.22f, 0.22f, 0.24f };
     private static final float[] SW_WATER   = { 0.30f, 0.50f, 1.00f };
     private static final float[] SW_STONE   = { 0.58f, 0.58f, 0.60f };
+    private static final float[] SW_TORCH   = { 1.00f, 0.86f, 0.45f };
 
     /** Canonical RGB swatch for a block id. The array is shared - do not mutate it. */
     public static float[] swatch(byte id) {
@@ -65,6 +110,7 @@ public class Tile {
             case GRAVEL  -> SW_GRAVEL;
             case BEDROCK -> SW_BEDROCK;
             case WATER   -> SW_WATER;
+            case TORCH   -> SW_TORCH;
             default      -> SW_STONE;
         };
     }
@@ -90,8 +136,14 @@ public class Tile {
     public static final Tile gravel     = tinted(TEX_STONE, 0.52f, 0.52f, 0.55f);
     public static final Tile snow       = tinted(TEX_STONE, 0.95f, 0.97f, 1.00f);
     public static final Tile water      = tinted(TEX_STONE, 0.30f, 0.50f, 1.00f);
+    public static final Tile torch      = tinted(TEX_STONE, 1.00f, 0.86f, 0.45f);
     public static final Tile[] waterFlow = new Tile[7];
     static {
+        // a thin, short, self-lit post: not a cube, so its faces must never be culled
+        torch.inset = 0.42f;
+        torch.fill = 0.6f;
+        torch.glow = 1.0f;
+        torch.noCull = true;
         water.translucent = true;
         water.ta = 0.65f;
         for (int lvl = 1; lvl <= 7; lvl++) {
@@ -123,6 +175,13 @@ public class Tile {
     float tr = 1f, tg = 1f, tb = 1f, ta = 1f;
     // vertical fill fraction (1 = full cube). <1 lowers the top surface (flowing water).
     float fill = 1f;
+    // horizontal inset per side (0 = full cube). >0 makes a thin post, e.g. a torch.
+    float inset = 0f;
+    // self-illumination 0..1: the block lights its own faces regardless of its surroundings.
+    float glow = 0f;
+    // skip neighbour face culling — required for anything that is not a full cube, whose
+    // faces stay visible even when the neighbouring block is solid.
+    boolean noCull = false;
     boolean translucent = false;
 
     private Tile(int texTop, int texBottom, int texSide) {
@@ -162,6 +221,20 @@ public class Tile {
         return 1.0f - occ * 0.2f;
     }
 
+    /**
+     * Set the light of the face about to be emitted from the voxel it faces, and return the
+     * directional shade that belongs in the vertex colour.
+     *
+     * Light is deliberately NOT folded into the colour any more: the fragment shader dims sky
+     * light with the day/night multiplier and leaves block light alone, which is what keeps a
+     * torch-lit cave bright at midnight. The 0.8/0.6 side shading is a property of the face,
+     * not of the light, so it stays multiplicative in the colour and survives both.
+     */
+    private float faceLight(Tesselator t, Level level, int x, int y, int z, float shade) {
+        t.light(level.getBrightness(x, y, z), Math.max(level.getBlockBrightness(x, y, z), glow));
+        return shade;
+    }
+
     public void render(
         Tesselator t,
         Level level,
@@ -174,17 +247,17 @@ public class Tile {
         // any face-visibility or lighting work for the pass that would emit nothing.
         if (translucent ? layer != 1 : layer != 0) return;
 
-        float x0 = x,
-            x1 = x + 1.0f;
+        float x0 = x + inset,
+            x1 = x + 1.0f - inset;
         float y0 = y,
             y1 = y + fill;
-        float z0 = z,
-            z1 = z + 1.0f;
+        float z0 = z + inset,
+            z1 = z + 1.0f - inset;
         boolean w = translucent; // water: cull faces against same fluid
 
         // bottom face
-        if (!level.isSolidOrSameFluid(x, y - 1, z, w)) {
-            float br = level.getBrightness(x, y - 1, z);
+        if (noCull || !level.isSolidOrSameFluid(x, y - 1, z, w)) {
+            float br = faceLight(t, level, x, y - 1, z, 1.0f);
             float a00 = ao(level, x, y - 1, z, -1, 0, 0, 0, 0, 1) * br,
                 a10 = ao(level, x, y - 1, z, 1, 0, 0, 0, 0, 1) * br;
             float a01 = ao(level, x, y - 1, z, -1, 0, 0, 0, 0, -1) * br,
@@ -203,8 +276,8 @@ public class Tile {
             t.vertex(x1, y0, z1);
         }
         // top face
-        if (!level.isSolidOrSameFluid(x, y + 1, z, w)) {
-            float br = level.getBrightness(x, y + 1, z);
+        if (noCull || !level.isSolidOrSameFluid(x, y + 1, z, w)) {
+            float br = faceLight(t, level, x, y + 1, z, 1.0f);
             float a11 = ao(level, x, y + 1, z, 1, 0, 0, 0, 0, 1) * br,
                 a10 = ao(level, x, y + 1, z, 1, 0, 0, 0, 0, -1) * br;
             float a00 = ao(level, x, y + 1, z, -1, 0, 0, 0, 0, -1) * br,
@@ -223,9 +296,8 @@ public class Tile {
             t.vertex(x0, y1, z1);
         }
         // south face (z-)
-        if (!level.isSolidOrSameFluid(x, y, z - 1, w)) {
-            float rawBr = level.getBrightness(x, y, z - 1);
-            float br = rawBr * 0.8f;
+        if (noCull || !level.isSolidOrSameFluid(x, y, z - 1, w)) {
+            float br = faceLight(t, level, x, y, z - 1, 0.8f);
             float a00 = ao(level, x, y, z - 1, -1, 0, 0, 0, 1, 0) * br,
                 a10 = ao(level, x, y, z - 1, 1, 0, 0, 0, 1, 0) * br;
             float a01 = ao(level, x, y, z - 1, -1, 0, 0, 0, -1, 0) * br,
@@ -244,9 +316,8 @@ public class Tile {
             t.vertex(x0, y0, z0);
         }
         // north face (z+)
-        if (!level.isSolidOrSameFluid(x, y, z + 1, w)) {
-            float rawBr = level.getBrightness(x, y, z + 1);
-            float br = rawBr * 0.8f;
+        if (noCull || !level.isSolidOrSameFluid(x, y, z + 1, w)) {
+            float br = faceLight(t, level, x, y, z + 1, 0.8f);
             float a00 = ao(level, x, y, z + 1, -1, 0, 0, 0, 1, 0) * br,
                 a10 = ao(level, x, y, z + 1, 1, 0, 0, 0, 1, 0) * br;
             float a01 = ao(level, x, y, z + 1, -1, 0, 0, 0, -1, 0) * br,
@@ -265,9 +336,8 @@ public class Tile {
             t.vertex(x1, y1, z1);
         }
         // west face (x-)
-        if (!level.isSolidOrSameFluid(x - 1, y, z, w)) {
-            float rawBr = level.getBrightness(x - 1, y, z);
-            float br = rawBr * 0.6f;
+        if (noCull || !level.isSolidOrSameFluid(x - 1, y, z, w)) {
+            float br = faceLight(t, level, x - 1, y, z, 0.6f);
             float a00 = ao(level, x - 1, y, z, 0, 0, -1, 0, 1, 0) * br,
                 a10 = ao(level, x - 1, y, z, 0, 0, 1, 0, 1, 0) * br;
             float a01 = ao(level, x - 1, y, z, 0, 0, -1, 0, -1, 0) * br,
@@ -286,9 +356,8 @@ public class Tile {
             t.vertex(x0, y0, z1);
         }
         // east face (x+)
-        if (!level.isSolidOrSameFluid(x + 1, y, z, w)) {
-            float rawBr = level.getBrightness(x + 1, y, z);
-            float br = rawBr * 0.6f;
+        if (noCull || !level.isSolidOrSameFluid(x + 1, y, z, w)) {
+            float br = faceLight(t, level, x + 1, y, z, 0.6f);
             float a00 = ao(level, x + 1, y, z, 0, 0, 1, 0, -1, 0) * br,
                 a10 = ao(level, x + 1, y, z, 0, 0, 1, 0, 1, 0) * br;
             float a01 = ao(level, x + 1, y, z, 0, 0, -1, 0, -1, 0) * br,

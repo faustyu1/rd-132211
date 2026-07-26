@@ -89,6 +89,16 @@ public class FontRenderer {
         MemoryUtil.memFree(buf);
     }
 
+    /** Width of a string at a scale factor, in screen pixels. */
+    public float width(String s, float scale) {
+        return stringWidth(s) * scale;
+    }
+
+    /** Height of a line at a scale factor, in screen pixels. */
+    public float height(float scale) {
+        return glyphH * scale;
+    }
+
     public int stringWidth(String s) {
         int w = 0;
         for (int i = 0; i < s.length(); i++) {
@@ -101,22 +111,40 @@ public class FontRenderer {
     }
 
     public void drawString(String s, int x, int y, float r, float g, float b, float a) {
+        drawString(s, x, y, 1f, r, g, b, a, Pipelines.Pipeline.UI);
+    }
+
+    /** Draw at an arbitrary scale; 1 renders the atlas at its native size. */
+    public void drawString(String s, float x, float y, float scale, float r, float g, float b, float a) {
+        drawString(s, x, y, scale, r, g, b, a, Pipelines.Pipeline.UI);
+    }
+
+    /**
+     * The one text primitive. Everything the game draws — menus, HUD, chat and the 3D name
+     * tags — goes through here, so there is a single font with a single set of glyphs
+     * (ASCII plus Cyrillic) rather than a second hand-built uppercase-only bitmap font.
+     */
+    public void drawString(String s, float x, float y, float scale,
+                           float r, float g, float b, float a, Pipelines.Pipeline pipeline) {
+        if (s.isEmpty()) return;
         GameRenderer gr = GameRenderer.instance;
-        gr.setPipeline(Pipelines.Pipeline.UI);
+        gr.setPipeline(pipeline);
         gr.bindTexture(texture);
         t.init();
         t.color(r, g, b, a);
+        float gh = glyphH * scale;
         for (int i = 0; i < s.length(); i++) {
             Integer idx = charIndex.get(s.charAt(i));
             if (idx == null) idx = fallbackIndex;
             int gx = charX[idx], gy = charY[idx], gw = charW[idx];
             float u0 = (float) gx / atlasW, u1 = (float)(gx + gw) / atlasW;
             float v0 = (float) gy / atlasH, v1 = (float)(gy + glyphH) / atlasH;
-            t.tex(u0, v0); t.vertex(x,    y,        0);
-            t.tex(u1, v0); t.vertex(x+gw, y,        0);
-            t.tex(u1, v1); t.vertex(x+gw, y+glyphH, 0);
-            t.tex(u0, v1); t.vertex(x,    y+glyphH, 0);
-            x += gw + 1;
+            float w = gw * scale;
+            t.tex(u0, v0); t.vertex(x,     y,      0);
+            t.tex(u1, v0); t.vertex(x + w, y,      0);
+            t.tex(u1, v1); t.vertex(x + w, y + gh, 0);
+            t.tex(u0, v1); t.vertex(x,     y + gh, 0);
+            x += w + scale;
         }
         t.flush();
     }

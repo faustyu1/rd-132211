@@ -19,7 +19,7 @@ import static org.lwjgl.glfw.GLFWVulkan.glfwVulkanSupported;
 
 public class RubyDung implements Runnable {
     /** Shown on the main menu; keep in step with the CHANGELOG release being tagged. */
-    private static final String VERSION = "0.4.1";
+    private static final String VERSION = "0.5.0";
 
     private int width;
     private int height;
@@ -89,6 +89,13 @@ public class RubyDung implements Runnable {
     private final Matrix4f savedProj = new Matrix4f();
     private final Matrix4f nameTagMv = new Matrix4f();
 
+    // scratch for reading the shim's current colour when drawing text
+    private final float[] textColor = new float[4];
+
+    // periodic autosave (only edited chunks reach disk, so this is cheap)
+    private static final int AUTOSAVE_TICKS = Timer.seconds(30);
+    private int autosaveTicks = 0;
+
     // day/night
     private float timeOfDay = 0.0f; // 0=noon, 0.5=midnight
     private static final int DAY_LENGTH_TICKS = Timer.seconds(600); // full cycle every 10 minutes
@@ -119,7 +126,7 @@ public class RubyDung implements Runnable {
     private static final int[] CREATIVE_BLOCKS = {
         Tile.GRASS, Tile.DIRT, Tile.STONE, Tile.GRAVEL, Tile.SAND, Tile.SNOW,
         Tile.WOOD, Tile.LEAVES, Tile.COAL, Tile.IRON, Tile.GOLD, Tile.DIAMOND,
-        Tile.BEDROCK, Tile.WATER
+        Tile.BEDROCK, Tile.WATER, Tile.TORCH
     };
 
     // chat
@@ -259,6 +266,8 @@ public class RubyDung implements Runnable {
             for (byte got : drops.tick(player)) collectItem(got);
         }
         if (miningHeld && hitResult != null) updateBreaking();
+        // a crash used to cost everything since launch: saveWorld only ran on quit
+        if (++autosaveTicks >= AUTOSAVE_TICKS) { autosaveTicks = 0; saveWorld(); }
 
         if (server != null) {
             server.tick(player.x, player.y, player.z, player.yRot, player.xRot);
@@ -398,7 +407,7 @@ public class RubyDung implements Runnable {
                 }
 
                 if (key == GLFW_KEY_ESCAPE) {
-                    if (screen == 6) { cursorItem = 0; screen = 0; glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED); Input.consumeMouseDelta(); }
+                    if (screen == 6 || screen == 7) { closeToGame(); }
                     else if (screen == -1) { /* stay on main menu */ }
                     else if (screen == 11) { /* stay on the loading screen: there is no world to pause yet */ }
                     else if (screen == 9) { refreshWorldList(); screen = 8; menuCooldown = 2; }
@@ -454,7 +463,13 @@ public class RubyDung implements Runnable {
                 } else if (screen == 3 && key == GLFW_KEY_BACKSPACE && editingPort && !portInput.isEmpty()) {
                     portInput = portInput.substring(0, portInput.length() - 1);
                 } else if (screen == 0) {
-                    if (key == GLFW_KEY_T) {
+                    if (key >= GLFW_KEY_1 && key <= GLFW_KEY_9) {
+                        selectedSlot = key - GLFW_KEY_1;
+                    } else if (key == GLFW_KEY_C) {
+                        screen = 7;
+                        glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+                        Input.consumeMouseDelta();
+                    } else if (key == GLFW_KEY_T) {
                         chatOpen = true; chatInput = "";
                         Input.blocked = true;
                         Input.pollCharEvents(); // discard the 't' char event from this same keypress
@@ -464,6 +479,8 @@ public class RubyDung implements Runnable {
                         glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
                         Input.consumeMouseDelta();
                     }
+                } else if (screen == 7 && (key == GLFW_KEY_C || key == GLFW_KEY_E)) {
+                    closeToGame();
                 } else if (screen == 6 && key == GLFW_KEY_E) {
                     cursorItem = 0;
                     screen = 0; glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED); Input.consumeMouseDelta();
@@ -581,7 +598,8 @@ public class RubyDung implements Runnable {
     private void tryPlaceBlock() {
         if (hitResult == null || player.mode == Player.GameMode.SPECTATOR) return;
         int tileType = hotbar[selectedSlot];
-        if (tileType == 0) return; // empty slot: placing nothing must not touch the world
+        if (tileType == 0) return;            // empty slot: placing nothing must not touch the world
+        if (!Items.isPlaceable(tileType)) return; // tools and sticks are not blocks
         boolean survival = player.mode == Player.GameMode.SURVIVAL;
         if (survival && itemCounts[tileType & 0xFF] <= 0) return; // none of this block collected
         int x = hitResult.x(), y = hitResult.y(), z = hitResult.z();
@@ -590,8 +608,11 @@ public class RubyDung implements Runnable {
             case 2 -> z--; case 3 -> z++;
             case 4 -> x--; case 5 -> x++;
         }
+        // a torch has nothing to stand on unless the block below is a full cube
+        if (Tile.needsSupport((byte) tileType) && !level.isSolidTile(x, y - 1, z)) return;
         var blockAABB = new com.mojang.rubydung.phys.AABB(x, y, z, x + 1, y + 1, z + 1);
-        if (!blockAABB.intersects(player.bb)) {
+        // non-solid blocks (a torch) may be placed inside the player's own box
+        if (!Tile.isSolid((byte) tileType) || !blockAABB.intersects(player.bb)) {
             level.setTile(x, y, z, tileType);
             if (survival) itemCounts[tileType & 0xFF]--;
             if (client != null) client.sendSetTile(x, y, z, tileType);
@@ -603,7 +624,10 @@ public class RubyDung implements Runnable {
         byte type = level.getBlock(x, y, z);
         if (type == 0 || Tile.hardness(type) < 0) return; // air / unbreakable
         particles.spawnBlockBreak(x, y, z, type);
-        if (drops != null) drops.spawn(x, y, z, dropFor(type));
+        // stone and ore need the right pickaxe, or they shatter and leave nothing
+        boolean yields = player.mode != Player.GameMode.SURVIVAL
+            || Items.canHarvest(hotbar[selectedSlot], type);
+        if (drops != null && yields) drops.spawn(x, y, z, dropFor(type));
         level.setTile(x, y, z, 0);
         if (client != null) client.sendSetTile(x, y, z, 0);
         else if (server != null) server.broadcastTile(x, y, z, 0);
@@ -613,7 +637,11 @@ public class RubyDung implements Runnable {
     private void collectItem(byte type) {
         int id = type & 0xFF;
         itemCounts[id]++;
-        // if the block type isn't on the hotbar yet, surface it in an empty/low slot
+        ensureOnHotbar(id);
+    }
+
+    /** Make an id reachable: leave it alone if it is already there, else take an empty slot. */
+    private void ensureOnHotbar(int id) {
         for (int v : hotbar) if (v == id) return;
         for (int i = 0; i < hotbar.length; i++) {
             if (hotbar[i] == 0) { hotbar[i] = id; return; }
@@ -639,7 +667,8 @@ public class RubyDung implements Runnable {
         if (!breaking || x != breakX || y != breakY || z != breakZ) {
             breaking = true; breakX = x; breakY = y; breakZ = z; breakProgress = 0f;
         }
-        float perTick = (1f / Timer.TICKS_PER_SECOND) / Math.max(0.05f, Tile.hardness(type));
+        float perTick = (1f / Timer.TICKS_PER_SECOND)
+            * Items.miningSpeed(hotbar[selectedSlot], type) / Math.max(0.05f, Tile.hardness(type));
         breakProgress += perTick;
         if (breakProgress >= 1f) {
             breakBlock(x, y, z);
@@ -765,6 +794,7 @@ public class RubyDung implements Runnable {
         else if (screen == 4) renderJoinScreen();
         else if (screen == 5) renderServerList();
         else if (screen == 6) renderInventory();
+        else if (screen == 7) renderCrafting();
         else if (screen == 10) renderAddServer();
 
         renderer.endFrame();
@@ -890,26 +920,23 @@ public class RubyDung implements Runnable {
         nameTagMv.m20(0).m21(0).m22(1);
         renderer.loadModelView(nameTagMv);
 
-        int cw = 5, ch = 7, sp = 1;
-        float scale = 0.01f;
-        int tw = name.length() * (cw + sp);
-        float hw = tw * scale / 2f;
+        // 7 px tall at the old 0.01 world-units-per-pixel scale, now measured properly
+        float scale = 0.07f / fontRenderer.glyphH;
+        float th = fontRenderer.height(scale);
+        float hw = fontRenderer.width(name, scale) / 2f;
 
         // dark background (3D quad, overlay pipeline so it ignores depth)
         GL.set3DQuadPipeline(Pipelines.Pipeline.OVERLAY_3D);
         GL.glColor4f(0f, 0f, 0f, 0.5f);
         GL.glBegin(GL.GL_QUADS);
-        GL.glVertex3f(-hw - 0.02f, -ch * scale - 0.01f, 0);
-        GL.glVertex3f( hw + 0.02f, -ch * scale - 0.01f, 0);
+        GL.glVertex3f(-hw - 0.02f, -th - 0.01f, 0);
+        GL.glVertex3f( hw + 0.02f, -th - 0.01f, 0);
         GL.glVertex3f( hw + 0.02f, 0.01f, 0);
         GL.glVertex3f(-hw - 0.02f, 0.01f, 0);
         GL.glEnd();
 
-        // text
-        GL.glColor4f(1f, 1f, 1f, 1f);
-        renderer.translate(-hw, -ch * scale, 0);
-        renderer.scale(scale, scale, scale);
-        drawText(name, 0, 0, cw, ch, cw + sp);
+        // text — same font as everything else, drawn straight into world space
+        fontRenderer.drawString(name, -hw, -th, scale, 1f, 1f, 1f, 1f, Pipelines.Pipeline.OVERLAY_3D);
 
         renderer.pop();
         GL.set3DQuadPipeline(Pipelines.Pipeline.WORLD_OPAQUE);
@@ -946,8 +973,7 @@ public class RubyDung implements Runnable {
             GL.glEnable(GL.GL_BLEND);
             GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA);
             GL.glColor4f(1f, 1f, 0.4f, 1f);
-            int sw = mpStatus.length() * 10;
-            drawText(mpStatus, (width - sw) / 2, by3 + btnH + 14, 8, 12, 10);
+            drawTextCentered(mpStatus, width / 2, by3 + btnH + 14, 14);
         }
 
         GL.glDisable(GL.GL_BLEND);
@@ -1017,7 +1043,7 @@ public class RubyDung implements Runnable {
             GL.glEnable(GL.GL_BLEND);
             GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA);
             GL.glColor4f(1f, 0.4f, 0.4f, 1f);
-            drawText(mpStatus, fx, by + fh*2 + gap*2, 8, 12, 10);
+            drawText(mpStatus, fx, by + fh*2 + gap*2, 14);
         }
 
         GL.glDisable(GL.GL_BLEND);
@@ -1101,18 +1127,17 @@ public class RubyDung implements Runnable {
             GL.glEnd();
             GL.glColor4f(1f, 1f, 1f, 1f);
             String label = s[0];
-            drawText(label.substring(0, Math.min(label.length(), 30)), lx + 10, ey + 7, 8, 12, 10);
+            drawText(label.substring(0, Math.min(label.length(), 30)), lx + 10, ey + 6, 14);
             GL.glColor4f(0.7f, 0.7f, 0.7f, 1f);
             String addr = s[1];
-            drawText(addr.substring(0, Math.min(addr.length(), 38)), lx + 10, ey + 22, 6, 10, 8);
+            drawText(addr.substring(0, Math.min(addr.length(), 38)), lx + 10, ey + 22, 12);
         }
 
         // empty list hint
         if (serverList.isEmpty()) {
             GL.glColor4f(0.6f, 0.6f, 0.6f, 1f);
             String hint = "NO SERVERS  ADD ONE BELOW";
-            int hw = hint.length() * 10;
-            drawText(hint, (width - hw) / 2, listTop + 14, 8, 12, 10);
+            drawTextCentered(hint, width / 2, listTop + 14, 14);
         }
 
         int btnY = listTop + visCount * (entryH + gap) + 10;
@@ -1141,8 +1166,7 @@ public class RubyDung implements Runnable {
             GL.glEnable(GL.GL_BLEND);
             GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA);
             GL.glColor4f(1f, 0.4f, 0.4f, 1f);
-            int sw = mpStatus.length() * 10;
-            drawText(mpStatus, (width - sw) / 2, btnY2 + btnH + 10, 8, 12, 10);
+            drawTextCentered(mpStatus, width / 2, btnY2 + btnH + 10, 14);
         }
 
         GL.glDisable(GL.GL_BLEND);
@@ -1265,7 +1289,7 @@ public class RubyDung implements Runnable {
         GL.glVertex2f(x+w-0.5f, y+h-0.5f); GL.glVertex2f(x+0.5f, y+h-0.5f);
         GL.glEnd();
         GL.glColor4f(1f, 1f, 1f, 1f);
-        drawText(text, x + 10, y + (h - 12) / 2, 8, 12, 10);
+        drawText(text, x + 10, y + (h - 14) / 2, 14);
     }
 
     private void doConnect() {
@@ -1276,10 +1300,14 @@ public class RubyDung implements Runnable {
             // world would let the host's snapshot overwrite it in memory, and — now that
             // edited chunks are flushed when they stream out — on disk as well.
             saveWorld();
-            Level connLevel = new Level(0);
-            client = new GameClient(ipInput, p, connLevel);
+            // the handshake hands over the seed, so the client generates the same terrain the
+            // host has and only edited chunks ever travel
+            client = new GameClient(ipInput, p);
+            Level connLevel = new Level(client.worldSeed);
+            client.attachLevel(connLevel);
             client.sendName(nameInput.isEmpty() ? "Player" : nameInput);
             level = connLevel;                 // only after the connection succeeded
+            worldSeedValue = client.worldSeed;
             levelRenderer = new LevelRenderer(level);
             player = new Player(level);
             drops = new DroppedItems(level);
@@ -1350,9 +1378,8 @@ public class RubyDung implements Runnable {
     }
 
     private void drawSmallText(String text, int x, int y) {
-        int charW = 6, charH = 8, sp = 7;
-        GL.glColor4f(1,1,1,1);
-        drawText(text, x, y, charW, charH, sp);
+        GL.glColor4f(1, 1, 1, 1);
+        drawText(text, x, y, 12);
     }
 
     private void renderTabList() {
@@ -1383,7 +1410,7 @@ public class RubyDung implements Runnable {
         // header
         GL.glColor4f(1, 1, 1, 1);
         String header = players.size() + " player" + (players.size() != 1 ? "s" : "") + " online";
-        drawSmallText(header, px + panW / 2 - header.length() * 4, py + 8);
+        drawTextCentered(header, px + panW / 2, py + 8, 12);
 
         // player cells
         for (int i = 0; i < players.size(); i++) {
@@ -1417,8 +1444,10 @@ public class RubyDung implements Runnable {
         renderOverlay();
         drawTitle(creative ? "CREATIVE INVENTORY" : "INVENTORY", height / 2 - 170);
 
+        // creative shows the full palette; survival shows what has actually been collected
+        int[] palette = creative ? CREATIVE_BLOCKS : ownedItems();
         int slot = 40, gap = 6, cols = 7;
-        int rows = (CREATIVE_BLOCKS.length + cols - 1) / cols;
+        int rows = Math.max(1, (palette.length + cols - 1) / cols);
         int gridW = cols * (slot + gap) - gap;
         int gridX = (width - gridW) / 2;
         int gridY = height / 2 - 120;
@@ -1429,14 +1458,18 @@ public class RubyDung implements Runnable {
 
         // palette
         int hoveredPalette = -1;
-        for (int i = 0; i < CREATIVE_BLOCKS.length; i++) {
+        for (int i = 0; i < palette.length; i++) {
             int r = i / cols, c = i % cols;
             int x = gridX + c * (slot + gap), y = gridY + r * (slot + gap);
             boolean hov = hover(mx, my, x, y, slot, slot);
             if (hov) hoveredPalette = i;
             // survival: no highlight (nothing to click) but show what has been collected
-            drawItemSlot(x, y, slot, (byte) CREATIVE_BLOCKS[i], creative && hov, false,
-                creative ? -1 : itemCounts[CREATIVE_BLOCKS[i] & 0xFF]);
+            drawItemSlot(x, y, slot, palette[i], creative && hov, false,
+                creative ? -1 : itemCounts[palette[i] & 0xFF]);
+        }
+        if (!creative && palette.length == 0) {
+            GL.glColor4f(1, 1, 1, 0.6f);
+            drawSmallText("NOTHING COLLECTED YET", gridX, gridY + 12);
         }
 
         // hotbar row label + slots along the bottom of the panel
@@ -1449,7 +1482,7 @@ public class RubyDung implements Runnable {
             int x = hbX + i * (slot + gap);
             boolean hov = hover(mx, my, x, hbY, slot, slot);
             if (hov) hoveredHotbar = i;
-            drawItemSlot(x, hbY, slot, (byte) hotbar[i], hov, i == selectedSlot, itemCounts[hotbar[i] & 0xFF]);
+            drawItemSlot(x, hbY, slot, hotbar[i], hov, i == selectedSlot, itemCounts[hotbar[i] & 0xFF]);
         }
 
         // close button
@@ -1459,7 +1492,7 @@ public class RubyDung implements Runnable {
 
         // cursor-carried item follows the mouse
         if (cursorItem != 0) {
-            float[] col = Tile.swatch((byte) cursorItem);
+            float[] col = Items.swatch(cursorItem);
             GL.glColor4f(col[0], col[1], col[2], 1f);
             GL.glBegin(GL.GL_QUADS);
             GL.glVertex2f(mx, my); GL.glVertex2f(mx + 24, my);
@@ -1470,7 +1503,7 @@ public class RubyDung implements Runnable {
         // tooltip for hovered palette block
         if (hoveredPalette >= 0 && cursorItem == 0) {
             GL.glColor4f(1, 1, 1, 1);
-            drawSmallText(blockName((byte) CREATIVE_BLOCKS[hoveredPalette]), mx + 14, my - 4);
+            drawSmallText(Items.name(palette[hoveredPalette]), mx + 14, my - 4);
         }
 
         GL.glDisable(GL.GL_BLEND);
@@ -1481,7 +1514,7 @@ public class RubyDung implements Runnable {
                     cursorItem = 0;
                     screen = 0; glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED); Input.consumeMouseDelta();
                 } else if (creative && hoveredPalette >= 0) {
-                    cursorItem = CREATIVE_BLOCKS[hoveredPalette]; // pick up an infinite stack
+                    cursorItem = palette[hoveredPalette]; // pick up an infinite stack
                 } else if (hoveredHotbar >= 0) {
                     if (cursorItem != 0) {
                         hotbar[hoveredHotbar] = cursorItem;       // place into slot
@@ -1498,15 +1531,110 @@ public class RubyDung implements Runnable {
         endOrtho();
     }
 
+    /** Ids the player actually owns, blocks first then items, for the survival inventory. */
+    private int[] ownedItems() {
+        int n = 0;
+        int[] owned = new int[itemCounts.length];
+        for (int id = 0; id < itemCounts.length; id++) if (itemCounts[id] > 0) owned[n++] = id;
+        return java.util.Arrays.copyOf(owned, n);
+    }
+
+    /**
+     * Crafting (screen 7). Every recipe is listed with what it costs and what is in stock;
+     * a row you can afford lights up and crafts on click. Shapeless by design — the grid
+     * puzzle adds no depth here, and a list makes the whole recipe set discoverable.
+     */
+    private void renderCrafting() {
+        beginOrtho();
+        renderOverlay();
+        drawTitle("CRAFTING", 40);
+
+        int mx = mouseScreenX(), my = mouseScreenY();
+        GL.glEnable(GL.GL_BLEND);
+        GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA);
+
+        boolean creative = player.mode == Player.GameMode.CREATIVE;
+        int rowH = 40, gap = 5;
+        int listW = Math.min(560, width - 60);
+        int lx = (width - listW) / 2;
+        int top = 104;
+        int hovered = -1;
+
+        for (int i = 0; i < Items.RECIPES.length; i++) {
+            Items.Recipe r = Items.RECIPES[i];
+            boolean can = creative || Items.canCraft(r, itemCounts);
+            int y = top + i * (rowH + gap);
+            boolean hov = can && hover(mx, my, lx, y, listW, rowH);
+            if (hov) hovered = i;
+
+            GL.glColor4f(1f, 1f, 1f, hov ? 0.22f : can ? 0.12f : 0.05f);
+            GL.glBegin(GL.GL_QUADS);
+            GL.glVertex2f(lx, y); GL.glVertex2f(lx + listW, y);
+            GL.glVertex2f(lx + listW, y + rowH); GL.glVertex2f(lx, y + rowH);
+            GL.glEnd();
+
+            float[] col = Items.swatch(r.result());
+            float dim = can ? 1f : 0.45f;
+            GL.glColor4f(col[0] * dim, col[1] * dim, col[2] * dim, 1f);
+            GL.glBegin(GL.GL_QUADS);
+            GL.glVertex2f(lx + 8, y + 8); GL.glVertex2f(lx + 32, y + 8);
+            GL.glVertex2f(lx + 32, y + 32); GL.glVertex2f(lx + 8, y + 32);
+            GL.glEnd();
+
+            GL.glColor4f(dim, dim, dim, 1f);
+            String head = Items.name(r.result()) + (r.count() > 1 ? "  X" + r.count() : "");
+            drawSmallText(head, lx + 42, y + 6);
+
+            StringBuilder cost = new StringBuilder();
+            for (int k = 0; k < r.need().length; k += 2) {
+                int id = r.need()[k], qty = r.need()[k + 1];
+                if (cost.length() > 0) cost.append("   ");
+                cost.append(Items.name(id)).append(" ")
+                    .append(creative ? qty : Math.min(itemCounts[id & 0xFF], qty)).append("/").append(qty);
+            }
+            drawSmallText(cost.toString(), lx + 42, y + 22);
+        }
+
+        int closeY = top + Items.RECIPES.length * (rowH + gap) + 12;
+        boolean hClose = hover(mx, my, (width - 140) / 2, closeY, 140, 32);
+        drawButton((width - 140) / 2, closeY, 140, 32, "CLOSE", hClose);
+
+        GL.glDisable(GL.GL_BLEND);
+
+        for (var e : Input.pollMouseEvents()) {
+            if (e[0] != GLFW_MOUSE_BUTTON_1 || e[1] != GLFW_PRESS) continue;
+            if (hClose) {
+                closeToGame();
+            } else if (hovered >= 0) {
+                Items.Recipe r = Items.RECIPES[hovered];
+                if (creative) {
+                    itemCounts[r.result() & 0xFF] += r.count();   // creative pays nothing
+                } else if (Items.canCraft(r, itemCounts)) {
+                    Items.craft(r, itemCounts);
+                }
+                ensureOnHotbar(r.result());
+            }
+        }
+        endOrtho();
+    }
+
+    /** Leave an overlay screen and hand control back to the world. */
+    private void closeToGame() {
+        cursorItem = 0;
+        screen = 0;
+        glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+        Input.consumeMouseDelta();
+    }
+
     /** Draw one inventory slot: background, border, block swatch and optional count. */
-    private void drawItemSlot(int x, int y, int s, byte id, boolean hov, boolean sel, int count) {
+    private void drawItemSlot(int x, int y, int s, int id, boolean hov, boolean sel, int count) {
         GL.glColor4f(1, 1, 1, sel ? 0.5f : hov ? 0.32f : 0.15f);
         GL.glBegin(GL.GL_QUADS);
         GL.glVertex2f(x, y); GL.glVertex2f(x + s, y);
         GL.glVertex2f(x + s, y + s); GL.glVertex2f(x, y + s);
         GL.glEnd();
         if (id != 0) {
-            float[] col = Tile.swatch(id);
+            float[] col = Items.swatch(id);
             int pad = 6;
             GL.glColor4f(col[0], col[1], col[2], 1f);
             GL.glBegin(GL.GL_QUADS);
@@ -1526,27 +1654,6 @@ public class RubyDung implements Runnable {
         GL.glEnd();
     }
 
-    /** Human-readable block name for inventory tooltips. */
-    private static String blockName(byte b) {
-        return switch (b) {
-            case Tile.GRASS   -> "GRASS";
-            case Tile.DIRT    -> "DIRT";
-            case Tile.STONE   -> "STONE";
-            case Tile.GRAVEL  -> "GRAVEL";
-            case Tile.SAND    -> "SAND";
-            case Tile.SNOW    -> "SNOW";
-            case Tile.WOOD    -> "WOOD";
-            case Tile.LEAVES  -> "LEAVES";
-            case Tile.COAL    -> "COAL ORE";
-            case Tile.IRON    -> "IRON ORE";
-            case Tile.GOLD    -> "GOLD ORE";
-            case Tile.DIAMOND -> "DIAMOND ORE";
-            case Tile.BEDROCK -> "BEDROCK";
-            case Tile.WATER   -> "WATER";
-            default           -> "BLOCK " + (b & 0xFF);
-        };
-    }
-
     private void renderHud() {
         frameCount++;
         long now = System.currentTimeMillis();
@@ -1557,11 +1664,8 @@ public class RubyDung implements Runnable {
         }
 
         beginOrtho();
-        String text = "FPS " + displayFps;
-        int x = 10, y = 10;
-        int charW = 12, charH = 16;
         GL.glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
-        drawText(text, x, y, charW, charH, charW + 3);
+        drawText("FPS " + displayFps, 10, 10, 18);
         endOrtho();
     }
 
@@ -1590,7 +1694,7 @@ public class RubyDung implements Runnable {
             // block swatch + collected count
             int id = hotbar[i];
             if (id != 0) {
-                float[] col = Tile.swatch((byte) id);
+                float[] col = Items.swatch(id);
                 int pad = 8;
                 GL.glColor4f(col[0], col[1], col[2], 1f);
                 GL.glBegin(GL.GL_QUADS);
@@ -1627,8 +1731,34 @@ public class RubyDung implements Runnable {
             if (fill >= 2)      drawHeart(x, y, hs, flash ? 1f : 0.92f, flash ? 1f : 0.12f, 0.14f, 1f);
             else if (fill == 1) drawHalfHeart(x, y, hs, flash ? 1f : 0.92f, flash ? 1f : 0.12f, 0.14f, 1f);
         }
+        // breath: bubbles appear only while they are draining, above the hearts
+        if (player.air < Player.MAX_AIR) {
+            int bubbles = (int) Math.ceil(player.air * 10.0 / Player.MAX_AIR);
+            int by = y - hs - 4;
+            for (int i = 0; i < 10; i++) {
+                boolean full = i < bubbles;
+                if (!full && player.air > 0) continue;   // empty slots only show once drowning
+                float shade = full ? 1f : 0.25f;
+                drawBubble(startX + i * (hs + hgap), by, hs, shade);
+            }
+        }
+
         GL.glDisable(GL.GL_BLEND);
         endOrtho();
+    }
+
+    /** A round-ish bubble: a cross of quads, matching the blocky look of the hearts. */
+    private void drawBubble(int x, int y, int s, float shade) {
+        float u = s / 8f;
+        GL.glColor4f(0.55f * shade, 0.80f * shade, 1.0f * shade, 1f);
+        GL.glBegin(GL.GL_QUADS);
+        heartCell(x, y, u, 2, 1, 4, 6);
+        heartCell(x, y, u, 1, 2, 6, 4);
+        GL.glEnd();
+        GL.glColor4f(1f, 1f, 1f, 0.85f * shade);
+        GL.glBegin(GL.GL_QUADS);
+        heartCell(x, y, u, 2, 2, 2, 2);   // highlight
+        GL.glEnd();
     }
 
     /** A blocky heart: two top bumps + a body, drawn as filled quads. */
@@ -1881,8 +2011,7 @@ public class RubyDung implements Runnable {
 
         GL.glColor4f(0.8f, 0.8f, 0.8f, 1f);
         String s = loadingStatus;
-        int sw = s.length() * 10;
-        drawText(s, (width - sw) / 2, height / 2 + 42, 8, 12, 10);
+        drawTextCentered(s, width / 2, height / 2 + 42, 14);
 
         GL.glDisable(GL.GL_BLEND);
         endOrtho();
@@ -1902,17 +2031,15 @@ public class RubyDung implements Runnable {
 
         // logo shadow
         int logoY = height / 2 - 200;
-        int cw = 28, ch = 38, sp = 5;
         String logo = "RUBYDUNG";
-        int tw = logo.length() * (cw + sp);
         GL.glColor4f(0.1f, 0.1f, 0.1f, 0.8f);
-        drawText(logo, (width - tw) / 2 + 3, logoY + 3, cw, ch, cw + sp);
+        drawTextCentered(logo, width / 2 + 3, logoY + 3, 52);
         GL.glColor4f(1.0f, 0.85f, 0.3f, 1.0f);
-        drawText(logo, (width - tw) / 2, logoY, cw, ch, cw + sp);
+        drawTextCentered(logo, width / 2, logoY, 52);
 
         int btnW = 380, btnH = 60, gap = 12;
         int bx = (width - btnW) / 2;
-        int by0 = logoY + ch + 50;
+        int by0 = logoY + 52 + 50;   // logo height + gap
 
         int mx = mouseScreenX(), my = mouseScreenY();
         boolean h0 = hover(mx, my, bx, by0,              btnW, btnH);
@@ -1927,7 +2054,7 @@ public class RubyDung implements Runnable {
 
         // version strings
         GL.glColor4f(1f, 1f, 1f, 0.7f);
-        drawText("RUBYDUNG ALPHA " + VERSION, 8, height - 22, 8, 12, 11);
+        drawText("RUBYDUNG ALPHA " + VERSION, 8, height - 22, 14);
 
         var menuEvents = Input.pollMouseEvents();
         if (menuCooldown > 0) { menuCooldown--; menuEvents.clear(); }
@@ -2164,10 +2291,8 @@ public class RubyDung implements Runnable {
     }
 
     private void drawTitle(String title, int y) {
-        int cw = 30, ch = 42, sp = 5;
-        int tw = title.length() * (cw + sp);
         GL.glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
-        drawText(title, (width - tw) / 2, y, cw, ch, cw + sp);
+        drawTextFitCentered(title, width / 2, y, 42, width - 40);
     }
 
     private void drawButton(int x, int y, int w, int h, String label, boolean hover) {
@@ -2195,11 +2320,9 @@ public class RubyDung implements Runnable {
         GL.glEnd();
 
         // label
-        int charW = 18, charH = 26;
-        int spacing = charW + 3;
-        int textW = label.length() * spacing;
+        int charH = Math.min(26, h - 8);
         GL.glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
-        drawText(label, x + (w - textW) / 2, y + (h - charH) / 2, charW, charH, spacing);
+        drawTextFitCentered(label, x + w / 2, y + (h - charH) / 2, charH, w - 12);
     }
 
     /** Button-sized text without the box or hover highlight, for read-only rows. */
@@ -2226,98 +2349,43 @@ public class RubyDung implements Runnable {
         renderer.pop();
     }
 
-    /** 5x7 bitmap font. Bit 4 = leftmost pixel. */
-    private static final int[][] GLYPHS = {
-        {0b11111, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11111}, // 0
-        {0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110}, // 1
-        {0b11111, 0b00001, 0b00001, 0b11111, 0b10000, 0b10000, 0b11111}, // 2
-        {0b11111, 0b00001, 0b00001, 0b11111, 0b00001, 0b00001, 0b11111}, // 3
-        {0b10001, 0b10001, 0b10001, 0b11111, 0b00001, 0b00001, 0b00001}, // 4
-        {0b11111, 0b10000, 0b10000, 0b11111, 0b00001, 0b00001, 0b11111}, // 5
-        {0b11111, 0b10000, 0b10000, 0b11111, 0b10001, 0b10001, 0b11111}, // 6
-        {0b11111, 0b00001, 0b00001, 0b00011, 0b00010, 0b00100, 0b00100}, // 7
-        {0b11111, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b11111}, // 8
-        {0b11111, 0b10001, 0b10001, 0b11111, 0b00001, 0b00001, 0b11111}, // 9
-        {0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001}, // A
-        {0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110}, // B
-        {0b01111, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b01111}, // C
-        {0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110}, // D
-        {0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111}, // E
-        {0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000}, // F
-        {0b01111, 0b10000, 0b10000, 0b10011, 0b10001, 0b10001, 0b01111}, // G
-        {0b10001, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001}, // H
-        {0b01110, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110}, // I
-        {0b00111, 0b00010, 0b00010, 0b00010, 0b00010, 0b10010, 0b01100}, // J
-        {0b10001, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010, 0b10001}, // K
-        {0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111}, // L
-        {0b10001, 0b11011, 0b10101, 0b10101, 0b10001, 0b10001, 0b10001}, // M
-        {0b10001, 0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001}, // N
-        {0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110}, // O
-        {0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000}, // P
-        {0b01110, 0b10001, 0b10001, 0b10001, 0b10101, 0b10010, 0b01101}, // Q
-        {0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001}, // R
-        {0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110}, // S
-        {0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100}, // T
-        {0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110}, // U
-        {0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100}, // V
-        {0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b10101, 0b01010}, // W
-        {0b10001, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b10001}, // X
-        {0b10001, 0b10001, 0b10001, 0b01010, 0b00100, 0b00100, 0b00100}, // Y
-        {0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b11111}, // Z
-        {0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000}, // ' '
-        {0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b01100, 0b01100}, // '.'
-        {0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00000, 0b00100}, // '!'
-        {0b00000, 0b00000, 0b00000, 0b11111, 0b00000, 0b00000, 0b00000}, // '-'
-        {0b00000, 0b01100, 0b01100, 0b00000, 0b01100, 0b01100, 0b00000}, // ':'
-        {0b00001, 0b00010, 0b00100, 0b00100, 0b01000, 0b10000, 0b00000}, // '/'
-        {0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00100, 0b00100}, // ',' (approx)
-        {0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b11111}, // '_'
-    };
-    // Direct char→glyph index lookup. -1 = unsupported character.
-    private static final int[] GLYPH_INDEX;
-    static {
-        char[] keys = {
-            '0','1','2','3','4','5','6','7','8','9',
-            'A','B','C','D','E','F','G','H','I','J','K','L','M','N','O','P','Q','R','S','T','U','V','W','X','Y','Z',
-            ' ','.','!','-',':','/',',','_'
-        };
-        int maxChar = 0;
-        for (char k : keys) if (k > maxChar) maxChar = k;
-        GLYPH_INDEX = new int[maxChar + 1];
-        java.util.Arrays.fill(GLYPH_INDEX, -1);
-        for (int i = 0; i < keys.length; i++) GLYPH_INDEX[keys[i]] = i;
+    /**
+     * Draw a line of UI text. {@code h} is the wanted line height in pixels; the width and
+     * pitch arguments are historical — the font is proportional, so glyphs are no longer
+     * placed on a fixed grid. Colour comes from the last GL.glColor call, which is how every
+     * call site already expresses it.
+     */
+    private void drawText(String text, int x, int y, int w, int h, int pitch) {
+        drawText(text, x, y, h);
+    }
+
+    private void drawText(String text, int x, int y, int h) {
+        GL.color(textColor);
+        fontRenderer.drawString(text, x, y, textScale(h), textColor[0], textColor[1], textColor[2], textColor[3]);
+    }
+
+    /** Same, centred on {@code centerX} — measured, not estimated from the character count. */
+    private void drawTextCentered(String text, int centerX, int y, int h) {
+        drawText(text, Math.round(centerX - fontRenderer.width(text, textScale(h)) / 2f), y, h);
     }
 
     /**
-     * Draw a whole string as one batch: glyph boxes are w x h and advance `pitch` pixels
-     * apart. One glBegin/glEnd for the line keeps text off the per-glyph draw-call path.
+     * Centred, but shrunk to fit {@code maxWidth}. A proportional font makes label widths
+     * depend on the text, so a long label in a narrow button (or any title in a window the
+     * user dragged small) has to give — silently drawing past the edge is not an option.
      */
-    private void drawText(String text, int x, int y, int w, int h, int pitch) {
-        int pixW = Math.max(w / 5, 1);
-        int pixH = Math.max(h / 7, 1);
-
-        GL.glBegin(GL.GL_QUADS);
-        for (int i = 0; i < text.length(); i++) {
-            char c = text.charAt(i);
-            if (c >= 'a' && c <= 'z') c -= 32; // fold lowercase to the uppercase glyph
-            int glyph = (c < GLYPH_INDEX.length) ? GLYPH_INDEX[c] : -1;
-            if (glyph < 0) continue; // unknown glyph (e.g. Cyrillic): draw nothing rather than a black box
-            int cx = x + i * pitch;
-            for (int row = 0; row < 7; row++) {
-                for (int col = 0; col < 5; col++) {
-                    if ((GLYPHS[glyph][row] & (1 << (4 - col))) != 0) {
-                        float px = cx + col * pixW;
-                        float py = y + row * pixH;
-                        GL.glVertex2f(px,          py);
-                        GL.glVertex2f(px + pixW,   py);
-                        GL.glVertex2f(px + pixW,   py + pixH);
-                        GL.glVertex2f(px,          py + pixH);
-                    }
-                }
-            }
-        }
-        GL.glEnd();
+    private void drawTextFitCentered(String text, int centerX, int y, int h, int maxWidth) {
+        float scale = textScale(h);
+        float w = fontRenderer.width(text, scale);
+        int drawH = h;
+        if (w > maxWidth && w > 0) drawH = Math.max(8, Math.round(h * maxWidth / w));
+        drawTextCentered(text, centerX, y + (h - drawH) / 2, drawH);
     }
+
+    private float textScale(int pixelHeight) {
+        return pixelHeight / (float) fontRenderer.glyphH;
+    }
+
 
     public static void main(String[] args) {
         new RubyDung().run();

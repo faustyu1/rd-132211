@@ -20,6 +20,9 @@ public class GameServer {
     private final Map<Integer, float[]>          clientPos    = new ConcurrentHashMap<>(); // id->[x,y,z,yr,xr]
     private final Map<Integer, String>           clientNames  = new ConcurrentHashMap<>();
     private final AtomicInteger                  nextId       = new AtomicInteger(1);
+    // chunks already delivered to each client, so an edited chunk is sent once and not
+    // re-sent every tick; entries are dropped once the client walks far away from them
+    private final Map<Integer, java.util.Set<Long>> sentChunks = new ConcurrentHashMap<>();
     private volatile boolean                     running      = true;
     public  final int                            port;
     // host's own data visible to game thread for rendering
@@ -43,7 +46,7 @@ public class GameServer {
                     int id = nextId.getAndIncrement();
                     // send WELCOME before creating Connection so its reader thread
                     // doesn't race against the client's synchronous bootstrap read
-                    byte[] welcome = PacketWriter.welcome(id, level.getRawBlocks());
+                    byte[] welcome = PacketWriter.welcome(id, level.getSeed());
                     var directOut = new DataOutputStream(new BufferedOutputStream(sock.getOutputStream()));
                     directOut.writeInt(welcome.length);
                     directOut.write(welcome);
@@ -85,7 +88,47 @@ public class GameServer {
             while ((pkt = conn.poll()) != null) handlePacket(id, pkt, conn);
         }
         if (dead != null) {
-            dead.forEach(id -> { clients.remove(id); clientPos.remove(id); clientNames.remove(id); });
+            dead.forEach(id -> { clients.remove(id); clientPos.remove(id); clientNames.remove(id); sentChunks.remove(id); });
+        }
+        streamEditedChunks();
+    }
+
+    // How far around a client edited chunks are pushed, and how far they have to walk away
+    // before that record is forgotten. The gap between the two stops a client sitting on a
+    // boundary from re-requesting the same chunk every tick.
+    private static final int SEND_RADIUS = 8, FORGET_RADIUS = 12;
+    private static final int MAX_CHUNKS_PER_TICK = 4;
+
+    /**
+     * Send each client the chunks it cannot generate for itself. Terrain comes from the
+     * seed; only blocks somebody edited are pushed, a few per tick so a join does not stall
+     * the game thread with megabytes of writes.
+     */
+    private void streamEditedChunks() {
+        for (var entry : clients.entrySet()) {
+            int id = entry.getKey();
+            Connection conn = entry.getValue();
+            float[] pos = clientPos.get(id);
+            if (pos == null || !conn.isAlive()) continue;
+            var sent = sentChunks.computeIfAbsent(id, k -> java.util.concurrent.ConcurrentHashMap.newKeySet());
+            int pcx = (int) Math.floor(pos[0] / 16.0f), pcz = (int) Math.floor(pos[2] / 16.0f);
+            sent.removeIf(key -> Math.abs((int) (key >> 32) - pcx) > FORGET_RADIUS
+                              || Math.abs((int) (long) key - pcz) > FORGET_RADIUS);
+            int budget = MAX_CHUNKS_PER_TICK;
+            for (int r = 0; r <= SEND_RADIUS && budget > 0; r++) {
+                for (int dx = -r; dx <= r && budget > 0; dx++) {
+                    for (int dz = -r; dz <= r && budget > 0; dz++) {
+                        if (Math.max(Math.abs(dx), Math.abs(dz)) != r) continue; // ring by ring, nearest first
+                        int cx = pcx + dx, cz = pcz + dz;
+                        long key = ((long) cx << 32) | (cz & 0xFFFFFFFFL);
+                        if (!sent.add(key)) continue;
+                        byte[] blocks = level.getStoredBlocks(cx, cz);
+                        if (blocks == null) continue;   // pure terrain: the seed is enough
+                        conn.send(PacketWriter.chunk(cx, cz, blocks));
+                        budget--;
+                    }
+                }
+            }
         }
     }
 

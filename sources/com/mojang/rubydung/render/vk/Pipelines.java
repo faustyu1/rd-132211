@@ -10,9 +10,9 @@ import static org.lwjgl.system.MemoryStack.stackPush;
 import static org.lwjgl.vulkan.KHRDynamicRendering.VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO_KHR;
 import static org.lwjgl.vulkan.VK10.*;
 
-/** Builds the shared pipeline layout and all graphics pipelines. Vertex format: pos3+uv2+color4 (36B). */
+/** Builds the shared pipeline layout and all graphics pipelines. Vertex format: pos3+uv2+color4+light2 (44B). */
 public class Pipelines {
-    public static final int VERTEX_STRIDE = 36; // 9 floats
+    public static final int VERTEX_STRIDE = 44; // 11 floats
 
     public enum Pipeline { WORLD_OPAQUE, WORLD_TRANSLUCENT, OVERLAY_3D, LINES, UI, UI_LINES, UI_INVERT }
 
@@ -101,10 +101,11 @@ public class Pipelines {
             // vertex input: one interleaved binding, 3 attributes
             VkVertexInputBindingDescription.Buffer binding = VkVertexInputBindingDescription.calloc(1, stack)
                 .binding(0).stride(VERTEX_STRIDE).inputRate(VK_VERTEX_INPUT_RATE_VERTEX);
-            VkVertexInputAttributeDescription.Buffer attrs = VkVertexInputAttributeDescription.calloc(3, stack);
+            VkVertexInputAttributeDescription.Buffer attrs = VkVertexInputAttributeDescription.calloc(4, stack);
             attrs.get(0).location(0).binding(0).format(VK_FORMAT_R32G32B32_SFLOAT).offset(0);   // pos
             attrs.get(1).location(1).binding(0).format(VK_FORMAT_R32G32_SFLOAT).offset(12);      // uv
             attrs.get(2).location(2).binding(0).format(VK_FORMAT_R32G32B32A32_SFLOAT).offset(20);// color
+            attrs.get(3).location(3).binding(0).format(VK_FORMAT_R32G32_SFLOAT).offset(36);      // light (sky, block)
 
             VkPipelineVertexInputStateCreateInfo vertexInput = VkPipelineVertexInputStateCreateInfo.calloc(stack)
                 .sType(VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO)

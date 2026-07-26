@@ -3,6 +3,7 @@
 layout(location = 0) in vec2 vUV;
 layout(location = 1) in vec4 vColor;
 layout(location = 2) in vec3 vViewPos;
+layout(location = 3) in vec2 vLight;   // x = sky light, y = block light
 
 layout(set = 0, binding = 0) uniform sampler2D tex;
 
@@ -20,8 +21,11 @@ void main() {
     vec4 c = texture(tex, vUV) * vColor;
     if (c.a < (1.0 / 255.0)) discard;
 
-    // global day/night darkening (applied to lit geometry; UI uses brightness=1)
-    c.rgb *= fog.brightness;
+    // Sky light follows the day/night cycle; block light does not, so a torch keeps its
+    // room lit at midnight. Whichever source is stronger wins, as in the original game.
+    // Geometry with no light attribute defaults to (1, 0) and so just tracks brightness,
+    // which is what the UI, particles and entities want.
+    c.rgb *= max(vLight.x * fog.brightness, vLight.y);
 
     if (fog.enabled > 0.5) {
         float dist = length(vViewPos);

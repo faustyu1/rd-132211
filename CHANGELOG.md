@@ -8,6 +8,50 @@ This project follows [Semantic Versioning](https://semver.org/) while in `0.x`:
 
 Do not bump versions for every commit; group changes into a release and tag once.
 
+## [0.5.0] - 2026-07-26
+
+Everything below is new gameplay or a protocol change, so this is a MINOR bump rather than
+a patch. Multiplayer is not compatible with 0.4.x: the handshake now carries a protocol
+version and a mismatched peer is told so instead of misreading the stream.
+
+### Added
+- **Torches and block light.** A second light channel, propagated by the same flood fill as
+  sky light but seeded from emitters, and — unlike sky light — not dimmed by the day/night
+  cycle, so a lit cave stays lit at midnight. Light crosses chunk borders, is blocked by
+  solid blocks, and disappears when the torch does. A torch needs something to stand on and
+  drops when that support is broken.
+- **Tools and crafting** (`Items`, screen 7, key `C`). Sticks, and pickaxes/axes/shovels in
+  wood, stone and iron. The right tool mines its material up to seven times faster, and
+  stone and ore now yield nothing without a pickaxe good enough for them — bare hands get
+  wood and dirt, a wooden pickaxe gets stone and coal, stone gets iron, iron gets gold and
+  diamond. That chain is what finally gives the ore in the ground a purpose. Recipes are
+  shapeless and listed with their cost and your stock; tools have no durability.
+- **Drowning.** Fifteen seconds of breath under water, then half a heart a second, with a
+  bubble row above the hearts. Refills instantly at the surface.
+- **Number keys 1-9** select hotbar slots.
+- **Autosave** every 30 seconds. A crash used to cost everything since launch.
+- **Survival inventory** shows what you have actually collected, including crafted items,
+  instead of the creative palette.
+
+### Changed
+- **Multiplayer sends the world seed, not the world.** The handshake shrank from tens of
+  megabytes to seventeen bytes: both sides generate identical terrain from the seed, and
+  only chunks somebody edited travel, streamed a few per tick around each client as it
+  moves. Before this, the client generated its own terrain outside the snapshot it was
+  sent, so players standing in the same place could be in different worlds.
+- **One font.** The hand-built 5x7 bitmap font is gone; menus, HUD, chat and the 3D name
+  tags all draw through the same texture atlas. Menus can therefore show lowercase and
+  Cyrillic, which the old font silently dropped, and a label that would not fit its button
+  is scaled down instead of drawn past the edge.
+- **Saves only store what the seed cannot reproduce.** A world folder used to accumulate
+  every chunk the player had ever seen (~14 MB at the default render distance); now it
+  holds only edited chunks, and untouched terrain is regenerated.
+- Spectator mode moves properly fast, which is the only thing it is for.
+- `Level.save()`/`load()` without arguments (the pre-`saves/` single-folder API) removed.
+
+### Fixed
+- Placing a block no longer relights the whole chunk when there is no torch light near it.
+
 ## [0.4.1] - 2026-07-26
 
 A full line-by-line review of the codebase, and the fixes for everything it found.

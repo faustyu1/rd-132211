@@ -59,6 +59,9 @@ public final class GL {
         }
     }
 
+    /** Reads back the colour last set with glColor — FontRenderer takes colour as an argument. */
+    public static void color(float[] out) { imm.getColor(out); }
+
     public static void glVertex2f(float x, float y) { imm.vertex2(x, y); }
     public static void glVertex3f(float x, float y, float z) { imm.vertex3(x, y, z); }
     public static void glEnd() { imm.end(); }

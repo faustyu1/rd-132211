@@ -192,14 +192,134 @@ public class Level {
         WorldChunk chunk = chunks.get(chunkKey(cx, cz));
         if (chunk == null) return;
         int lx = x - cx * WorldChunk.SIZE, lz = z - cz * WorldChunk.SIZE;
+        byte old = chunk.getBlock(lx, y, lz);
         chunk.setBlock(lx, y, lz, (byte) type);
         chunk.markModified();
         // recompute light for this column
         chunk.updateLightAt(lx, lz);
         for (var listener : levelListeners) listener.tileChanged(x, y, z, true);
+        // Emitters change what is lit; ordinary blocks change what the light can reach, but
+        // only matter where there is light to block, which is nowhere in most of the world.
+        if (Tile.lightEmission(old) > 0 || Tile.lightEmission(type) > 0 || litNearby(x, y, z))
+            relightBlockLightAround(x, y, z);
+        // a torch cannot hang in the air: removing its support takes it with it
+        if (Tile.isSolid(old) && !Tile.isSolid((byte) type) && Tile.needsSupport(getBlock(x, y + 1, z)))
+            setTile(x, y + 1, z, Tile.AIR);
         // wake fluid simulation around the change
         scheduleFluid(x, y, z);
         scheduleFluidNeighbors(x, y, z);
+    }
+
+    // ===================================================================== //
+    //  Block light (torches): world-space reflood of a bounded box            //
+    // ===================================================================== //
+
+    private static final int LIGHT_RADIUS = 15;
+
+    /**
+     * Recompute block light around a change. Everything within the light radius is cleared
+     * and then re-flooded from every emitter that could reach it, walking world coordinates
+     * so light crosses chunk borders exactly as it does anywhere else.
+     *
+     * Re-flooding from the emitters themselves is what makes removal work: a torch that is
+     * gone simply is not a seed any more, and because the fill only ever raises a cell, the
+     * emitters outside the cleared box re-light their share of it without disturbing
+     * anything beyond it.
+     */
+    public void relightBlockLightAround(int x, int y, int z) {
+        final int r = LIGHT_RADIUS;
+        int y0 = Math.max(0, y - r), y1 = Math.min(sizeY - 1, y + r);
+        int x0 = x - r, x1 = x + r, z0 = z - r, z1 = z + r;
+
+        for (int bx = x0; bx <= x1; bx++)
+            for (int bz = z0; bz <= z1; bz++) {
+                WorldChunk c = chunkAt(bx, bz);
+                if (c == null) continue;
+                int lx = bx - Math.floorDiv(bx, WorldChunk.SIZE) * WorldChunk.SIZE;
+                int lz = bz - Math.floorDiv(bz, WorldChunk.SIZE) * WorldChunk.SIZE;
+                for (int by = y0; by <= y1; by++) c.clearBlockLight(lx, by, lz);
+            }
+
+        // seeds: every emitter whose own radius overlaps the cleared box
+        LongQueue queue = new LongQueue();
+        int ecx0 = Math.floorDiv(x0 - r, WorldChunk.SIZE), ecx1 = Math.floorDiv(x1 + r, WorldChunk.SIZE);
+        int ecz0 = Math.floorDiv(z0 - r, WorldChunk.SIZE), ecz1 = Math.floorDiv(z1 + r, WorldChunk.SIZE);
+        for (int cx = ecx0; cx <= ecx1; cx++) {
+            for (int cz = ecz0; cz <= ecz1; cz++) {
+                WorldChunk c = chunks.get(chunkKey(cx, cz));
+                if (c == null) continue;
+                for (int idx : c.emitters()) {
+                    int ey = idx / (WorldChunk.SIZE * WorldChunk.SIZE);
+                    int rem = idx - ey * WorldChunk.SIZE * WorldChunk.SIZE;
+                    int elz = rem / WorldChunk.SIZE;
+                    int elx = rem - elz * WorldChunk.SIZE;
+                    int ex = cx * WorldChunk.SIZE + elx, ez = cz * WorldChunk.SIZE + elz;
+                    int emit = Tile.lightEmission(c.getBlock(elx, ey, elz));
+                    if (emit <= 0) continue;
+                    c.raiseBlockLight(elx, ey, elz, emit);
+                    queue.add(packPos(ex, ey, ez));
+                }
+            }
+        }
+
+        while (!queue.isEmpty()) {
+            long p = queue.poll();
+            int px = unpackX(p), py = unpackY(p), pz = unpackZ(p);
+            int next = blockLightRaw(px, py, pz) - 1;
+            if (next <= 0) continue;
+            spreadBlockLight(px - 1, py, pz, next, queue);
+            spreadBlockLight(px + 1, py, pz, next, queue);
+            spreadBlockLight(px, py - 1, pz, next, queue);
+            spreadBlockLight(px, py + 1, pz, next, queue);
+            spreadBlockLight(px, py, pz - 1, next, queue);
+            spreadBlockLight(px, py, pz + 1, next, queue);
+        }
+
+        // anything whose light may have moved has to be re-meshed
+        for (int cx = Math.floorDiv(x0, WorldChunk.SIZE); cx <= Math.floorDiv(x1, WorldChunk.SIZE); cx++)
+            for (int cz = Math.floorDiv(z0, WorldChunk.SIZE); cz <= Math.floorDiv(z1, WorldChunk.SIZE); cz++) {
+                WorldChunk c = chunks.get(chunkKey(cx, cz));
+                if (c != null) c.setDirtyRange(y0, y1, false);
+            }
+    }
+
+    private void spreadBlockLight(int x, int y, int z, int level, LongQueue queue) {
+        WorldChunk c = chunkAt(x, z);
+        if (c == null) return;
+        int lx = x - Math.floorDiv(x, WorldChunk.SIZE) * WorldChunk.SIZE;
+        int lz = z - Math.floorDiv(z, WorldChunk.SIZE) * WorldChunk.SIZE;
+        if (c.raiseBlockLight(lx, y, lz, level)) queue.add(packPos(x, y, z));
+    }
+
+    private int blockLightRaw(int x, int y, int z) {
+        WorldChunk c = chunkAt(x, z);
+        if (c == null) return 0;
+        int lx = x - Math.floorDiv(x, WorldChunk.SIZE) * WorldChunk.SIZE;
+        int lz = z - Math.floorDiv(z, WorldChunk.SIZE) * WorldChunk.SIZE;
+        return c.blockLightAt(lx, y, lz);
+    }
+
+    private WorldChunk chunkAt(int x, int z) {
+        return chunks.get(chunkKey(Math.floorDiv(x, WorldChunk.SIZE), Math.floorDiv(z, WorldChunk.SIZE)));
+    }
+
+    private static int unpackX(long p) { int v = (int) (p >> 38); return (v & 0x2000000) != 0 ? v | ~0x3FFFFFF : v; }
+    private static int unpackY(long p) { return (int) ((p >> 26) & 0xFFF); }
+    private static int unpackZ(long p) { int v = (int) (p & 0x3FFFFFF); return (v & 0x2000000) != 0 ? v | ~0x3FFFFFF : v; }
+
+    /** Minimal growable long FIFO — the light fill would otherwise box every position. */
+    private static final class LongQueue {
+        private long[] a = new long[1024];
+        private int head = 0, tail = 0;
+        void add(long v) {
+            if (tail == a.length) {
+                if (head > 0) { System.arraycopy(a, head, a, 0, tail - head); tail -= head; head = 0; }
+                else a = java.util.Arrays.copyOf(a, a.length * 2);
+            }
+            a[tail++] = v;
+        }
+        boolean isEmpty() { return head == tail; }
+        long poll() { return a[head++]; }
     }
 
     // ===================================================================== //
@@ -340,13 +460,12 @@ public class Level {
         if (y < 0 || y >= sizeY) return false;
         byte b = getBlock(x, y, z);
         if (callerIsWater && Tile.isWater(b)) return true; // water-water: cull face
-        return b != 0 && b != 3 && !Tile.isWater(b);
+        return Tile.isSolid(b);
     }
 
     public boolean isSolidTile(int x, int y, int z) {
         if (y < 0 || y >= sizeY) return false;
-        byte b = getBlock(x, y, z);
-        return b != 0 && b != 3 && !Tile.isWater(b);
+        return Tile.isSolid(getBlock(x, y, z));
     }
 
     public float getBrightness(int x, int y, int z) {
@@ -356,6 +475,24 @@ public class Level {
         WorldChunk chunk = chunks.get(chunkKey(cx, cz));
         if (chunk == null) return 1.0f;
         return chunk.getBrightness(x - cx * WorldChunk.SIZE, y, z - cz * WorldChunk.SIZE);
+    }
+
+    /** Light cast by torches, 0..1. Unloaded chunks are dark, not lit. */
+    /** Cheap test for "is there any torch light around here at all" before a reflood. */
+    private boolean litNearby(int x, int y, int z) {
+        return blockLightRaw(x, y, z) > 0
+            || blockLightRaw(x + 1, y, z) > 0 || blockLightRaw(x - 1, y, z) > 0
+            || blockLightRaw(x, y + 1, z) > 0 || blockLightRaw(x, y - 1, z) > 0
+            || blockLightRaw(x, y, z + 1) > 0 || blockLightRaw(x, y, z - 1) > 0;
+    }
+
+    public float getBlockBrightness(int x, int y, int z) {
+        if (y < 0 || y >= sizeY) return 0f;
+        int cx = Math.floorDiv(x, WorldChunk.SIZE);
+        int cz = Math.floorDiv(z, WorldChunk.SIZE);
+        WorldChunk chunk = chunks.get(chunkKey(cx, cz));
+        if (chunk == null) return 0f;
+        return chunk.getBlockBrightness(x - cx * WorldChunk.SIZE, y, z - cz * WorldChunk.SIZE);
     }
 
     public int getSurfaceY(int x, int z) {
@@ -459,8 +596,10 @@ public class Level {
         } catch (Exception e) {
             e.printStackTrace();
         }
-        // Save each loaded chunk
-        for (var chunk : chunks.values()) writeChunk(dir, chunk);
+        // Only edited chunks are worth storing: terrain is a pure function of the seed,
+        // so writing generated chunks would bloat the save with data readChunk could
+        // reproduce for free. A chunk edited in an earlier session already has its file.
+        for (var chunk : chunks.values()) if (chunk.modified) writeChunk(dir, chunk);
     }
 
     public void load(File dir) {
@@ -503,48 +642,46 @@ public class Level {
         for (var listener : levelListeners) listener.allChanged();
     }
 
-    // Legacy save/load (single file) kept for compatibility
-    public void save() {
-        save(new File("world"));
-    }
-
-    public void load() {
-        load(new File("world"));
-    }
-
-    /** Returns a compact byte[] of all loaded chunks for network sync (legacy). */
-    public byte[] getRawBlocks() {
-        // Serialize as: [count(int)][cx(int)][cz(int)][blocks(SIZE*HEIGHT*SIZE)]...
-        // snapshot first: this runs on the server's acceptor thread while the game thread
-        // streams chunks in, and a concurrent insert would overflow a pre-sized buffer
-        List<WorldChunk> snapshot = new ArrayList<>(chunks.values());
-        int count = snapshot.size();
-        int blockLen = WorldChunk.SIZE * WorldChunk.HEIGHT * WorldChunk.SIZE;
-        byte[] out = new byte[4 + count * (8 + blockLen)];
-        java.nio.ByteBuffer buf = java.nio.ByteBuffer.wrap(out);
-        buf.putInt(count);
-        for (var chunk : snapshot) {
-            buf.putInt(chunk.cx);
-            buf.putInt(chunk.cz);
-            buf.put(chunk.blocks);
+    /**
+     * Block data for a chunk the world does NOT generate from its seed — i.e. one somebody
+     * edited. Returns null for untouched terrain, which a peer can reproduce from the seed
+     * alone and so never needs to be sent. Reads straight from the save file when the chunk
+     * is not resident, so serving a client does not drag the whole world into memory.
+     */
+    public byte[] getStoredBlocks(int cx, int cz) {
+        WorldChunk c = chunks.get(chunkKey(cx, cz));
+        if (c != null && c.modified) return c.blocks.clone();
+        File dir = saveDir;
+        if (dir == null) return null;
+        File f = new File(dir, cx + "_" + cz + ".dat");
+        if (!f.exists()) return null;
+        byte[] buf = new byte[WorldChunk.SIZE * WorldChunk.HEIGHT * WorldChunk.SIZE];
+        int off = 0;
+        try (var dis = new DataInputStream(new GZIPInputStream(new FileInputStream(f)))) {
+            int n;
+            while (off < buf.length && (n = dis.read(buf, off, buf.length - off)) > 0) off += n;
+        } catch (Exception e) {
+            e.printStackTrace();
+            return null;
         }
-        return out;
+        return off == buf.length ? buf : null;
     }
 
-    /** Replaces block data from network. */
-    public void setRawBlocks(byte[] data) {
-        java.nio.ByteBuffer buf = java.nio.ByteBuffer.wrap(data);
-        int count = buf.getInt();
-        int blockLen = WorldChunk.SIZE * WorldChunk.HEIGHT * WorldChunk.SIZE;
-        for (int i = 0; i < count; i++) {
-            int cx = buf.getInt(), cz = buf.getInt();
-            WorldChunk chunk = chunks.computeIfAbsent(chunkKey(cx, cz), k -> new WorldChunk(cx, cz, this));
-            buf.get(chunk.blocks);
-            // a remote snapshot is not a local edit: it must never be flushed into
-            // whatever save directory this Level happens to be pointed at
-            chunk.calcLightDepths();
-            chunk.setDirty();
-        }
+    /**
+     * Overwrite one chunk with authoritative data from the host. Not marked modified: a
+     * client never owns the world it is shown and must never write it to a save folder.
+     */
+    public void applyNetworkChunk(int cx, int cz, byte[] blocks) {
+        WorldChunk chunk = chunks.computeIfAbsent(chunkKey(cx, cz), k -> new WorldChunk(cx, cz, this));
+        if (blocks.length != chunk.blocks.length) return;
+        System.arraycopy(blocks, 0, chunk.blocks, 0, blocks.length);
+        chunk.invalidateEmitters();
+        chunk.calcLightDepths();
+        chunk.setDirty();
+        markNeighborDirty(cx - 1, cz);
+        markNeighborDirty(cx + 1, cz);
+        markNeighborDirty(cx, cz - 1);
+        markNeighborDirty(cx, cz + 1);
         for (var listener : levelListeners) listener.allChanged();
     }
 }

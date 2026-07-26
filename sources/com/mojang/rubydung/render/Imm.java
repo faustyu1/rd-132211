@@ -29,6 +29,11 @@ public final class Imm {
         this.r = r; this.g = g; this.b = b; this.a = a;
     }
 
+    /** Current colour, for the text renderer, which needs it as shader input rather than state. */
+    public void getColor(float[] out) {
+        out[0] = r; out[1] = g; out[2] = b; out[3] = a;
+    }
+
     public void begin(int mode) {
         this.mode = mode;
         t.init();

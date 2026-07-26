@@ -18,15 +18,17 @@ public class GameClient {
 
     private final Connection conn;
     public  final int        localId;
+    public  final long       worldSeed;
 
-    private final Level level;
+    // Assigned once the caller has built a Level for the seed we were handed. Packets that
+    // arrive before that are simply queued in the Connection and drained on the first tick.
+    private Level level;
 
     private final Map<Integer, float[]>  remotePlayers = new ConcurrentHashMap<>();
     private final Map<Integer, String>   remoteNames   = new ConcurrentHashMap<>();
     private final java.util.concurrent.ConcurrentLinkedQueue<String> pendingChat = new java.util.concurrent.ConcurrentLinkedQueue<>();
 
-    public GameClient(String host, int port, Level level) throws IOException {
-        this.level = level;
+    public GameClient(String host, int port) throws IOException {
         Socket sock = new Socket();
         try {
             sock.connect(new InetSocketAddress(host, port), 5000);
@@ -39,10 +41,12 @@ public class GameClient {
 
             var wis = new DataInputStream(new ByteArrayInputStream(welcomePkt));
             if (wis.readByte() != Packet.WELCOME) throw new IOException("Expected WELCOME");
+            int protocol = wis.readInt();
+            if (protocol != Packet.PROTOCOL_VERSION)
+                throw new IOException("Server speaks protocol " + protocol
+                    + ", this client speaks " + Packet.PROTOCOL_VERSION);
             localId = wis.readInt();
-            byte[] blocks = new byte[wis.available()];
-            wis.readFully(blocks);
-            level.setRawBlocks(blocks);
+            worldSeed = wis.readLong();
 
             sock.setSoTimeout(0);
             // hand the bootstrap stream over: a second buffered stream on this socket would
@@ -52,6 +56,11 @@ public class GameClient {
             try { sock.close(); } catch (IOException ignored) {}
             throw e;
         }
+    }
+
+    /** Give the client the world built from {@link #worldSeed}; until then packets just queue. */
+    public void attachLevel(Level level) {
+        this.level = level;
     }
 
     /** Send our name right after connecting. */
@@ -77,10 +86,15 @@ public class GameClient {
                     float yr = dis.readFloat(), xr = dis.readFloat();
                     if (id != localId) remotePlayers.put(id, new float[]{x, y, z, yr, xr});
                 }
+                case Packet.CHUNK -> {
+                    int cx = dis.readInt(), cz = dis.readInt();
+                    byte[] blocks = dis.readAllBytes();
+                    if (level != null) level.applyNetworkChunk(cx, cz, blocks);
+                }
                 case Packet.SET_TILE -> {
                     int x = dis.readInt(), y = dis.readInt(), z = dis.readInt(), tile = dis.readInt();
                     // a rogue host is no more trusted than a rogue peer
-                    if (Packet.isPlaceable(tile)) level.setTile(x, y, z, tile);
+                    if (Packet.isPlaceable(tile) && level != null) level.setTile(x, y, z, tile);
                 }
                 case Packet.PLAYER_NAME -> {
                     int id = dis.readInt();
