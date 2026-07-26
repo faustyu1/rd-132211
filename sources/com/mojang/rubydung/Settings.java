@@ -57,8 +57,4 @@ public class Settings {
         p.setProperty("resIndex",    String.valueOf(resIndex));
         try (var w = new FileWriter(FILE)) { p.store(w, null); } catch (Exception ignored) {}
     }
-
-    private static int clamp(int v, int min, int max) {
-        return Math.max(min, Math.min(max, v));
-    }
 }

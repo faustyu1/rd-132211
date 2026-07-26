@@ -14,7 +14,7 @@ Do not bump versions for every commit; group changes into a release and tag once
 - **Survival mode**: player health (0–20 half-hearts), fall damage, void damage,
   invulnerability frames, passive regeneration, respawn, and a blocky heart HUD.
 - **Dropped items** (`DroppedItems`): broken blocks spawn spinning, gravity-affected,
-  collidable item entities with magnet pickup, pickup delay, and despawn timer.
+  collidable item entities with proximity pickup, pickup delay, and despawn timer.
 - **Creative inventory** (screen 6): block palette grid with cursor-carry, hotbar
   editing, item counts, and block-name tooltips. Replaces the old crafting screen.
 - **Day/night cycle**: animated sky colour, warm dawn/dusk horizon tint, and a global

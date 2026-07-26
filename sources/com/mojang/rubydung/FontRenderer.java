@@ -17,9 +17,11 @@ import org.lwjgl.system.MemoryUtil;
 public class FontRenderer {
     private VkTexture texture;
     private final int[] charX   = new int[512];
+    private final int[] charY   = new int[512];
     private final int[] charW   = new int[512];
     public final int glyphH;
     private final int atlasW = 4096, atlasH;
+    private final int fallbackIndex;   // glyph substituted for characters outside RANGES
 
     private final Tesselator t = new Tesselator();
 
@@ -44,34 +46,38 @@ public class FontRenderer {
         gtmp.setFont(font);
         FontMetrics fm = gtmp.getFontMetrics();
         glyphH = fm.getHeight();
-        int x = 0;
+        int rowH = glyphH + 1;   // 1px gutter so antialiased rows cannot bleed into each other
+        int x = 0, row = 0;
         for (int i = 0; i < RANGES.length(); i++) {
             char c = RANGES.charAt(i);
             int w = fm.charWidth(c);
+            // wrap onto a new row instead of running off the end of the atlas
+            if (x + w + 1 > atlasW) { x = 0; row++; }
             charIndex.put(c, i);
             charX[i] = x;
+            charY[i] = row * rowH;
             charW[i] = w;
             x += w + 1;
         }
         gtmp.dispose();
-        atlasH = nextPow2(glyphH);
-        int atlasH2 = nextPow2(glyphH);
+        fallbackIndex = charIndex.getOrDefault('?', 0);
+        atlasH = nextPow2((row + 1) * rowH);
 
-        BufferedImage atlas = new BufferedImage(atlasW, atlasH2, BufferedImage.TYPE_INT_ARGB);
+        BufferedImage atlas = new BufferedImage(atlasW, atlasH, BufferedImage.TYPE_INT_ARGB);
         Graphics2D g = atlas.createGraphics();
         g.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
         g.setFont(font);
         g.setColor(new Color(0, 0, 0, 0));
-        g.fillRect(0, 0, atlasW, atlasH2);
+        g.fillRect(0, 0, atlasW, atlasH);
         g.setColor(Color.WHITE);
         for (int i = 0; i < RANGES.length(); i++) {
-            g.drawString(String.valueOf(RANGES.charAt(i)), charX[i], fm.getAscent());
+            g.drawString(String.valueOf(RANGES.charAt(i)), charX[i], charY[i] + fm.getAscent());
         }
         g.dispose();
 
-        int[] px = new int[atlasW * atlasH2];
-        atlas.getRGB(0, 0, atlasW, atlasH2, px, 0, atlasW);
-        ByteBuffer buf = MemoryUtil.memAlloc(atlasW * atlasH2 * 4);
+        int[] px = new int[atlasW * atlasH];
+        atlas.getRGB(0, 0, atlasW, atlasH, px, 0, atlasW);
+        ByteBuffer buf = MemoryUtil.memAlloc(atlasW * atlasH * 4);
         for (int p : px) {
             buf.put((byte)((p >> 16) & 0xFF)); // R
             buf.put((byte)((p >>  8) & 0xFF)); // G
@@ -79,7 +85,7 @@ public class FontRenderer {
             buf.put((byte)((p >> 24) & 0xFF)); // A
         }
         buf.flip();
-        texture = GameRenderer.instance.createTexture(atlasW, atlasH2, buf, true);
+        texture = GameRenderer.instance.createTexture(atlasW, atlasH, buf, true);
         MemoryUtil.memFree(buf);
     }
 
@@ -87,7 +93,9 @@ public class FontRenderer {
         int w = 0;
         for (int i = 0; i < s.length(); i++) {
             Integer idx = charIndex.get(s.charAt(i));
-            w += idx != null ? charW[idx] + 1 : charW[0];
+            // must match the substitution drawString makes, or boxes sized from this mismatch the text
+            if (idx == null) idx = fallbackIndex;
+            w += charW[idx] + 1;
         }
         return w;
     }
@@ -98,15 +106,14 @@ public class FontRenderer {
         gr.bindTexture(texture);
         t.init();
         t.color(r, g, b, a);
-        float ah = atlasH;
         for (int i = 0; i < s.length(); i++) {
             Integer idx = charIndex.get(s.charAt(i));
-            if (idx == null) idx = charIndex.getOrDefault('?', 0);
-            int gx = charX[idx], gw = charW[idx];
+            if (idx == null) idx = fallbackIndex;
+            int gx = charX[idx], gy = charY[idx], gw = charW[idx];
             float u0 = (float) gx / atlasW, u1 = (float)(gx + gw) / atlasW;
-            float v1 = (float) glyphH / ah;
-            t.tex(u0, 0);  t.vertex(x,    y,        0);
-            t.tex(u1, 0);  t.vertex(x+gw, y,        0);
+            float v0 = (float) gy / atlasH, v1 = (float)(gy + glyphH) / atlasH;
+            t.tex(u0, v0); t.vertex(x,    y,        0);
+            t.tex(u1, v0); t.vertex(x+gw, y,        0);
             t.tex(u1, v1); t.vertex(x+gw, y+glyphH, 0);
             t.tex(u0, v1); t.vertex(x,    y+glyphH, 0);
             x += gw + 1;

@@ -27,7 +27,7 @@ public class RubyDung implements Runnable {
     private Player player;
     private FontRenderer fontRenderer;
     private GameRenderer renderer;
-    private final Timer timer = new Timer(60.0f);
+    private final Timer timer = new Timer(Timer.TICKS_PER_SECOND);
     private HitResult hitResult = null;
     private long window;
 
@@ -61,6 +61,7 @@ public class RubyDung implements Runnable {
     private String portInput  = "25565";
     private String nameInput  = "Player";
     private String mpStatus   = "";
+    private int pendingHostPort = 0;  // >0: host as soon as the world finishes loading
     private boolean editingPort = false;
     private boolean editingName = false;
 
@@ -87,7 +88,10 @@ public class RubyDung implements Runnable {
 
     // day/night
     private float timeOfDay = 0.0f; // 0=noon, 0.5=midnight
+    private static final int DAY_LENGTH_TICKS = Timer.seconds(600); // full cycle every 10 minutes
     private int fluidTickCounter = 0;
+    // fluids only need to creep, so they run on every 5th tick — 12 updates per second
+    private static final int FLUID_INTERVAL = Math.max(1, Timer.TICKS_PER_SECOND / 12);
 
     // block breaking (survival) + particles
     private final ParticleSystem particles = new ParticleSystem();
@@ -101,7 +105,8 @@ public class RubyDung implements Runnable {
     private long placeNextMs  = 0;   // ms timestamp: next allowed place
 
     // hotbar
-    private final int[] hotbar = {1, 2, 3, 4, 5, 6, 7, 8, 9};
+    private static final int[] DEFAULT_HOTBAR = {1, 2, 3, 4, 5, 6, 7, 8, 9};
+    private final int[] hotbar = DEFAULT_HOTBAR.clone();
     private int selectedSlot = 0;
     // collected block counts, indexed by block id (survival inventory tally)
     private final int[] itemCounts = new int[256];
@@ -124,9 +129,6 @@ public class RubyDung implements Runnable {
 
     // tab player list
     private boolean tabOpen = false;
-
-    // inventory (screen=6)
-    private byte[] inventorySlots = new byte[36];
 
     public void init() {
         settings.load();
@@ -215,8 +217,10 @@ public class RubyDung implements Runnable {
                     if (!player.hasSpawn) player.setSpawn(player.x, player.y, player.z);
                     screen = 0;
                     glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
-                    Input.consumeMouseDelta();
+                    // anything clicked/typed while the world generated must not reach the world
+                    Input.drainEvents();
                     loadingDone = false;
+                    if (pendingHostPort > 0) startPendingHost();
                 }
                 timer.advanceTime();
                 if (screen == 0) {
@@ -225,7 +229,7 @@ public class RubyDung implements Runnable {
                     // multiplayer: keep ticking physics+network even while paused so player doesn't float
                     for (int i = 0; i < timer.ticks; i++) tick();
                 } else if (screen == -1 || screen == 8 || screen == 9) {
-                    for (int i = 0; i < timer.ticks; i++) timeOfDay = (timeOfDay + 1f / (20 * 60 * 10)) % 1f;
+                    for (int i = 0; i < timer.ticks; i++) timeOfDay = (timeOfDay + 1f / DAY_LENGTH_TICKS) % 1f;
                 }
                 render(timer.a);
                 while (System.currentTimeMillis() >= lastTime + 1000) {
@@ -243,14 +247,13 @@ public class RubyDung implements Runnable {
     }
 
     public void tick() {
-        timeOfDay = (timeOfDay + 1f / (20 * 60 * 10)) % 1f;
+        timeOfDay = (timeOfDay + 1f / DAY_LENGTH_TICKS) % 1f;
         player.tick();
         level.update(player.x, player.z, settings.chunkRadius());
-        if (fluidTickCounter++ % 5 == 0) level.tickFluids();
+        if (fluidTickCounter++ % FLUID_INTERVAL == 0) level.tickFluids();
         particles.tick();
         if (drops != null) {
-            byte got = drops.tick(player);
-            if (got != 0) collectItem(got);
+            for (byte got : drops.tick(player)) collectItem(got);
         }
         if (miningHeld && hitResult != null) updateBreaking();
 
@@ -337,7 +340,7 @@ public class RubyDung implements Runnable {
             int bx = (int) Math.floor(px + dx * t);
             int by = (int) Math.floor(py + dy * t);
             int bz = (int) Math.floor(pz + dz * t);
-            if (level.isSolidTile(bx, by, bz)) {
+            if (level.isPickable(bx, by, bz)) {
                 int face = 0;
                 if (lastBx != Integer.MIN_VALUE) {
                     int fdx = bx - lastBx, fdy = by - lastBy, fdz = bz - lastBz;
@@ -394,6 +397,7 @@ public class RubyDung implements Runnable {
                 if (key == GLFW_KEY_ESCAPE) {
                     if (screen == 6) { cursorItem = 0; screen = 0; glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED); Input.consumeMouseDelta(); }
                     else if (screen == -1) { /* stay on main menu */ }
+                    else if (screen == 11) { /* stay on the loading screen: there is no world to pause yet */ }
                     else if (screen == 9) { refreshWorldList(); screen = 8; menuCooldown = 2; }
                     else if (screen == 8) { screen = -1; menuCooldown = 2; }
                     else if (screen == 4) { screen = 5; ipInput = ""; mpStatus = ""; }
@@ -505,7 +509,7 @@ public class RubyDung implements Runnable {
             return;
         }
 
-        if (screen == 0) {
+        if (screen == 0 && player != null) {
             // re-lock cursor if chat just closed
             if (!chatOpen) glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
 
@@ -561,6 +565,10 @@ public class RubyDung implements Runnable {
             if (Input.isMouseDown(GLFW_MOUSE_BUTTON_2) && hitResult != null && now >= placeNextMs) {
                 tryPlaceBlock(); placeNextMs = now + 250;
             }
+        } else if (screen == 11) {
+            // nothing consumes input while the world generates, so drop it here: otherwise
+            // it replays into the world the moment it starts (and the queues never shrink)
+            Input.drainEvents();
         } else {
             // consume mouse delta while in menus so it doesn't accumulate
             Input.consumeMouseDelta();
@@ -569,6 +577,10 @@ public class RubyDung implements Runnable {
 
     private void tryPlaceBlock() {
         if (hitResult == null || player.mode == Player.GameMode.SPECTATOR) return;
+        int tileType = hotbar[selectedSlot];
+        if (tileType == 0) return; // empty slot: placing nothing must not touch the world
+        boolean survival = player.mode == Player.GameMode.SURVIVAL;
+        if (survival && itemCounts[tileType & 0xFF] <= 0) return; // none of this block collected
         int x = hitResult.x(), y = hitResult.y(), z = hitResult.z();
         switch (hitResult.f()) {
             case 0 -> y--; case 1 -> y++;
@@ -577,8 +589,8 @@ public class RubyDung implements Runnable {
         }
         var blockAABB = new com.mojang.rubydung.phys.AABB(x, y, z, x + 1, y + 1, z + 1);
         if (!blockAABB.intersects(player.bb)) {
-            int tileType = hotbar[selectedSlot];
             level.setTile(x, y, z, tileType);
+            if (survival) itemCounts[tileType & 0xFF]--;
             if (client != null) client.sendSetTile(x, y, z, tileType);
             else if (server != null) server.broadcastTile(x, y, z, tileType);
         }
@@ -624,7 +636,7 @@ public class RubyDung implements Runnable {
         if (!breaking || x != breakX || y != breakY || z != breakZ) {
             breaking = true; breakX = x; breakY = y; breakZ = z; breakProgress = 0f;
         }
-        float perTick = (1f / 20f) / Math.max(0.05f, Tile.hardness(type));
+        float perTick = (1f / Timer.TICKS_PER_SECOND) / Math.max(0.05f, Tile.hardness(type));
         breakProgress += perTick;
         if (breakProgress >= 1f) {
             breakBlock(x, y, z);
@@ -711,6 +723,18 @@ public class RubyDung implements Runnable {
             return;
         }
 
+        // everything below dereferences the world; a screen that got here without one
+        // (e.g. leaving the loading screen early) falls back to the main menu instead of crashing
+        if (player == null || levelRenderer == null) {
+            screen = -1;
+            menuCooldown = 2;
+            glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+            if (!renderer.beginFrame(sr, sg, sb)) return;
+            renderMainMenu();
+            renderer.endFrame();
+            return;
+        }
+
         if (!renderer.beginFrame(sr, sg, sb)) return;
         setupCamera(screen != 0 ? 1.0f : a);
 
@@ -772,7 +796,21 @@ public class RubyDung implements Runnable {
         }
     }
 
+    /** Bind the server that was requested before its world existed (see the HOST button). */
+    private void startPendingHost() {
+        int p = pendingHostPort;
+        pendingHostPort = 0;
+        try {
+            server = new GameServer(level, p);
+            server.setHostName(nameInput.isEmpty() ? "Host" : nameInput);
+            mpStatus = "HOSTING ON PORT " + p;
+        } catch (Exception ex) {
+            mpStatus = "FAILED  " + (ex.getMessage() != null ? ex.getMessage().toUpperCase() : "ERROR");
+        }
+    }
+
     private void stopMultiplayer() {
+        pendingHostPort = 0;
         if (server != null) { server.stop(); server = null; }
         if (client != null) { client.stop(); client = null; }
         remotePlayers.clear();
@@ -868,8 +906,7 @@ public class RubyDung implements Runnable {
         GL.glColor4f(1f, 1f, 1f, 1f);
         renderer.translate(-hw, -ch * scale, 0);
         renderer.scale(scale, scale, scale);
-        for (int i = 0; i < name.length(); i++)
-            drawChar(Character.toUpperCase(name.charAt(i)), i * (cw + sp), 0, cw, ch);
+        drawText(name, 0, 0, cw, ch, cw + sp);
 
         renderer.pop();
         GL.set3DQuadPipeline(Pipelines.Pipeline.WORLD_OPAQUE);
@@ -907,8 +944,7 @@ public class RubyDung implements Runnable {
             GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA);
             GL.glColor4f(1f, 1f, 0.4f, 1f);
             int sw = mpStatus.length() * 10;
-            for (int i = 0; i < mpStatus.length(); i++)
-                drawChar(mpStatus.charAt(i), (width - sw) / 2 + i * 10, by3 + btnH + 14, 8, 12);
+            drawText(mpStatus, (width - sw) / 2, by3 + btnH + 14, 8, 12, 10);
         }
 
         GL.glDisable(GL.GL_BLEND);
@@ -922,10 +958,18 @@ public class RubyDung implements Runnable {
                         try {
                             int p = portInput.isEmpty() ? GameServer.DEFAULT_PORT : Integer.parseInt(portInput);
                             stopMultiplayer();
-                            if (level == null) startWorld("MP Host", new java.util.Random().nextLong());
-                            server = new GameServer(level, p);
-                            server.setHostName(nameInput.isEmpty() ? "Host" : nameInput);
-                            mpStatus = "HOSTING ON PORT " + p;
+                            if (level == null) {
+                                // startWorld generates on a background thread and returns
+                                // immediately, so the server can only be bound once the
+                                // loading handoff in run() has published the world
+                                pendingHostPort = p;
+                                startWorld("MP Host", new java.util.Random().nextLong());
+                                mpStatus = "STARTING HOST ON PORT " + p;
+                            } else {
+                                server = new GameServer(level, p);
+                                server.setHostName(nameInput.isEmpty() ? "Host" : nameInput);
+                                mpStatus = "HOSTING ON PORT " + p;
+                            }
                         } catch (Exception ex) {
                             mpStatus = "FAILED  " + (ex.getMessage() != null ? ex.getMessage().toUpperCase() : "ERROR");
                         }
@@ -970,8 +1014,7 @@ public class RubyDung implements Runnable {
             GL.glEnable(GL.GL_BLEND);
             GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA);
             GL.glColor4f(1f, 0.4f, 0.4f, 1f);
-            for (int i = 0; i < mpStatus.length(); i++)
-                drawChar(mpStatus.charAt(i), fx + i * 10, by + fh*2 + gap*2, 8, 12);
+            drawText(mpStatus, fx, by + fh*2 + gap*2, 8, 12, 10);
         }
 
         GL.glDisable(GL.GL_BLEND);
@@ -1055,12 +1098,10 @@ public class RubyDung implements Runnable {
             GL.glEnd();
             GL.glColor4f(1f, 1f, 1f, 1f);
             String label = s[0];
-            for (int ci = 0; ci < Math.min(label.length(), 30); ci++)
-                drawChar(label.charAt(ci), lx + 10 + ci * 10, ey + 7, 8, 12);
+            drawText(label.substring(0, Math.min(label.length(), 30)), lx + 10, ey + 7, 8, 12, 10);
             GL.glColor4f(0.7f, 0.7f, 0.7f, 1f);
             String addr = s[1];
-            for (int ci = 0; ci < Math.min(addr.length(), 38); ci++)
-                drawChar(addr.charAt(ci), lx + 10 + ci * 8, ey + 22, 6, 10);
+            drawText(addr.substring(0, Math.min(addr.length(), 38)), lx + 10, ey + 22, 6, 10, 8);
         }
 
         // empty list hint
@@ -1068,8 +1109,7 @@ public class RubyDung implements Runnable {
             GL.glColor4f(0.6f, 0.6f, 0.6f, 1f);
             String hint = "NO SERVERS  ADD ONE BELOW";
             int hw = hint.length() * 10;
-            for (int i = 0; i < hint.length(); i++)
-                drawChar(hint.charAt(i), (width - hw) / 2 + i * 10, listTop + 14, 8, 12);
+            drawText(hint, (width - hw) / 2, listTop + 14, 8, 12, 10);
         }
 
         int btnY = listTop + visCount * (entryH + gap) + 10;
@@ -1099,8 +1139,7 @@ public class RubyDung implements Runnable {
             GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA);
             GL.glColor4f(1f, 0.4f, 0.4f, 1f);
             int sw = mpStatus.length() * 10;
-            for (int i = 0; i < mpStatus.length(); i++)
-                drawChar(mpStatus.charAt(i), (width - sw) / 2 + i * 10, btnY2 + btnH + 10, 8, 12);
+            drawText(mpStatus, (width - sw) / 2, btnY2 + btnH + 10, 8, 12, 10);
         }
 
         GL.glDisable(GL.GL_BLEND);
@@ -1223,22 +1262,28 @@ public class RubyDung implements Runnable {
         GL.glVertex2f(x+w-0.5f, y+h-0.5f); GL.glVertex2f(x+0.5f, y+h-0.5f);
         GL.glEnd();
         GL.glColor4f(1f, 1f, 1f, 1f);
-        for (int i = 0; i < text.length(); i++)
-            drawChar(text.charAt(i), x + 10 + i * 10, y + (h - 12) / 2, 8, 12);
+        drawText(text, x + 10, y + (h - 12) / 2, 8, 12, 10);
     }
 
     private void doConnect() {
         try {
             int p = portInput.isEmpty() ? GameServer.DEFAULT_PORT : Integer.parseInt(portInput);
             stopMultiplayer();
-            Level connLevel = (level != null) ? level : new Level(0);
+            // A joined session always gets its own Level. Reusing an open single-player
+            // world would let the host's snapshot overwrite it in memory, and — now that
+            // edited chunks are flushed when they stream out — on disk as well.
+            saveWorld();
+            Level connLevel = new Level(0);
             client = new GameClient(ipInput, p, connLevel);
             client.sendName(nameInput.isEmpty() ? "Player" : nameInput);
-            if (level == null) {
-                level = connLevel;
-                levelRenderer = new LevelRenderer(level);
-                player = new Player(level);
-            }
+            level = connLevel;                 // only after the connection succeeded
+            levelRenderer = new LevelRenderer(level);
+            player = new Player(level);
+            drops = new DroppedItems(level);
+            particles.clear();
+            resetBreaking();
+            hitResult = null;
+            worldName = "";                    // remote world: nothing of ours to save
             mpStatus = "";
             screen = 0;
             glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED); Input.consumeMouseDelta();
@@ -1304,8 +1349,7 @@ public class RubyDung implements Runnable {
     private void drawSmallText(String text, int x, int y) {
         int charW = 6, charH = 8, sp = 7;
         GL.glColor4f(1,1,1,1);
-        for (int i = 0; i < text.length(); i++)
-            drawChar(Character.toUpperCase(text.charAt(i)), x + i * sp, y, charW, charH);
+        drawText(text, x, y, charW, charH, sp);
     }
 
     private void renderTabList() {
@@ -1357,15 +1401,18 @@ public class RubyDung implements Runnable {
     }
 
     /**
-     * Creative inventory: a palette of every placeable block plus the live hotbar
-     * row. Left-click a palette block to pick it up onto the cursor; left-click a
+     * Inventory: a palette of every placeable block plus the live hotbar row.
+     * In creative, left-click a palette block to pick it up onto the cursor; left-click a
      * hotbar slot to drop the cursor item there. Click a hotbar slot with an empty
      * cursor to pick that slot's block up (swap). Click outside to clear the cursor.
+     * In survival the palette is a read-only catalogue showing what you have collected —
+     * only the hotbar can be rearranged.
      */
     private void renderInventory() {
+        boolean creative = player.mode == Player.GameMode.CREATIVE;
         beginOrtho();
         renderOverlay();
-        drawTitle("CREATIVE INVENTORY", height / 2 - 170);
+        drawTitle(creative ? "CREATIVE INVENTORY" : "INVENTORY", height / 2 - 170);
 
         int slot = 40, gap = 6, cols = 7;
         int rows = (CREATIVE_BLOCKS.length + cols - 1) / cols;
@@ -1384,7 +1431,9 @@ public class RubyDung implements Runnable {
             int x = gridX + c * (slot + gap), y = gridY + r * (slot + gap);
             boolean hov = hover(mx, my, x, y, slot, slot);
             if (hov) hoveredPalette = i;
-            drawItemSlot(x, y, slot, (byte) CREATIVE_BLOCKS[i], hov, false, -1);
+            // survival: no highlight (nothing to click) but show what has been collected
+            drawItemSlot(x, y, slot, (byte) CREATIVE_BLOCKS[i], creative && hov, false,
+                creative ? -1 : itemCounts[CREATIVE_BLOCKS[i] & 0xFF]);
         }
 
         // hotbar row label + slots along the bottom of the panel
@@ -1407,7 +1456,7 @@ public class RubyDung implements Runnable {
 
         // cursor-carried item follows the mouse
         if (cursorItem != 0) {
-            float[] col = blockSwatch((byte) cursorItem);
+            float[] col = Tile.swatch((byte) cursorItem);
             GL.glColor4f(col[0], col[1], col[2], 1f);
             GL.glBegin(GL.GL_QUADS);
             GL.glVertex2f(mx, my); GL.glVertex2f(mx + 24, my);
@@ -1428,7 +1477,7 @@ public class RubyDung implements Runnable {
                 if (hClose) {
                     cursorItem = 0;
                     screen = 0; glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED); Input.consumeMouseDelta();
-                } else if (hoveredPalette >= 0) {
+                } else if (creative && hoveredPalette >= 0) {
                     cursorItem = CREATIVE_BLOCKS[hoveredPalette]; // pick up an infinite stack
                 } else if (hoveredHotbar >= 0) {
                     if (cursorItem != 0) {
@@ -1454,7 +1503,7 @@ public class RubyDung implements Runnable {
         GL.glVertex2f(x + s, y + s); GL.glVertex2f(x, y + s);
         GL.glEnd();
         if (id != 0) {
-            float[] col = blockSwatch(id);
+            float[] col = Tile.swatch(id);
             int pad = 6;
             GL.glColor4f(col[0], col[1], col[2], 1f);
             GL.glBegin(GL.GL_QUADS);
@@ -1509,9 +1558,7 @@ public class RubyDung implements Runnable {
         int x = 10, y = 10;
         int charW = 12, charH = 16;
         GL.glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
-        for (int i = 0; i < text.length(); i++) {
-            drawChar(text.charAt(i), x + i * (charW + 3), y, charW, charH);
-        }
+        drawText(text, x, y, charW, charH, charW + 3);
         endOrtho();
     }
 
@@ -1540,7 +1587,7 @@ public class RubyDung implements Runnable {
             // block swatch + collected count
             int id = hotbar[i];
             if (id != 0) {
-                float[] col = blockSwatch((byte) id);
+                float[] col = Tile.swatch((byte) id);
                 int pad = 8;
                 GL.glColor4f(col[0], col[1], col[2], 1f);
                 GL.glBegin(GL.GL_QUADS);
@@ -1553,26 +1600,6 @@ public class RubyDung implements Runnable {
         }
         GL.glDisable(GL.GL_BLEND);
         endOrtho();
-    }
-
-    /** Hotbar swatch colour for a block id (mirrors world tints). */
-    private static float[] blockSwatch(byte b) {
-        return switch (b) {
-            case Tile.GRASS  -> new float[]{0.35f, 0.65f, 0.25f};
-            case Tile.DIRT   -> new float[]{0.52f, 0.38f, 0.24f};
-            case Tile.SAND   -> new float[]{0.86f, 0.80f, 0.56f};
-            case Tile.SNOW   -> new float[]{0.95f, 0.97f, 1.00f};
-            case Tile.WOOD   -> new float[]{0.45f, 0.31f, 0.16f};
-            case Tile.LEAVES -> new float[]{0.42f, 0.62f, 0.30f};
-            case Tile.COAL   -> new float[]{0.28f, 0.28f, 0.30f};
-            case Tile.IRON   -> new float[]{0.78f, 0.66f, 0.52f};
-            case Tile.GOLD   -> new float[]{0.92f, 0.80f, 0.30f};
-            case Tile.DIAMOND-> new float[]{0.45f, 0.85f, 0.88f};
-            case Tile.GRAVEL -> new float[]{0.52f, 0.52f, 0.55f};
-            case Tile.BEDROCK-> new float[]{0.22f, 0.22f, 0.24f};
-            case Tile.WATER  -> new float[]{0.30f, 0.50f, 1.00f};
-            default          -> new float[]{0.58f, 0.58f, 0.60f}; // stone
-        };
     }
 
     /** Draw 10 hearts above the hotbar reflecting survival health (half-heart resolution). */
@@ -1682,6 +1709,7 @@ public class RubyDung implements Runnable {
             java.io.File dir = worldDir(name);
             dir.mkdirs();
             level = new Level(seed);
+            level.setSaveDir(dir); // so edited chunks are written out when they stream away
             if (new java.io.File(dir, "seed.dat").exists()) {
                 loadingStatus = "LOADING WORLD...";
                 level.load(dir);
@@ -1729,12 +1757,12 @@ public class RubyDung implements Runnable {
         return new java.io.File(SAVES_DIR, sanitize(name));
     }
 
-    /** Persist player position, spawn, health, mode, hotbar and inventory to player.dat. */
+    /** Persist player position, spawn, health, mode, hotbar and collected counts to player.dat. */
     private void savePlayer(java.io.File dir) {
         if (player == null) return;
         java.io.File f = new java.io.File(dir, "player.dat");
         try (var dos = new java.io.DataOutputStream(new java.util.zip.GZIPOutputStream(new java.io.FileOutputStream(f)))) {
-            dos.writeInt(2); // version
+            dos.writeInt(3); // version
             dos.writeFloat(player.x); dos.writeFloat(player.y); dos.writeFloat(player.z);
             dos.writeFloat(player.yRot); dos.writeFloat(player.xRot);
             dos.writeBoolean(player.hasSpawn);
@@ -1743,8 +1771,6 @@ public class RubyDung implements Runnable {
             dos.writeInt(player.mode.ordinal());
             dos.writeInt(hotbar.length);
             for (int v : hotbar) dos.writeInt(v);
-            dos.writeInt(inventorySlots.length);
-            dos.write(inventorySlots);
             dos.writeInt(itemCounts.length);
             for (int v : itemCounts) dos.writeInt(v);
         } catch (Exception e) {
@@ -1754,10 +1780,17 @@ public class RubyDung implements Runnable {
 
     /** Restore player state from player.dat if present (call after the player exists). */
     private void loadPlayer(java.io.File dir) {
+        // hotbar and item counts live on the RubyDung instance, not on Player, so they
+        // survive a world switch — reset them first or a new world inherits (and can
+        // spend, now that survival checks counts) whatever the last world collected
+        System.arraycopy(DEFAULT_HOTBAR, 0, hotbar, 0, hotbar.length);
+        java.util.Arrays.fill(itemCounts, 0);
+        selectedSlot = 0;
+        cursorItem = 0;
         java.io.File f = new java.io.File(dir, "player.dat");
         if (player == null || !f.exists()) return;
         try (var dis = new java.io.DataInputStream(new java.util.zip.GZIPInputStream(new java.io.FileInputStream(f)))) {
-            dis.readInt(); // version
+            int version = dis.readInt();
             float px = dis.readFloat(), py = dis.readFloat(), pz = dis.readFloat();
             float yaw = dis.readFloat(), pitch = dis.readFloat();
             boolean hasSpawn = dis.readBoolean();
@@ -1766,11 +1799,6 @@ public class RubyDung implements Runnable {
             int modeOrd = dis.readInt();
             int hn = dis.readInt();
             for (int i = 0; i < hn; i++) { int v = dis.readInt(); if (i < hotbar.length) hotbar[i] = v; }
-            int in = dis.readInt();
-            byte[] inv = new byte[in];
-            int off = 0, r;
-            while (off < in && (r = dis.read(inv, off, in - off)) > 0) off += r;
-            System.arraycopy(inv, 0, inventorySlots, 0, Math.min(in, inventorySlots.length));
             // apply core state first so a truncated/older file still restores the player
             player.hasSpawn = hasSpawn;
             player.spawnX = sx; player.spawnY = sy; player.spawnZ = sz;
@@ -1778,8 +1806,10 @@ public class RubyDung implements Runnable {
             var modes = Player.GameMode.values();
             player.mode = modes[Math.clamp(modeOrd, 0, modes.length - 1)];
             player.teleport(px, py, pz, yaw, pitch);
-            // v2+: collected item counts (absent in v1 -> EOFException, harmless)
             try {
+                // v1/v2 stored an unused slot array here; read past it
+                if (version < 3) dis.skipNBytes(dis.readInt());
+                // v2+: collected item counts (absent in v1 -> EOFException, harmless)
                 int cn = dis.readInt();
                 for (int i = 0; i < cn; i++) { int v = dis.readInt(); if (i < itemCounts.length) itemCounts[i] = v; }
             } catch (java.io.EOFException ignored) {}
@@ -1849,8 +1879,7 @@ public class RubyDung implements Runnable {
         GL.glColor4f(0.8f, 0.8f, 0.8f, 1f);
         String s = loadingStatus;
         int sw = s.length() * 10;
-        for (int i = 0; i < s.length(); i++)
-            drawChar(s.charAt(i), (width - sw) / 2 + i * 10, height / 2 + 42, 8, 12);
+        drawText(s, (width - sw) / 2, height / 2 + 42, 8, 12, 10);
 
         GL.glDisable(GL.GL_BLEND);
         endOrtho();
@@ -1874,11 +1903,9 @@ public class RubyDung implements Runnable {
         String logo = "RUBYDUNG";
         int tw = logo.length() * (cw + sp);
         GL.glColor4f(0.1f, 0.1f, 0.1f, 0.8f);
-        for (int i = 0; i < logo.length(); i++)
-            drawChar(logo.charAt(i), (width - tw) / 2 + i * (cw + sp) + 3, logoY + 3, cw, ch);
+        drawText(logo, (width - tw) / 2 + 3, logoY + 3, cw, ch, cw + sp);
         GL.glColor4f(1.0f, 0.85f, 0.3f, 1.0f);
-        for (int i = 0; i < logo.length(); i++)
-            drawChar(logo.charAt(i), (width - tw) / 2 + i * (cw + sp), logoY, cw, ch);
+        drawText(logo, (width - tw) / 2, logoY, cw, ch, cw + sp);
 
         int btnW = 380, btnH = 60, gap = 12;
         int bx = (width - btnW) / 2;
@@ -1898,8 +1925,7 @@ public class RubyDung implements Runnable {
         // version strings
         GL.glColor4f(1f, 1f, 1f, 0.7f);
         String ver = "RUBYDUNG ALPHA 0.1";
-        for (int i = 0; i < ver.length(); i++)
-            drawChar(ver.charAt(i), 8 + i * 11, height - 22, 8, 12);
+        drawText(ver, 8, height - 22, 8, 12, 11);
 
         var menuEvents = Input.pollMouseEvents();
         if (menuCooldown > 0) { menuCooldown--; menuEvents.clear(); }
@@ -2091,10 +2117,10 @@ public class RubyDung implements Runnable {
         boolean hFov   = hover(mx, my, bx, by + unit*r, btnW, btnH); r++;
         boolean hDist  = hover(mx, my, bx, by + unit*r, btnW, btnH); r++;
         boolean hSens  = hover(mx, my, bx, by + unit*r, btnW, btnH); r++;
-        boolean hMode = false, hSeed = false;
+        boolean hMode = false;
         if (inGame) {
             hMode = hover(mx, my, bx, by + unit*r, btnW, btnH); r++;
-            hSeed = hover(mx, my, bx, by + unit*r, btnW, btnH); r++;
+            r++; // seed row is read-only, so it has no hover state
         }
         boolean hBack  = hover(mx, my, bx, by + unit*r, btnW, btnH);
 
@@ -2107,7 +2133,7 @@ public class RubyDung implements Runnable {
         drawButton(bx, by + unit*r++, btnW, btnH, "SENSITIVITY  " + Settings.SENS_LABELS[settings.sensitivity], hSens);
         if (inGame) {
             drawButton(bx, by + unit*r++, btnW, btnH, "MODE  " + player.mode.name(), hMode);
-            drawButton(bx, by + unit*r++, btnW, btnH, "SEED  " + worldSeedValue, hSeed);
+            drawLabel(bx, by + unit*r++, btnW, btnH, "SEED  " + worldSeedValue);
         }
         drawButton(bx, by + unit*r, btnW, btnH, "BACK", hBack);
 
@@ -2139,8 +2165,7 @@ public class RubyDung implements Runnable {
         int cw = 30, ch = 42, sp = 5;
         int tw = title.length() * (cw + sp);
         GL.glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
-        for (int i = 0; i < title.length(); i++)
-            drawChar(title.charAt(i), (width - tw) / 2 + i * (cw + sp), y, cw, ch);
+        drawText(title, (width - tw) / 2, y, cw, ch, cw + sp);
     }
 
     private void drawButton(int x, int y, int w, int h, String label, boolean hover) {
@@ -2172,9 +2197,16 @@ public class RubyDung implements Runnable {
         int spacing = charW + 3;
         int textW = label.length() * spacing;
         GL.glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
-        for (int i = 0; i < label.length(); i++) {
-            drawChar(label.charAt(i), x + (w - textW) / 2 + i * spacing, y + (h - charH) / 2, charW, charH);
-        }
+        drawText(label, x + (w - textW) / 2, y + (h - charH) / 2, charW, charH, spacing);
+    }
+
+    /** Button-sized text without the box or hover highlight, for read-only rows. */
+    private void drawLabel(int x, int y, int w, int h, String label) {
+        int charW = 18, charH = 26;
+        int spacing = charW + 3;
+        int textW = label.length() * spacing;
+        GL.glColor4f(1.0f, 1.0f, 1.0f, 0.7f);
+        drawText(label, x + (w - textW) / 2, y + (h - charH) / 2, charW, charH, spacing);
     }
 
     private void beginOrtho() {
@@ -2254,27 +2286,31 @@ public class RubyDung implements Runnable {
         for (int i = 0; i < keys.length; i++) GLYPH_INDEX[keys[i]] = i;
     }
 
-    private void drawChar(char c, int x, int y, int w, int h) {
-        if (c >= 'a' && c <= 'z') c -= 32; // fold lowercase to the uppercase glyph
-        int glyph = (c < GLYPH_INDEX.length) ? GLYPH_INDEX[c] : -1;
-        if (glyph < 0) {
-            // unknown glyph (e.g. Cyrillic): draw nothing rather than a black box
-            return;
-        }
-
+    /**
+     * Draw a whole string as one batch: glyph boxes are w x h and advance `pitch` pixels
+     * apart. One glBegin/glEnd for the line keeps text off the per-glyph draw-call path.
+     */
+    private void drawText(String text, int x, int y, int w, int h, int pitch) {
         int pixW = Math.max(w / 5, 1);
         int pixH = Math.max(h / 7, 1);
 
         GL.glBegin(GL.GL_QUADS);
-        for (int row = 0; row < 7; row++) {
-            for (int col = 0; col < 5; col++) {
-                if ((GLYPHS[glyph][row] & (1 << (4 - col))) != 0) {
-                    float px = x + col * pixW;
-                    float py = y + row * pixH;
-                    GL.glVertex2f(px,          py);
-                    GL.glVertex2f(px + pixW,   py);
-                    GL.glVertex2f(px + pixW,   py + pixH);
-                    GL.glVertex2f(px,          py + pixH);
+        for (int i = 0; i < text.length(); i++) {
+            char c = text.charAt(i);
+            if (c >= 'a' && c <= 'z') c -= 32; // fold lowercase to the uppercase glyph
+            int glyph = (c < GLYPH_INDEX.length) ? GLYPH_INDEX[c] : -1;
+            if (glyph < 0) continue; // unknown glyph (e.g. Cyrillic): draw nothing rather than a black box
+            int cx = x + i * pitch;
+            for (int row = 0; row < 7; row++) {
+                for (int col = 0; col < 5; col++) {
+                    if ((GLYPHS[glyph][row] & (1 << (4 - col))) != 0) {
+                        float px = cx + col * pixW;
+                        float py = y + row * pixH;
+                        GL.glVertex2f(px,          py);
+                        GL.glVertex2f(px + pixW,   py);
+                        GL.glVertex2f(px + pixW,   py + pixH);
+                        GL.glVertex2f(px,          py + pixH);
+                    }
                 }
             }
         }

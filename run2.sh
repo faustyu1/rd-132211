@@ -1,11 +1,10 @@
 #!/bin/bash
-mkdir -p /tmp/rd23-client2
-cd /tmp/rd23-client2
-JAVA="/Users/faustyu/dev/rd-23/jdk-x64/jdk-21.0.11.jdk/Contents/Home/bin/java"
-M2="$HOME/.m2/repository"
-"$JAVA" \
-  -XstartOnFirstThread \
-  -Dapple.awt.UIElement=true \
-  -Djava.library.path=/Users/faustyu/dev/rd-23/target/natives \
-  -cp "/Users/faustyu/dev/rd-23/target/classes:/Users/faustyu/dev/rd-23/resources:$M2/org/lwjgl/lwjgl/3.4.1/lwjgl-3.4.1.jar:$M2/org/lwjgl/lwjgl-glfw/3.4.1/lwjgl-glfw-3.4.1.jar:$M2/org/lwjgl/lwjgl-opengl/3.4.1/lwjgl-opengl-3.4.1.jar:$M2/org/joml/joml/1.10.7/joml-1.10.7.jar" \
-  com.mojang.rubydung.RubyDung
+# Second client for testing multiplayer locally: same build and jars as run.sh, but
+# launched from a scratch directory so this instance keeps its own settings.properties,
+# servers.properties and saves/ instead of fighting the first client over them.
+set -e
+DIR="$(cd "$(dirname "$0")" && pwd)"
+RD_RUN_DIR="${RD_RUN_DIR:-/tmp/rubydung-client2}"
+mkdir -p "$RD_RUN_DIR"
+export RD_RUN_DIR
+exec "$DIR/run.sh"

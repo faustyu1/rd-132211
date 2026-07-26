@@ -7,7 +7,7 @@ import com.mojang.rubydung.render.vk.GameRenderer;
 import com.mojang.rubydung.render.vk.Pipelines;
 import com.mojang.rubydung.render.vk.VkTexture;
 
-public class LevelRenderer implements LevelListener {
+public final class LevelRenderer implements LevelListener {
     private static final int CHUNK_SIZE = WorldChunk.SIZE;
 
     private final Level level;
@@ -77,32 +77,27 @@ public class LevelRenderer implements LevelListener {
         }
     }
 
-    private void setDirty(int x0, int y0, int z0, int x1, int y1, int z1) {
-        setDirty(x0, y0, z0, x1, y1, z1, false);
-    }
-
     private void setDirty(int x0, int y0, int z0, int x1, int y1, int z1, boolean urgent) {
         int cx0 = Math.floorDiv(x0, CHUNK_SIZE);
         int cx1 = Math.floorDiv(x1, CHUNK_SIZE);
         int cz0 = Math.floorDiv(z0, CHUNK_SIZE);
         int cz1 = Math.floorDiv(z1, CHUNK_SIZE);
-        for (var chunk : level.getLoadedChunks()) {
-            if (chunk.cx >= cx0 && chunk.cx <= cx1 && chunk.cz >= cz0 && chunk.cz <= cz1) {
+        // look the touched chunks up directly — scanning every loaded chunk costs
+        // hundreds of misses per edited tile at a large render distance
+        for (int cx = cx0; cx <= cx1; cx++) {
+            for (int cz = cz0; cz <= cz1; cz++) {
+                WorldChunk chunk = level.getChunk(cx, cz);
                 // only the sections covering the touched Y-range rebuild, not the whole column
-                chunk.setDirtyRange(y0, y1, urgent);
+                if (chunk != null) chunk.setDirtyRange(y0, y1, urgent);
             }
         }
     }
 
     @Override
-    public void tileChanged(int x, int y, int z) {
-        // player block edit: rebuild affected chunks this frame to avoid visible lag
-        setDirty(x - 1, y - 1, z - 1, x + 1, y + 1, z + 1, true);
-    }
-
-    @Override
-    public void lightColumnChanged(int x, int z, int y0, int y1) {
-        setDirty(x - 1, y0 - 1, z - 1, x + 1, y1 + 1, z + 1);
+    public void tileChanged(int x, int y, int z, boolean urgent) {
+        // urgent (player/network edit) rebuilds this frame to avoid visible lag; fluid
+        // updates settle on the background pool instead of stalling the render thread
+        setDirty(x - 1, y - 1, z - 1, x + 1, y + 1, z + 1, urgent);
     }
 
     @Override

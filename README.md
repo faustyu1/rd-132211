@@ -9,11 +9,11 @@ A Minecraft-classic-style voxel game written in Java, with a custom **Vulkan** r
 - Water transparency, fog, day/night sky, and particle effects
 - TCP multiplayer: host a server or join via a server list, with synced player positions and block changes
 - Unicode chat with an AWT-generated font atlas (Cyrillic + ASCII)
-- Persistent worlds (`level.dat`) and settings (`settings.properties`)
+- Persistent worlds (`saves/<name>/`) and settings (`settings.properties`)
 
 ## Requirements
 
-- Java 21 (a JDK is bundled under `jdk-x64/` for the custom build script)
+- Java 21+ (`build.sh`/`run.sh` use `$JAVA_HOME`, else the `javac`/`java` on your `PATH`)
 - macOS, Windows, or Linux. On macOS the Vulkan backend runs through MoltenVK.
 
 ## Build & Run
@@ -24,13 +24,15 @@ A Minecraft-classic-style voxel game written in Java, with a custom **Vulkan** r
 mvn compile exec:java
 ```
 
-> On macOS the game requires `-XstartOnFirstThread`.
+> On macOS the game requires `-XstartOnFirstThread`, which `exec:java` does not pass — use the
+> custom scripts below there.
 
-**Custom build script** (uses the bundled JDK 21):
+**Custom build script** (JDK 21+ from `$JAVA_HOME` or `PATH`, jars from `~/.m2`):
 
 ```bash
 ./build.sh
 ./run.sh
+./run2.sh   # second client, run from a scratch dir, for local multiplayer testing
 ```
 
 **Fat jar** (all-platform natives + shaders bundled):
@@ -47,8 +49,9 @@ Entry point: `sources/com/mojang/rubydung/RubyDung.java` — implements `Runnabl
 
 **Packages:**
 
-- `com.mojang.rubydung` — `RubyDung` (main loop, rendering, menus), `Player`, `RemotePlayer`, `Input`, `Textures`, `Timer`, `HitResult`, `Settings`
-- `com.mojang.rubydung.level` — `Level`, `LevelRenderer`, `WorldChunk`, `Tesselator`, `Tile`, `Frustum`
+- `com.mojang.rubydung` — `RubyDung` (main loop, rendering, menus), `Player`, `RemotePlayer`, `Input`, `DroppedItems`, `ParticleSystem`, `FontRenderer`, `Textures`, `Timer`, `HitResult`, `Settings`
+- `com.mojang.rubydung.level` — `Level`, `LevelRenderer`, `LevelListener`, `WorldChunk`, `ChunkGenerator`, `PerlinNoise`, `Tesselator`, `Tile`, `Frustum`
+- `com.mojang.rubydung.render` — `GL` / `Imm`: fixed-function-style shim used by the UI code
 - `com.mojang.rubydung.phys` — `AABB` (collision)
 - `com.mojang.rubydung.net` — TCP multiplayer: `GameServer`, `GameClient`, `Connection`, `Packet`, `PacketWriter`
 - `com.mojang.rubydung.render.vk` — Vulkan backend: `VkContext`, `Swapchain`, `Pipelines`, `FrameSync`, `GameRenderer` (facade), `DescriptorAllocator`, `StreamingBuffer`, `QuadIndexBuffer`, `VkBuf`, `VkTexture`, `ShaderCompiler`, `DeferredDeleter`

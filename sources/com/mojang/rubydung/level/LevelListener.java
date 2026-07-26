@@ -1,7 +1,7 @@
 package com.mojang.rubydung.level;
 
 public interface LevelListener {
-    void tileChanged(int x, int y, int z);
-    void lightColumnChanged(int x, int z, int y0, int y1);
+    /** urgent = player/network edit that must not lag a frame; background edits (fluids) pass false. */
+    void tileChanged(int x, int y, int z, boolean urgent);
     void allChanged();
 }

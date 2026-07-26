@@ -31,11 +31,51 @@ public class Tile {
         };
     }
 
+    // Shared block colours for everything that draws a block outside the world mesh
+    // (break particles, dropped items, inventory swatches). Cached instances, so
+    // callers must treat the returned array as read-only.
+    private static final float[] SW_GRASS   = { 0.35f, 0.65f, 0.25f };
+    private static final float[] SW_DIRT    = { 0.52f, 0.38f, 0.24f };
+    private static final float[] SW_SAND    = { 0.86f, 0.80f, 0.56f };
+    private static final float[] SW_SNOW    = { 0.95f, 0.97f, 1.00f };
+    private static final float[] SW_WOOD    = { 0.45f, 0.31f, 0.16f };
+    private static final float[] SW_LEAVES  = { 0.42f, 0.62f, 0.30f };
+    private static final float[] SW_COAL    = { 0.28f, 0.28f, 0.30f };
+    private static final float[] SW_IRON    = { 0.78f, 0.66f, 0.52f };
+    private static final float[] SW_GOLD    = { 0.92f, 0.80f, 0.30f };
+    private static final float[] SW_DIAMOND = { 0.45f, 0.85f, 0.88f };
+    private static final float[] SW_GRAVEL  = { 0.52f, 0.52f, 0.55f };
+    private static final float[] SW_BEDROCK = { 0.22f, 0.22f, 0.24f };
+    private static final float[] SW_WATER   = { 0.30f, 0.50f, 1.00f };
+    private static final float[] SW_STONE   = { 0.58f, 0.58f, 0.60f };
+
+    /** Canonical RGB swatch for a block id. The array is shared - do not mutate it. */
+    public static float[] swatch(byte id) {
+        return switch (id) {
+            case GRASS   -> SW_GRASS;
+            case DIRT    -> SW_DIRT;
+            case SAND    -> SW_SAND;
+            case SNOW    -> SW_SNOW;
+            case WOOD    -> SW_WOOD;
+            case LEAVES  -> SW_LEAVES;
+            case COAL    -> SW_COAL;
+            case IRON    -> SW_IRON;
+            case GOLD    -> SW_GOLD;
+            case DIAMOND -> SW_DIAMOND;
+            case GRAVEL  -> SW_GRAVEL;
+            case BEDROCK -> SW_BEDROCK;
+            case WATER   -> SW_WATER;
+            default      -> SW_STONE;
+        };
+    }
+
     // The terrain atlas only ships two real tiles: 0 = grass (green), 1 = stone (gray).
     // Every material therefore reuses one of those two textures and is differentiated by a colour tint.
     private static final int TEX_GRASS = 0, TEX_STONE = 1;
 
-    public static final Tile rock       = tinted(TEX_STONE, 0.58f, 0.58f, 0.60f);
+    // Width/height of one atlas tile in uv space, slightly under 1/16 so neighbours do not bleed in.
+    private static final float UV_SIZE = 0.0624375f;
+
     public static final Tile grass      = tinted(TEX_GRASS, 1.00f, 1.00f, 1.00f);
     public static final Tile dirt       = tinted(TEX_STONE, 0.52f, 0.38f, 0.24f);
     public static final Tile stone      = tinted(TEX_STONE, 0.58f, 0.58f, 0.60f);
@@ -49,13 +89,13 @@ public class Tile {
     public static final Tile sand       = tinted(TEX_STONE, 0.86f, 0.80f, 0.56f);
     public static final Tile gravel     = tinted(TEX_STONE, 0.52f, 0.52f, 0.55f);
     public static final Tile snow       = tinted(TEX_STONE, 0.95f, 0.97f, 1.00f);
-    public static final Tile water      = tinted(14, 0.30f, 0.50f, 1.00f);
+    public static final Tile water      = tinted(TEX_STONE, 0.30f, 0.50f, 1.00f);
     public static final Tile[] waterFlow = new Tile[7];
     static {
         water.translucent = true;
         water.ta = 0.65f;
         for (int lvl = 1; lvl <= 7; lvl++) {
-            Tile t = tinted(14, 0.30f, 0.50f, 1.00f);
+            Tile t = tinted(TEX_STONE, 0.30f, 0.50f, 1.00f);
             t.fill = 1.0f - lvl / 8.0f;
             t.translucent = true;
             t.ta = 0.65f;
@@ -76,8 +116,9 @@ public class Tile {
         return t;
     }
 
-    // texTop, texBottom, texSide
-    private final int texTop, texBottom, texSide;
+    // Atlas u-range per face. Meshing asks for these once per emitted face, so they are
+    // resolved here instead of building a fresh coordinate array every time.
+    private final float uTop0, uTop1, uBottom0, uBottom1, uSide0, uSide1;
     // color tint (default white = no tint)
     float tr = 1f, tg = 1f, tb = 1f, ta = 1f;
     // vertical fill fraction (1 = full cube). <1 lowers the top surface (flowing water).
@@ -85,31 +126,38 @@ public class Tile {
     boolean translucent = false;
 
     private Tile(int texTop, int texBottom, int texSide) {
-        this.texTop = texTop;
-        this.texBottom = texBottom;
-        this.texSide = texSide;
+        this.uTop0 = texTop / 16.0f;
+        this.uTop1 = this.uTop0 + UV_SIZE;
+        this.uBottom0 = texBottom / 16.0f;
+        this.uBottom1 = this.uBottom0 + UV_SIZE;
+        this.uSide0 = texSide / 16.0f;
+        this.uSide1 = this.uSide0 + UV_SIZE;
     }
 
-    private static float[] uv(int tex) {
-        float u0 = tex / 16.0f;
-        return new float[] { u0, u0 + 0.0624375f, 0.0624375f };
-    }
-
+    /**
+     * Ambient occlusion for one face corner. s1 and s2 are the two neighbours of the
+     * face-adjacent voxel that lie in the plane of the face, the corner between them is
+     * their sum; sampling anything off that plane picks up blocks that cannot occlude it.
+     */
     private float ao(
         Level level,
         int x,
         int y,
         int z,
-        int dx1,
-        int dz1,
-        int dx2,
-        int dz2
+        int s1x,
+        int s1y,
+        int s1z,
+        int s2x,
+        int s2y,
+        int s2z
     ) {
-        boolean s1 = level.isSolidTile(x + dx1, y, z + dz1);
-        boolean s2 = level.isSolidTile(x + dx2, y, z + dz2);
-        boolean c =
-            level.isSolidTile(x + dx1, y, z + dz2) ||
-            level.isSolidTile(x + dx2, y, z + dz1);
+        boolean s1 = level.isSolidTile(x + s1x, y + s1y, z + s1z);
+        boolean s2 = level.isSolidTile(x + s2x, y + s2y, z + s2z);
+        boolean c = level.isSolidTile(
+            x + s1x + s2x,
+            y + s1y + s2y,
+            z + s1z + s2z
+        );
         int occ = (s1 ? 1 : 0) + (s2 ? 1 : 0) + (c ? 1 : 0);
         return 1.0f - occ * 0.2f;
     }
@@ -122,6 +170,10 @@ public class Tile {
         int y,
         int z
     ) {
+        // Opaque tiles belong to layer 0, translucent ones to layer 1; bail out before doing
+        // any face-visibility or lighting work for the pass that would emit nothing.
+        if (translucent ? layer != 1 : layer != 0) return;
+
         float x0 = x,
             x1 = x + 1.0f;
         float y0 = y,
@@ -132,192 +184,127 @@ public class Tile {
 
         // bottom face
         if (!level.isSolidOrSameFluid(x, y - 1, z, w)) {
-            float[] c = uv(texBottom);
             float br = level.getBrightness(x, y - 1, z);
-            if (translucent ? (layer == 1) : (layer == 0)) {
-                float a00 = ao(level, x, y - 1, z, -1, 0, 0, 1) * br,
-                    a10 = ao(level, x, y - 1, z, 1, 0, 0, 1) * br;
-                float a01 = ao(level, x, y - 1, z, -1, 0, 0, -1) * br,
-                    a11 = ao(level, x, y - 1, z, 1, 0, 0, -1) * br;
-                t.color(a00 * tr, a00 * tg, a00 * tb, ta);
-                t.tex(c[0], c[2]);
-                t.vertex(x0, y0, z1);
-                t.color(a01 * tr, a01 * tg, a01 * tb, ta);
-                t.tex(c[0], 0);
-                t.vertex(x0, y0, z0);
-                t.color(a11 * tr, a11 * tg, a11 * tb, ta);
-                t.tex(c[1], 0);
-                t.vertex(x1, y0, z0);
-                t.color(a10 * tr, a10 * tg, a10 * tb, ta);
-                t.tex(c[1], c[2]);
-                t.vertex(x1, y0, z1);
-            }
+            float a00 = ao(level, x, y - 1, z, -1, 0, 0, 0, 0, 1) * br,
+                a10 = ao(level, x, y - 1, z, 1, 0, 0, 0, 0, 1) * br;
+            float a01 = ao(level, x, y - 1, z, -1, 0, 0, 0, 0, -1) * br,
+                a11 = ao(level, x, y - 1, z, 1, 0, 0, 0, 0, -1) * br;
+            t.color(a00 * tr, a00 * tg, a00 * tb, ta);
+            t.tex(uBottom0, UV_SIZE);
+            t.vertex(x0, y0, z1);
+            t.color(a01 * tr, a01 * tg, a01 * tb, ta);
+            t.tex(uBottom0, 0);
+            t.vertex(x0, y0, z0);
+            t.color(a11 * tr, a11 * tg, a11 * tb, ta);
+            t.tex(uBottom1, 0);
+            t.vertex(x1, y0, z0);
+            t.color(a10 * tr, a10 * tg, a10 * tb, ta);
+            t.tex(uBottom1, UV_SIZE);
+            t.vertex(x1, y0, z1);
         }
         // top face
         if (!level.isSolidOrSameFluid(x, y + 1, z, w)) {
-            float[] c = uv(texTop);
             float br = level.getBrightness(x, y + 1, z);
-            if (translucent ? (layer == 1) : (layer == 0)) {
-                float a11 = ao(level, x, y + 1, z, 1, 0, 0, 1) * br,
-                    a10 = ao(level, x, y + 1, z, 1, 0, 0, -1) * br;
-                float a00 = ao(level, x, y + 1, z, -1, 0, 0, -1) * br,
-                    a01 = ao(level, x, y + 1, z, -1, 0, 0, 1) * br;
-                t.color(a11 * tr, a11 * tg, a11 * tb, ta);
-                t.tex(c[1], c[2]);
-                t.vertex(x1, y1, z1);
-                t.color(a10 * tr, a10 * tg, a10 * tb, ta);
-                t.tex(c[1], 0);
-                t.vertex(x1, y1, z0);
-                t.color(a00 * tr, a00 * tg, a00 * tb, ta);
-                t.tex(c[0], 0);
-                t.vertex(x0, y1, z0);
-                t.color(a01 * tr, a01 * tg, a01 * tb, ta);
-                t.tex(c[0], c[2]);
-                t.vertex(x0, y1, z1);
-            }
+            float a11 = ao(level, x, y + 1, z, 1, 0, 0, 0, 0, 1) * br,
+                a10 = ao(level, x, y + 1, z, 1, 0, 0, 0, 0, -1) * br;
+            float a00 = ao(level, x, y + 1, z, -1, 0, 0, 0, 0, -1) * br,
+                a01 = ao(level, x, y + 1, z, -1, 0, 0, 0, 0, 1) * br;
+            t.color(a11 * tr, a11 * tg, a11 * tb, ta);
+            t.tex(uTop1, UV_SIZE);
+            t.vertex(x1, y1, z1);
+            t.color(a10 * tr, a10 * tg, a10 * tb, ta);
+            t.tex(uTop1, 0);
+            t.vertex(x1, y1, z0);
+            t.color(a00 * tr, a00 * tg, a00 * tb, ta);
+            t.tex(uTop0, 0);
+            t.vertex(x0, y1, z0);
+            t.color(a01 * tr, a01 * tg, a01 * tb, ta);
+            t.tex(uTop0, UV_SIZE);
+            t.vertex(x0, y1, z1);
         }
         // south face (z-)
         if (!level.isSolidOrSameFluid(x, y, z - 1, w)) {
-            float[] c = uv(texSide);
             float rawBr = level.getBrightness(x, y, z - 1);
             float br = rawBr * 0.8f;
-            if (translucent ? (layer == 1) : (layer == 0)) {
-                float a00 = ao(level, x, y, z - 1, -1, 0, 0, -1) * br,
-                    a10 = ao(level, x, y, z - 1, 1, 0, 0, -1) * br;
-                float a01 = ao(level, x, y, z - 1, -1, 0, 0, 1) * br,
-                    a11 = ao(level, x, y, z - 1, 1, 0, 0, 1) * br;
-                t.color(a00 * tr, a00 * tg, a00 * tb, ta);
-                t.tex(c[1], 0);
-                t.vertex(x0, y1, z0);
-                t.color(a10 * tr, a10 * tg, a10 * tb, ta);
-                t.tex(c[0], 0);
-                t.vertex(x1, y1, z0);
-                t.color(a11 * tr, a11 * tg, a11 * tb, ta);
-                t.tex(c[0], c[2]);
-                t.vertex(x1, y0, z0);
-                t.color(a01 * tr, a01 * tg, a01 * tb, ta);
-                t.tex(c[1], c[2]);
-                t.vertex(x0, y0, z0);
-            }
+            float a00 = ao(level, x, y, z - 1, -1, 0, 0, 0, 1, 0) * br,
+                a10 = ao(level, x, y, z - 1, 1, 0, 0, 0, 1, 0) * br;
+            float a01 = ao(level, x, y, z - 1, -1, 0, 0, 0, -1, 0) * br,
+                a11 = ao(level, x, y, z - 1, 1, 0, 0, 0, -1, 0) * br;
+            t.color(a00 * tr, a00 * tg, a00 * tb, ta);
+            t.tex(uSide1, 0);
+            t.vertex(x0, y1, z0);
+            t.color(a10 * tr, a10 * tg, a10 * tb, ta);
+            t.tex(uSide0, 0);
+            t.vertex(x1, y1, z0);
+            t.color(a11 * tr, a11 * tg, a11 * tb, ta);
+            t.tex(uSide0, UV_SIZE);
+            t.vertex(x1, y0, z0);
+            t.color(a01 * tr, a01 * tg, a01 * tb, ta);
+            t.tex(uSide1, UV_SIZE);
+            t.vertex(x0, y0, z0);
         }
         // north face (z+)
         if (!level.isSolidOrSameFluid(x, y, z + 1, w)) {
-            float[] c = uv(texSide);
             float rawBr = level.getBrightness(x, y, z + 1);
             float br = rawBr * 0.8f;
-            if (translucent ? (layer == 1) : (layer == 0)) {
-                float a00 = ao(level, x, y, z + 1, -1, 0, 0, 1) * br,
-                    a10 = ao(level, x, y, z + 1, 1, 0, 0, 1) * br;
-                float a01 = ao(level, x, y, z + 1, -1, 0, 0, -1) * br,
-                    a11 = ao(level, x, y, z + 1, 1, 0, 0, -1) * br;
-                t.color(a00 * tr, a00 * tg, a00 * tb, ta);
-                t.tex(c[0], 0);
-                t.vertex(x0, y1, z1);
-                t.color(a01 * tr, a01 * tg, a01 * tb, ta);
-                t.tex(c[0], c[2]);
-                t.vertex(x0, y0, z1);
-                t.color(a11 * tr, a11 * tg, a11 * tb, ta);
-                t.tex(c[1], c[2]);
-                t.vertex(x1, y0, z1);
-                t.color(a10 * tr, a10 * tg, a10 * tb, ta);
-                t.tex(c[1], 0);
-                t.vertex(x1, y1, z1);
-            }
+            float a00 = ao(level, x, y, z + 1, -1, 0, 0, 0, 1, 0) * br,
+                a10 = ao(level, x, y, z + 1, 1, 0, 0, 0, 1, 0) * br;
+            float a01 = ao(level, x, y, z + 1, -1, 0, 0, 0, -1, 0) * br,
+                a11 = ao(level, x, y, z + 1, 1, 0, 0, 0, -1, 0) * br;
+            t.color(a00 * tr, a00 * tg, a00 * tb, ta);
+            t.tex(uSide0, 0);
+            t.vertex(x0, y1, z1);
+            t.color(a01 * tr, a01 * tg, a01 * tb, ta);
+            t.tex(uSide0, UV_SIZE);
+            t.vertex(x0, y0, z1);
+            t.color(a11 * tr, a11 * tg, a11 * tb, ta);
+            t.tex(uSide1, UV_SIZE);
+            t.vertex(x1, y0, z1);
+            t.color(a10 * tr, a10 * tg, a10 * tb, ta);
+            t.tex(uSide1, 0);
+            t.vertex(x1, y1, z1);
         }
         // west face (x-)
         if (!level.isSolidOrSameFluid(x - 1, y, z, w)) {
-            float[] c = uv(texSide);
             float rawBr = level.getBrightness(x - 1, y, z);
             float br = rawBr * 0.6f;
-            if (translucent ? (layer == 1) : (layer == 0)) {
-                float a00 = ao(level, x - 1, y, z, 0, -1, -1, 0) * br,
-                    a10 = ao(level, x - 1, y, z, 0, 1, -1, 0) * br;
-                float a01 = ao(level, x - 1, y, z, 0, -1, 1, 0) * br,
-                    a11 = ao(level, x - 1, y, z, 0, 1, 1, 0) * br;
-                t.color(a10 * tr, a10 * tg, a10 * tb, ta);
-                t.tex(c[1], 0);
-                t.vertex(x0, y1, z1);
-                t.color(a00 * tr, a00 * tg, a00 * tb, ta);
-                t.tex(c[0], 0);
-                t.vertex(x0, y1, z0);
-                t.color(a01 * tr, a01 * tg, a01 * tb, ta);
-                t.tex(c[0], c[2]);
-                t.vertex(x0, y0, z0);
-                t.color(a11 * tr, a11 * tg, a11 * tb, ta);
-                t.tex(c[1], c[2]);
-                t.vertex(x0, y0, z1);
-            }
+            float a00 = ao(level, x - 1, y, z, 0, 0, -1, 0, 1, 0) * br,
+                a10 = ao(level, x - 1, y, z, 0, 0, 1, 0, 1, 0) * br;
+            float a01 = ao(level, x - 1, y, z, 0, 0, -1, 0, -1, 0) * br,
+                a11 = ao(level, x - 1, y, z, 0, 0, 1, 0, -1, 0) * br;
+            t.color(a10 * tr, a10 * tg, a10 * tb, ta);
+            t.tex(uSide1, 0);
+            t.vertex(x0, y1, z1);
+            t.color(a00 * tr, a00 * tg, a00 * tb, ta);
+            t.tex(uSide0, 0);
+            t.vertex(x0, y1, z0);
+            t.color(a01 * tr, a01 * tg, a01 * tb, ta);
+            t.tex(uSide0, UV_SIZE);
+            t.vertex(x0, y0, z0);
+            t.color(a11 * tr, a11 * tg, a11 * tb, ta);
+            t.tex(uSide1, UV_SIZE);
+            t.vertex(x0, y0, z1);
         }
         // east face (x+)
         if (!level.isSolidOrSameFluid(x + 1, y, z, w)) {
-            float[] c = uv(texSide);
             float rawBr = level.getBrightness(x + 1, y, z);
             float br = rawBr * 0.6f;
-            if (translucent ? (layer == 1) : (layer == 0)) {
-                float a00 = ao(level, x + 1, y, z, 0, -1, 1, 0) * br,
-                    a10 = ao(level, x + 1, y, z, 0, 1, 1, 0) * br;
-                float a01 = ao(level, x + 1, y, z, 0, -1, -1, 0) * br,
-                    a11 = ao(level, x + 1, y, z, 0, 1, -1, 0) * br;
-                t.color(a00 * tr, a00 * tg, a00 * tb, ta);
-                t.tex(c[0], c[2]);
-                t.vertex(x1, y0, z1);
-                t.color(a01 * tr, a01 * tg, a01 * tb, ta);
-                t.tex(c[1], c[2]);
-                t.vertex(x1, y0, z0);
-                t.color(a11 * tr, a11 * tg, a11 * tb, ta);
-                t.tex(c[1], 0);
-                t.vertex(x1, y1, z0);
-                t.color(a10 * tr, a10 * tg, a10 * tb, ta);
-                t.tex(c[0], 0);
-                t.vertex(x1, y1, z1);
-            }
-        }
-    }
-
-    public void renderFace(Tesselator t, int x, int y, int z, int face) {
-        float x0 = x,
-            x1 = x + 1f,
-            y0 = y,
-            y1 = y + 1f,
-            z0 = z,
-            z1 = z + 1f;
-        switch (face) {
-            case 0 -> {
-                t.vertex(x0, y0, z1);
-                t.vertex(x0, y0, z0);
-                t.vertex(x1, y0, z0);
-                t.vertex(x1, y0, z1);
-            }
-            case 1 -> {
-                t.vertex(x1, y1, z1);
-                t.vertex(x1, y1, z0);
-                t.vertex(x0, y1, z0);
-                t.vertex(x0, y1, z1);
-            }
-            case 2 -> {
-                t.vertex(x0, y1, z0);
-                t.vertex(x1, y1, z0);
-                t.vertex(x1, y0, z0);
-                t.vertex(x0, y0, z0);
-            }
-            case 3 -> {
-                t.vertex(x0, y1, z1);
-                t.vertex(x0, y0, z1);
-                t.vertex(x1, y0, z1);
-                t.vertex(x1, y1, z1);
-            }
-            case 4 -> {
-                t.vertex(x0, y1, z1);
-                t.vertex(x0, y1, z0);
-                t.vertex(x0, y0, z0);
-                t.vertex(x0, y0, z1);
-            }
-            case 5 -> {
-                t.vertex(x1, y0, z1);
-                t.vertex(x1, y0, z0);
-                t.vertex(x1, y1, z0);
-                t.vertex(x1, y1, z1);
-            }
+            float a00 = ao(level, x + 1, y, z, 0, 0, 1, 0, -1, 0) * br,
+                a10 = ao(level, x + 1, y, z, 0, 0, 1, 0, 1, 0) * br;
+            float a01 = ao(level, x + 1, y, z, 0, 0, -1, 0, -1, 0) * br,
+                a11 = ao(level, x + 1, y, z, 0, 0, -1, 0, 1, 0) * br;
+            t.color(a00 * tr, a00 * tg, a00 * tb, ta);
+            t.tex(uSide0, UV_SIZE);
+            t.vertex(x1, y0, z1);
+            t.color(a01 * tr, a01 * tg, a01 * tb, ta);
+            t.tex(uSide1, UV_SIZE);
+            t.vertex(x1, y0, z0);
+            t.color(a11 * tr, a11 * tg, a11 * tb, ta);
+            t.tex(uSide1, 0);
+            t.vertex(x1, y1, z0);
+            t.color(a10 * tr, a10 * tg, a10 * tb, ta);
+            t.tex(uSide0, 0);
+            t.vertex(x1, y1, z1);
         }
     }
 }

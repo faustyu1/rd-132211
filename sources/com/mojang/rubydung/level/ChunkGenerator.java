@@ -17,13 +17,18 @@ import java.util.Random;
  *   6. mineshafts    -> gridded corridors with wooden support frames
  *   7. ores          -> depth-banded veins
  *   8. water         -> oceans + inland lakes (column-fill, never floods caves)
- *   9. vegetation    -> biome trees
+ *   9. vegetation    -> biome trees, gathered from the 3x3 chunk neighbourhood so
+ *                      trunks and canopies straddle chunk borders
+ *
+ * Steps 4 and 9 replay features owned by nearby chunks, so both are order- and
+ * thread-independent: a feature's geometry depends only on the seed and on its
+ * own origin chunk, never on which chunk happens to be generated first.
  */
 public class ChunkGenerator {
 
     public static final int SEA_LEVEL = 62;
 
-    // biome ids (mirror Level.Biome ordinal order)
+    // biome ids (canonical: the former Level.Biome enum was removed)
     public static final int OCEAN = 0, BEACH = 1, PLAINS = 2, FOREST = 3,
         DESERT = 4, SAVANNA = 5, MOUNTAINS = 6, SNOWY = 7;
 
@@ -137,7 +142,7 @@ public class ChunkGenerator {
         genMineshafts(chunk, bx0, bz0, surf);
         genOres(chunk);
         fillWater(chunk, surf);
-        genTrees(chunk, bx0, bz0, surf, biome);
+        genTrees(chunk, bx0, bz0);
 
         chunk.calcLightDepths();
     }
@@ -191,11 +196,23 @@ public class ChunkGenerator {
     // A region's tunnel geometry depends only on its seed, and up to (2*R+1)^2
     // neighbouring chunks replay it — so we compute each region's carve spheres
     // once and cache them, instead of re-running the RNG walk per chunk.
-    private static final int CAVE_SEARCH_RADIUS = 8; // chunks to search around current chunk
+    private static final int TUNNEL_MIN_LEN = 80;
+    private static final int TUNNEL_LEN_RANGE = 80;
+    private static final int TUNNEL_MAX_LEN = TUNNEL_MIN_LEN + TUNNEL_LEN_RANGE - 1;
+    private static final float MAX_SPHERE_RADIUS = 6f; // widest room-cave sphere
+    // A tunnel starts anywhere inside its own region chunk and advances at most one
+    // block per step (branches only continue the parent's remaining budget), so its
+    // spheres reach at most S + TUNNEL_MAX_LEN + MAX_SPHERE_RADIUS blocks away. The
+    // radius must cover that or tunnels stop dead at an invisible boundary.
+    private static final int CAVE_SEARCH_RADIUS =
+        (int) Math.ceil((S + TUNNEL_MAX_LEN + MAX_SPHERE_RADIUS) / (double) S);
 
-    // packed carve spheres per region: [cx, cy, cz, radius] repeating. Thread-safe;
-    // entries are pure functions of the seed, so eviction only costs recomputation.
-    private final java.util.concurrent.ConcurrentHashMap<Long, float[]> caveCache =
+    /** A region's carve spheres ([x, y, z, radius] repeating) plus their world-space XZ bounds. */
+    private record CaveRegion(float[] spheres, float minX, float maxX, float minZ, float maxZ) {}
+
+    // carve geometry per region. Thread-safe; entries are pure functions of the
+    // seed, so eviction only costs recomputation.
+    private final java.util.concurrent.ConcurrentHashMap<Long, CaveRegion> caveCache =
         new java.util.concurrent.ConcurrentHashMap<>();
     private static final int CAVE_CACHE_MAX = 8192;
 
@@ -204,7 +221,12 @@ public class ChunkGenerator {
         int czMin = bz0, czMax = bz0 + S - 1;
         for (int ox = -CAVE_SEARCH_RADIUS; ox <= CAVE_SEARCH_RADIUS; ox++) {
             for (int oz = -CAVE_SEARCH_RADIUS; oz <= CAVE_SEARCH_RADIUS; oz++) {
-                float[] spheres = caveSpheres(chunk.cx + ox, chunk.cz + oz);
+                CaveRegion region = caveRegion(chunk.cx + ox, chunk.cz + oz);
+                // one bounds test throws out a whole region (and every empty one) before
+                // its spheres are ever walked, so the wider search stays cheap
+                if (region.maxX() < cxMin || region.minX() > cxMax) continue;
+                if (region.maxZ() < czMin || region.minZ() > czMax) continue;
+                float[] spheres = region.spheres();
                 for (int i = 0; i + 3 < spheres.length; i += 4) {
                     float sx = spheres[i], sy = spheres[i + 1], sz = spheres[i + 2], r = spheres[i + 3];
                     // skip spheres whose bounding box can't touch this chunk
@@ -240,9 +262,9 @@ public class ChunkGenerator {
     }
 
     /** Deterministic carve-sphere geometry for a region's tunnels (cached). */
-    private float[] caveSpheres(int ncx, int ncz) {
+    private CaveRegion caveRegion(int ncx, int ncz) {
         long key = ((long) ncx << 32) ^ (ncz & 0xFFFFFFFFL);
-        float[] cached = caveCache.get(key);
+        CaveRegion cached = caveCache.get(key);
         if (cached != null) return cached;
 
         FloatBuf out = new FloatBuf();
@@ -265,11 +287,19 @@ public class ChunkGenerator {
             float sz = ncz * S + rng.nextFloat() * S;
             float yaw   = rng.nextFloat() * (float)(Math.PI * 2);
             float pitch = (rng.nextFloat() - 0.5f) * 0.25f;
-            int len = 80 + rng.nextInt(80);
+            int len = TUNNEL_MIN_LEN + rng.nextInt(TUNNEL_LEN_RANGE);
             recordTunnel(out, new Random(rng.nextLong()), sx, sy, sz, yaw, pitch, len, 1.0f, 0);
         }
 
-        float[] result = out.toArray();
+        float[] spheres = out.toArray();
+        float minX = Float.POSITIVE_INFINITY, maxX = Float.NEGATIVE_INFINITY;
+        float minZ = Float.POSITIVE_INFINITY, maxZ = Float.NEGATIVE_INFINITY;
+        for (int i = 0; i + 3 < spheres.length; i += 4) {
+            float r = spheres[i + 3];
+            minX = Math.min(minX, spheres[i] - r);     maxX = Math.max(maxX, spheres[i] + r);
+            minZ = Math.min(minZ, spheres[i + 2] - r); maxZ = Math.max(maxZ, spheres[i + 2] + r);
+        }
+        CaveRegion result = new CaveRegion(spheres, minX, maxX, minZ, maxZ);
         if (caveCache.size() >= CAVE_CACHE_MAX) caveCache.clear(); // bounded; deterministic refill
         caveCache.putIfAbsent(key, result);
         return result;
@@ -414,38 +444,133 @@ public class ChunkGenerator {
     }
 
     // ---- 9. vegetation ----
-    private void genTrees(WorldChunk chunk, int bx0, int bz0, int[] surf, int[] biome) {
-        Random r = new Random(seed ^ ((long) chunk.cx * 987654321L) ^ ((long) chunk.cz * 123456789L));
-        for (int lx = 2; lx < S - 2; lx++) {
-            for (int lz = 2; lz < S - 2; lz++) {
-                int s = surf[lz * S + lx];
-                if (s < SEA_LEVEL) continue;
-                byte topBlock = chunk.getBlock(lx, s, lz);
-                if (topBlock != Tile.GRASS && topBlock != Tile.SNOW) continue;
-                int chance = switch (biome[lz * S + lx]) {
-                    case FOREST  -> 22;
-                    case SNOWY   -> 55;
-                    case PLAINS  -> 130;
-                    case SAVANNA -> 200;
-                    default      -> 0;
-                };
-                if (chance == 0 || r.nextInt(chance) != 0) continue;
-                if (hasTreeNearby(chunk, lx, s, lz)) continue;
-                plantTree(chunk, r, lx, s, lz);
+    // Like caves: a chunk plants the trees of its whole 3x3 neighbourhood, so a trunk
+    // near a border still drops its overhanging canopy into the chunk next door instead
+    // of leaving a bald strip. Candidates are pure functions of seed + origin chunk, and
+    // two chunks always visit shared candidates in the same relative order, so parallel
+    // generation can never disagree about a block.
+
+    /** One deterministic tree: trunk base in world coords + its own RNG stream. */
+    private record Tree(int x, int y, int z, long seed) {}
+
+    private static final Tree[] NO_TREES = new Tree[0];
+
+    private final java.util.concurrent.ConcurrentHashMap<Long, Tree[]> treeCache =
+        new java.util.concurrent.ConcurrentHashMap<>();
+    private final java.util.concurrent.ConcurrentHashMap<Long, Tree[]> rawTreeCache =
+        new java.util.concurrent.ConcurrentHashMap<>();
+    private static final int TREE_CACHE_MAX = 16384;
+
+    private static long treeKey(int ncx, int ncz) {
+        return ((long) ncx << 32) ^ (ncz & 0xFFFFFFFFL);
+    }
+
+    private void genTrees(WorldChunk chunk, int bx0, int bz0) {
+        for (int ox = -1; ox <= 1; ox++) {
+            for (int oz = -1; oz <= 1; oz++) {
+                for (Tree tree : treeCandidates(chunk.cx + ox, chunk.cz + oz)) {
+                    plantTree(chunk, bx0, bz0, tree);
+                }
             }
         }
     }
 
-    /** Keep trunks apart so forests don't fuse into a solid wood wall. */
-    private boolean hasTreeNearby(WorldChunk chunk, int lx, int s, int lz) {
-        for (int dx = -2; dx <= 2; dx++)
-            for (int dz = -2; dz <= 2; dz++)
-                for (int dy = 1; dy <= 3; dy++)
-                    if (chunk.getBlock(lx + dx, s + dy, lz + dz) == Tile.WOOD) return true;
+    /**
+     * Per-biome trunk spawn chance (0 = no trees). Doubles as the surface-block test:
+     * applySurface caps exactly these four biomes with GRASS/SNOW and nothing later
+     * overwrites a top block above sea level, so a neighbouring chunk can judge a
+     * candidate without owning the blocks.
+     */
+    private static int treeChance(int bm) {
+        return switch (bm) {
+            case FOREST  -> 22;
+            case SNOWY   -> 55;
+            case PLAINS  -> 130;
+            case SAVANNA -> 200;
+            default      -> 0;
+        };
+    }
+
+    /**
+     * Deterministic tree candidates of one chunk after cross-chunk spacing (cached).
+     *
+     * Trunks may now sit in a chunk's border columns, so the spacing rule has to reach
+     * across the border too. Every chunk resolves a conflict identically: the candidate
+     * in the lexicographically smaller chunk (by cx, then cz) wins, so only the four
+     * earlier neighbours can veto a candidate here and the answer never depends on who
+     * generated first. Vetoes are tested against the neighbours' raw (unfiltered) lists
+     * — filtering against filtered lists would recurse across the whole world; at worst
+     * this drops one extra trunk in a chain conflict, which is still deterministic.
+     */
+    private Tree[] treeCandidates(int ncx, int ncz) {
+        long key = treeKey(ncx, ncz);
+        Tree[] cached = treeCache.get(key);
+        if (cached != null) return cached;
+
+        Tree[] raw = rawCandidates(ncx, ncz);
+        Tree[] wNW = rawCandidates(ncx - 1, ncz - 1), wW = rawCandidates(ncx - 1, ncz);
+        Tree[] wSW = rawCandidates(ncx - 1, ncz + 1), wN = rawCandidates(ncx, ncz - 1);
+        java.util.ArrayList<Tree> kept = new java.util.ArrayList<>(raw.length);
+        for (Tree t : raw) {
+            if (tooClose(wNW, t.x(), t.z()) || tooClose(wW, t.x(), t.z())
+                || tooClose(wSW, t.x(), t.z()) || tooClose(wN, t.x(), t.z())) continue;
+            kept.add(t);
+        }
+
+        Tree[] result = kept.isEmpty() ? NO_TREES : kept.toArray(new Tree[0]);
+        if (treeCache.size() >= TREE_CACHE_MAX) treeCache.clear(); // bounded; deterministic refill
+        treeCache.putIfAbsent(key, result);
+        return result;
+    }
+
+    /** Chunk-local candidate pass: pure function of seed + chunk, before cross-chunk spacing. */
+    private Tree[] rawCandidates(int ncx, int ncz) {
+        long key = treeKey(ncx, ncz);
+        Tree[] cached = rawTreeCache.get(key);
+        if (cached != null) return cached;
+
+        int bx0 = ncx * S, bz0 = ncz * S;
+        Random r = new Random(seed ^ ((long) ncx * 987654321L) ^ ((long) ncz * 123456789L));
+        java.util.ArrayList<Tree> trees = new java.util.ArrayList<>();
+        for (int lx = 0; lx < S; lx++) {
+            for (int lz = 0; lz < S; lz++) {
+                int wx = bx0 + lx, wz = bz0 + lz;
+                int s = surfaceHeight(wx, wz);
+                if (s < SEA_LEVEL) continue;
+                int chance = treeChance(biomeFrom(s, wx, wz));
+                if (chance == 0 || r.nextInt(chance) != 0) continue;
+                if (tooClose(trees, wx, wz)) continue;
+                trees.add(new Tree(wx, s, wz, r.nextLong()));
+            }
+        }
+
+        Tree[] result = trees.isEmpty() ? NO_TREES : trees.toArray(new Tree[0]);
+        if (rawTreeCache.size() >= TREE_CACHE_MAX) rawTreeCache.clear(); // bounded; deterministic refill
+        rawTreeCache.putIfAbsent(key, result);
+        return result;
+    }
+
+    /**
+     * Keep trunks apart so forests don't fuse into a solid wood wall. Tested against the
+     * candidate set in world space rather than against already-placed WOOD, so the answer
+     * doesn't depend on which chunk (or thread) got there first.
+     */
+    private static boolean tooClose(java.util.List<Tree> trees, int wx, int wz) {
+        for (Tree t : trees)
+            if (Math.abs(t.x() - wx) <= 2 && Math.abs(t.z() - wz) <= 2) return true;
         return false;
     }
 
-    private void plantTree(WorldChunk chunk, Random r, int lx, int s, int lz) {
+    private static boolean tooClose(Tree[] trees, int wx, int wz) {
+        for (Tree t : trees)
+            if (Math.abs(t.x() - wx) <= 2 && Math.abs(t.z() - wz) <= 2) return true;
+        return false;
+    }
+
+    /** Plant one tree into this chunk; WorldChunk.setBlock clips whatever falls outside. */
+    private void plantTree(WorldChunk chunk, int bx0, int bz0, Tree tree) {
+        Random r = new Random(tree.seed());
+        int lx = tree.x() - bx0, lz = tree.z() - bz0, s = tree.y();
         int trunkH = 4 + r.nextInt(3);
         int topY = s + trunkH;
         for (int y = s + 1; y <= topY && y < H; y++) chunk.setBlock(lx, y, lz, Tile.WOOD);

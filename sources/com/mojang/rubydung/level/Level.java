@@ -11,8 +11,6 @@ import java.util.zip.GZIPInputStream;
 import java.util.zip.GZIPOutputStream;
 
 public class Level {
-    public enum Biome { OCEAN, BEACH, PLAINS, FOREST, DESERT, SAVANNA, MOUNTAINS, SNOWY }
-
     public static final int sizeY = WorldChunk.HEIGHT;
 
     private final ConcurrentHashMap<Long, WorldChunk> chunks = new ConcurrentHashMap<>();
@@ -25,7 +23,8 @@ public class Level {
     private final ChunkGenerator generator;
     private long seed;
     private final List<LevelListener> levelListeners = new ArrayList<>();
-    public final java.util.List<int[]> animalSpawns = new java.util.ArrayList<>();
+    // world folder to flush edited chunks into when they stream out; null = nowhere to write yet
+    private volatile File saveDir;
 
     public Level(long seed) {
         this.seed = seed;
@@ -38,32 +37,16 @@ public class Level {
         return (long) cx << 32 | (cz & 0xFFFFFFFFL);
     }
 
-    public WorldChunk getOrLoadChunk(int cx, int cz) {
-        boolean[] created = {false};
-        WorldChunk chunk = chunks.computeIfAbsent(chunkKey(cx, cz), k -> {
-            created[0] = true;
-            WorldChunk c = new WorldChunk(cx, cz, this);
-            generator.generate(c);
-            wakeBorderWater(c);
-            return c;
-        });
-        if (created[0]) {
-            // a freshly streamed-in chunk invalidates its neighbours' edge faces,
-            // brightness and AO, so re-mesh the four that already exist
-            markNeighborDirty(cx - 1, cz);
-            markNeighborDirty(cx + 1, cz);
-            markNeighborDirty(cx, cz - 1);
-            markNeighborDirty(cx, cz + 1);
-            chunk.scheduleBuild();
-        }
-        return chunk;
+    /** The loaded chunk at these chunk coords, or null — never generates. */
+    public WorldChunk getChunk(int cx, int cz) {
+        return chunks.get(chunkKey(cx, cz));
     }
 
     /** Generate a chunk's block data only — no mesh build, no neighbour invalidation. */
     private WorldChunk loadChunkData(int cx, int cz) {
         return chunks.computeIfAbsent(chunkKey(cx, cz), k -> {
             WorldChunk c = new WorldChunk(cx, cz, this);
-            generator.generate(c);
+            if (!readChunk(c)) generator.generate(c);
             wakeBorderWater(c);
             return c;
         });
@@ -155,9 +138,16 @@ public class Level {
         }
         // unload far chunks
         int unloadDist = renderDist + 2;
+        final File flushDir = saveDir;
         chunks.entrySet().removeIf(e -> {
             WorldChunk c = e.getValue();
             if (Math.abs(c.cx - pcx) > unloadDist || Math.abs(c.cz - pcz) > unloadDist) {
+                // an edited chunk that is only dropped is lost for good: save() writes
+                // resident chunks, so it must reach disk before it leaves memory.
+                // Edited chunks are rare, so the write can stay on this thread; if it
+                // fails (full/read-only disk) the chunk stays loaded rather than
+                // taking the player's building down with it.
+                if (flushDir != null && c.modified && !writeChunk(flushDir, c)) return false;
                 c.freeGL();
                 return true;
             }
@@ -170,7 +160,7 @@ public class Level {
         long key = chunkKey(cx, cz);
         if (chunks.containsKey(key)) return;
         WorldChunk c = new WorldChunk(cx, cz, this);
-        generator.generate(c);
+        if (!readChunk(c)) generator.generate(c);
         wakeBorderWater(c);
         if (chunks.putIfAbsent(key, c) != null) return; // lost the race, discard
         // symmetric neighbour invalidation: whichever chunk publishes last sees the
@@ -201,10 +191,12 @@ public class Level {
         int cz = Math.floorDiv(z, WorldChunk.SIZE);
         WorldChunk chunk = chunks.get(chunkKey(cx, cz));
         if (chunk == null) return;
-        chunk.setBlock(x - cx * WorldChunk.SIZE, y, z - cz * WorldChunk.SIZE, (byte) type);
+        int lx = x - cx * WorldChunk.SIZE, lz = z - cz * WorldChunk.SIZE;
+        chunk.setBlock(lx, y, lz, (byte) type);
+        chunk.markModified();
         // recompute light for this column
-        chunk.calcLightDepths();
-        for (var listener : levelListeners) listener.tileChanged(x, y, z);
+        chunk.updateLightAt(lx, lz);
+        for (var listener : levelListeners) listener.tileChanged(x, y, z, true);
         // wake fluid simulation around the change
         scheduleFluid(x, y, z);
         scheduleFluidNeighbors(x, y, z);
@@ -240,7 +232,12 @@ public class Level {
         WorldChunk chunk = chunks.get(chunkKey(cx, cz));
         if (chunk == null) return;
         chunk.setBlock(x - cx * WorldChunk.SIZE, y, z - cz * WorldChunk.SIZE, type);
-        for (var listener : levelListeners) listener.tileChanged(x, y, z);
+        // deliberately NOT marked modified: flow levels are derived state that
+        // wakeBorderWater + the sim rebuild on load, and every ocean would otherwise
+        // count as edited and get flushed to disk when it streams out
+        // not urgent: a flowing cell settles over several ticks, so meshing it inline on
+        // the render thread would stall for up to 64 cells per fluid tick
+        for (var listener : levelListeners) listener.tileChanged(x, y, z, false);
         if (Tile.isWater(type) || type == 0) fluidPending.add(packPos(x, y, z));
         scheduleFluidNeighbors(x, y, z);
     }
@@ -269,10 +266,10 @@ public class Level {
 
     private void updateFluid(int x, int y, int z) {
         byte cur = getBlock(x, y, z);
-        boolean isWater = Tile.isWater(cur);
-        if (!isWater && cur != 0) return;
+        // a non-water cell has nothing to push out (an empty one is handled by neighbors feeding it)
+        if (!Tile.isWater(cur)) return;
 
-        if (isWater && cur != Tile.WATER) {
+        if (cur != Tile.WATER) {
             // flowing water: must be fed, else it dries up / decreases
             int fed = inflowLevel(x, y, z);
             if (fed < 0) { setBlockFluid(x, y, z, (byte) 0); return; }
@@ -280,8 +277,7 @@ public class Level {
             if (fed != curLvl) { setBlockFluid(x, y, z, Tile.waterBlock(fed)); return; }
         }
 
-        int level = isWater ? Tile.waterLevel(cur) : -1;
-        if (!isWater) return; // empty cell: nothing to push out (handled by neighbors feeding it)
+        int level = Tile.waterLevel(cur);
 
         // 1) flow straight down
         if (y > 0) {
@@ -333,9 +329,11 @@ public class Level {
     }
 
 
-    public boolean isTile(int x, int y, int z) {
+    /** Anything the crosshair can hit: non-air and non-water, leaves included. */
+    public boolean isPickable(int x, int y, int z) {
         if (y < 0 || y >= sizeY) return false;
-        return getBlock(x, y, z) != 0;
+        byte b = getBlock(x, y, z);
+        return b != 0 && !Tile.isWater(b);
     }
 
     public boolean isSolidOrSameFluid(int x, int y, int z, boolean callerIsWater) {
@@ -349,10 +347,6 @@ public class Level {
         if (y < 0 || y >= sizeY) return false;
         byte b = getBlock(x, y, z);
         return b != 0 && b != 3 && !Tile.isWater(b);
-    }
-
-    public boolean isLightBlocker(int x, int y, int z) {
-        return isSolidTile(x, y, z);
     }
 
     public float getBrightness(int x, int y, int z) {
@@ -398,10 +392,6 @@ public class Level {
         return result;
     }
 
-    public byte getBiome(int x, int z) {
-        return (byte) generator.biomeId(x, z);
-    }
-
     public void addListener(LevelListener listener) {
         levelListeners.add(listener);
     }
@@ -410,8 +400,59 @@ public class Level {
         levelListeners.remove(listener);
     }
 
+    /** Where edited chunks are flushed when they stream out; save/load set it implicitly. */
+    public void setSaveDir(File dir) {
+        this.saveDir = dir;
+    }
+
+    /**
+     * Write one chunk's blocks to its own file. Shared by save() and the unload flush.
+     * Returns false if the write failed — the unload path must then keep the chunk
+     * resident, because evicting it would discard the only copy of those edits.
+     */
+    private boolean writeChunk(File dir, WorldChunk chunk) {
+        File f = new File(dir, chunk.cx + "_" + chunk.cz + ".dat");
+        try (var dos = new DataOutputStream(new GZIPOutputStream(new FileOutputStream(f)))) {
+            dos.write(chunk.blocks);
+        } catch (Exception e) {
+            e.printStackTrace();
+            return false;
+        }
+        chunk.modified = false;
+        return true;
+    }
+
+    /**
+     * Restore a chunk's blocks from its save file, if it has one. A chunk that streams
+     * back in must come from disk: regenerating it from the seed would silently undo
+     * every edit ever made there, and the next save() would then overwrite the file.
+     * Returns false (leaving the chunk empty) when there is nothing usable to read.
+     */
+    private boolean readChunk(WorldChunk chunk) {
+        File dir = saveDir;
+        if (dir == null) return false;
+        File f = new File(dir, chunk.cx + "_" + chunk.cz + ".dat");
+        if (!f.exists()) return false;
+        byte[] buf = chunk.blocks;
+        int off = 0;
+        try (var dis = new DataInputStream(new GZIPInputStream(new FileInputStream(f)))) {
+            int n;
+            while (off < buf.length && (n = dis.read(buf, off, buf.length - off)) > 0) off += n;
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+        if (off != buf.length) {
+            // incompatible save (e.g. old world height) -> hand a clean chunk to the generator
+            java.util.Arrays.fill(buf, (byte) 0);
+            return false;
+        }
+        chunk.calcLightDepths();
+        return true;
+    }
+
     public void save(File dir) {
         dir.mkdirs();
+        saveDir = dir;
         // Save seed
         try (var dos = new DataOutputStream(new GZIPOutputStream(new FileOutputStream(new File(dir, "seed.dat"))))) {
             dos.writeLong(seed);
@@ -419,17 +460,11 @@ public class Level {
             e.printStackTrace();
         }
         // Save each loaded chunk
-        for (var chunk : chunks.values()) {
-            File f = new File(dir, chunk.cx + "_" + chunk.cz + ".dat");
-            try (var dos = new DataOutputStream(new GZIPOutputStream(new FileOutputStream(f)))) {
-                dos.write(chunk.blocks);
-            } catch (Exception e) {
-                e.printStackTrace();
-            }
-        }
+        for (var chunk : chunks.values()) writeChunk(dir, chunk);
     }
 
     public void load(File dir) {
+        saveDir = dir;
         File seedFile = new File(dir, "seed.dat");
         if (seedFile.exists()) {
             try (var dis = new DataInputStream(new GZIPInputStream(new FileInputStream(seedFile)))) {
@@ -480,12 +515,15 @@ public class Level {
     /** Returns a compact byte[] of all loaded chunks for network sync (legacy). */
     public byte[] getRawBlocks() {
         // Serialize as: [count(int)][cx(int)][cz(int)][blocks(SIZE*HEIGHT*SIZE)]...
-        int count = chunks.size();
+        // snapshot first: this runs on the server's acceptor thread while the game thread
+        // streams chunks in, and a concurrent insert would overflow a pre-sized buffer
+        List<WorldChunk> snapshot = new ArrayList<>(chunks.values());
+        int count = snapshot.size();
         int blockLen = WorldChunk.SIZE * WorldChunk.HEIGHT * WorldChunk.SIZE;
         byte[] out = new byte[4 + count * (8 + blockLen)];
         java.nio.ByteBuffer buf = java.nio.ByteBuffer.wrap(out);
         buf.putInt(count);
-        for (var chunk : chunks.values()) {
+        for (var chunk : snapshot) {
             buf.putInt(chunk.cx);
             buf.putInt(chunk.cz);
             buf.put(chunk.blocks);
@@ -502,6 +540,8 @@ public class Level {
             int cx = buf.getInt(), cz = buf.getInt();
             WorldChunk chunk = chunks.computeIfAbsent(chunkKey(cx, cz), k -> new WorldChunk(cx, cz, this));
             buf.get(chunk.blocks);
+            // a remote snapshot is not a local edit: it must never be flushed into
+            // whatever save directory this Level happens to be pointed at
             chunk.calcLightDepths();
             chunk.setDirty();
         }

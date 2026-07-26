@@ -157,6 +157,7 @@ public class GameRenderer {
         org.lwjgl.glfw.GLFW.glfwGetFramebufferSize(window, fbw, fbh);
         if (fbw[0] == 0 || fbh[0] == 0) return;
         swapchain.recreate(fbw[0], fbh[0]);
+        frames.onSwapchainRecreated();
     }
 
     public int width() { return swapchain.width; }
@@ -299,5 +300,10 @@ public class GameRenderer {
         frames.destroy();
         swapchain.destroy();
         ctx.destroy();
+
+        org.lwjgl.system.MemoryUtil.memFree(vbHandle);
+        org.lwjgl.system.MemoryUtil.memFree(vbOffset);
+        org.lwjgl.system.MemoryUtil.memFree(descSet);
+        org.lwjgl.system.MemoryUtil.memFree(pcBuf);
     }
 }

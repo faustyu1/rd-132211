@@ -28,6 +28,10 @@ public class Player {
     public int hurtTime = 0;          // ticks of red flash after taking damage
     public int invulnTime = 0;        // ticks of damage immunity
     private int regenTimer = 0;       // ticks until next natural regen point
+    // stated in seconds so they keep their intended feel whatever the tick rate is
+    private static final int HURT_TICKS    = Timer.seconds(0.5);
+    private static final int RESPAWN_TICKS = Timer.seconds(1.0);
+    private static final int REGEN_TICKS   = Timer.seconds(4.0);
 
     // double-tap W detection
     private long lastWTap  = 0;
@@ -71,8 +75,8 @@ public class Player {
         if (mode != GameMode.SURVIVAL || amount <= 0) return;
         if (invulnTime > 0) return;
         health = Math.max(0, health - amount);
-        hurtTime = 10;
-        invulnTime = 10;
+        hurtTime = HURT_TICKS;
+        invulnTime = HURT_TICKS;
         regenTimer = 0;
         if (health <= 0) respawn();
     }
@@ -86,7 +90,7 @@ public class Player {
     private void respawn() {
         health = MAX_HEALTH;
         hurtTime = 0;
-        invulnTime = 20;
+        invulnTime = RESPAWN_TICKS;
         fallDistance = 0;
         xd = yd = zd = 0;
         resetPos();
@@ -121,7 +125,7 @@ public class Player {
         if (invulnTime > 0) invulnTime--;
         // slow natural regen in survival: 1 half-heart per ~4s while not at full
         if (mode == GameMode.SURVIVAL && health > 0 && health < MAX_HEALTH) {
-            if (++regenTimer >= 80) { regenTimer = 0; health++; }
+            if (++regenTimer >= REGEN_TICKS) { regenTimer = 0; health++; }
         }
         // void damage instead of the old free teleport-on-fall
         if (y < -40) hurt(MAX_HEALTH);
@@ -246,7 +250,11 @@ public class Player {
     }
 
     public boolean inWater() {
-        return com.mojang.rubydung.level.Tile.isWater(level.getBlock((int) x, (int) (y - 0.5f), (int) z));
+        // floor, not a cast: truncation toward zero would sample the wrong block at negative coords
+        int bx = (int) Math.floor(x);
+        int by = (int) Math.floor(y - 0.5f);
+        int bz = (int) Math.floor(z);
+        return com.mojang.rubydung.level.Tile.isWater(level.getBlock(bx, by, bz));
     }
 
     public void move(float xa, float ya, float za) {

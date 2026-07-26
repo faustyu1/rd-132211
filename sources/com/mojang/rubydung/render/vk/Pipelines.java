@@ -14,7 +14,7 @@ import static org.lwjgl.vulkan.VK10.*;
 public class Pipelines {
     public static final int VERTEX_STRIDE = 36; // 9 floats
 
-    public enum Pipeline { WORLD_OPAQUE, WORLD_TRANSLUCENT, OVERLAY_3D, LINES, UI, UI_LINES }
+    public enum Pipeline { WORLD_OPAQUE, WORLD_TRANSLUCENT, OVERLAY_3D, LINES, UI, UI_LINES, UI_INVERT }
 
     private final VkContext ctx;
     public long pipelineLayout = VK_NULL_HANDLE;
@@ -146,7 +146,18 @@ public class Pipelines {
             VkPipelineColorBlendAttachmentState.Buffer blendAtt = VkPipelineColorBlendAttachmentState.calloc(1, stack)
                 .colorWriteMask(VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT)
                 .blendEnable(blend);
-            if (blend) {
+            if (p == Pipeline.UI_INVERT) {
+                // GL's glBlendFunc(GL_ONE_MINUS_DST_COLOR, GL_ZERO): the source colour is
+                // multiplied by the inverse of what is already there, so the crosshair stays
+                // readable on any terrain instead of turning white-on-white.
+                blendAtt.get(0)
+                    .srcColorBlendFactor(VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR)
+                    .dstColorBlendFactor(VK_BLEND_FACTOR_ZERO)
+                    .colorBlendOp(VK_BLEND_OP_ADD)
+                    .srcAlphaBlendFactor(VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA)
+                    .dstAlphaBlendFactor(VK_BLEND_FACTOR_ZERO)
+                    .alphaBlendOp(VK_BLEND_OP_ADD);
+            } else if (blend) {
                 blendAtt.get(0)
                     .srcColorBlendFactor(VK_BLEND_FACTOR_SRC_ALPHA)
                     .dstColorBlendFactor(VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA)

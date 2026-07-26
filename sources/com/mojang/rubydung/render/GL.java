@@ -12,7 +12,8 @@ import com.mojang.rubydung.render.vk.Pipelines;
  * State machine:
  *  - beginOrtho()/endOrtho() toggle UI (ortho) vs 3D mode; this decides the pipeline.
  *  - All shim draws are untextured (white texture); textured text goes through FontRenderer.
- *  - glEnable/Disable/glBlendFunc/glLineWidth are mostly no-ops (handled by pipeline objects).
+ *  - glEnable/Disable are no-ops (the pipelines encode that state); glBlendFunc only
+ *    distinguishes the classic inverse blend from normal alpha blending.
  */
 public final class GL {
     private GL() {}
@@ -22,7 +23,7 @@ public final class GL {
     public static final int GL_LINE_LOOP = 0x0002;
     public static final int GL_LINES     = 0x0001;
 
-    // state enum constants (consumed only by no-op enable/disable/blend)
+    // state enum constants (consumed by the no-op enable/disable and by glBlendFunc)
     public static final int GL_BLEND = 1, GL_TEXTURE_2D = 2;
     public static final int GL_SRC_ALPHA = 10, GL_ONE_MINUS_SRC_ALPHA = 11,
         GL_ONE_MINUS_DST_COLOR = 13, GL_ZERO = 14;
@@ -30,6 +31,7 @@ public final class GL {
     private static final Imm imm = new Imm();
     private static boolean ortho = false;
     private static Pipelines.Pipeline pipeline3D = Pipelines.Pipeline.WORLD_TRANSLUCENT;
+    private static boolean invertBlend = false;
 
     // ── mode control ──
     public static void setOrtho(boolean o) { ortho = o; }
@@ -44,7 +46,8 @@ public final class GL {
         GameRenderer r = GameRenderer.instance;
         boolean lines = (mode == GL_LINE_LOOP || mode == GL_LINES);
         if (ortho) {
-            r.setPipeline(lines ? Pipelines.Pipeline.UI_LINES : Pipelines.Pipeline.UI);
+            Pipelines.Pipeline quads = invertBlend ? Pipelines.Pipeline.UI_INVERT : Pipelines.Pipeline.UI;
+            r.setPipeline(lines ? Pipelines.Pipeline.UI_LINES : quads);
         } else {
             r.setPipeline(lines ? Pipelines.Pipeline.LINES : pipeline3D);
         }
@@ -62,7 +65,29 @@ public final class GL {
 
     // ── no-op state (pipelines encode this) ──
     public static void glEnable(int cap) {}
-    public static void glDisable(int cap) {}
-    public static void glBlendFunc(int src, int dst) {}
+
+    /**
+     * No-op except for GL_BLEND, which resets the remembered blend function the way real GL
+     * would: without this the inverse blend requested by the crosshair would stay latched and
+     * silently apply to the next ortho quad drawn by a call site that forgot its glBlendFunc.
+     */
+    public static void glDisable(int cap) {
+        if (cap == GL_BLEND) invertBlend = false;
+    }
+
+    /**
+     * Remembers the requested blend function so the next glBegin can pick a pipeline. Only the
+     * classic inverse blend (ONE_MINUS_DST_COLOR/ZERO, used by the crosshair) has its own
+     * pipeline; every other combination maps to the standard SRC_ALPHA/ONE_MINUS_SRC_ALPHA one.
+     */
+    public static void glBlendFunc(int src, int dst) {
+        invertBlend = (src == GL_ONE_MINUS_DST_COLOR && dst == GL_ZERO);
+    }
+
+    /**
+     * No-op, and it cannot be otherwise: MoltenVK does not support the wideLines feature, so all
+     * pipelines are built with lineWidth 1.0 and any other width would be a validation error.
+     * Call sites asking for 2f get a 1px line.
+     */
     public static void glLineWidth(float w) {}
 }

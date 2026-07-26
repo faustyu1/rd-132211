@@ -1,6 +1,5 @@
 package com.mojang.rubydung.render.vk;
 
-import org.lwjgl.system.MemoryStack;
 import org.lwjgl.util.shaderc.Shaderc;
 
 import java.io.InputStream;

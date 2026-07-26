@@ -1,6 +1,9 @@
 package com.mojang.rubydung;
 
 public class Timer {
+    /** Rate the game loop actually runs at; durations elsewhere are expressed against it. */
+    public static final int TICKS_PER_SECOND = 60;
+
     private static final long NS_PER_SECOND = 1_000_000_000L;
     private static final int MAX_TICKS_PER_UPDATE = 100;
 
@@ -13,6 +16,14 @@ public class Timer {
 
     public Timer(float ticksPerSecond) {
         this.ticksPerSecond = ticksPerSecond;
+    }
+
+    /**
+     * Ticks in a wall-clock duration, so gameplay code can state timings in seconds
+     * instead of hard-coding tick counts that silently change meaning with the tick rate.
+     */
+    public static int seconds(double s) {
+        return Math.max(1, (int) Math.round(s * TICKS_PER_SECOND));
     }
 
     public void advanceTime() {

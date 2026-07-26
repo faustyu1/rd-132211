@@ -48,10 +48,8 @@ public final class Imm {
         }
     }
 
-    /** Set texture coordinate for the next vertex (QUADS, textured draws). */
-    public void tex(float u, float v) { t.tex(u, v); }
-
-    public void end() {        if (mode == QUADS) {
+    public void end() {
+        if (mode == QUADS) {
             t.flush();
             return;
         }

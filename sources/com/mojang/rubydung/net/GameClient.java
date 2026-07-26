@@ -7,6 +7,15 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.Map;
 
 public class GameClient {
+    /**
+     * Read timeout for the bootstrap phase only. It runs on the game thread, so a server
+     * that accepts the socket and then goes silent must not freeze the window forever.
+     * SO_TIMEOUT applies per read() call rather than to the whole transfer, so a slow but
+     * progressing multi-megabyte WELCOME still completes; it is cleared before the reader
+     * thread takes over so gameplay reads can block indefinitely.
+     */
+    private static final int BOOTSTRAP_TIMEOUT_MS = 15_000;
+
     private final Connection conn;
     public  final int        localId;
 
@@ -19,23 +28,30 @@ public class GameClient {
     public GameClient(String host, int port, Level level) throws IOException {
         this.level = level;
         Socket sock = new Socket();
-        sock.connect(new InetSocketAddress(host, port), 5000);
-        sock.setTcpNoDelay(true);
+        try {
+            sock.connect(new InetSocketAddress(host, port), 5000);
+            sock.setTcpNoDelay(true);
+            sock.setSoTimeout(BOOTSTRAP_TIMEOUT_MS);
 
-        // read WELCOME synchronously
-        var bootstrapIn = new DataInputStream(new BufferedInputStream(sock.getInputStream()));
-        int len = bootstrapIn.readInt();
-        byte[] welcomePkt = new byte[len];
-        bootstrapIn.readFully(welcomePkt);
+            // read WELCOME synchronously
+            var bootstrapIn = new DataInputStream(new BufferedInputStream(sock.getInputStream()));
+            byte[] welcomePkt = Connection.readPacket(bootstrapIn, Connection.MAX_WORLD_PACKET_BYTES);
 
-        var wis = new DataInputStream(new ByteArrayInputStream(welcomePkt));
-        if (wis.readByte() != Packet.WELCOME) throw new IOException("Expected WELCOME");
-        localId = wis.readInt();
-        byte[] blocks = new byte[wis.available()];
-        wis.readFully(blocks);
-        level.setRawBlocks(blocks);
+            var wis = new DataInputStream(new ByteArrayInputStream(welcomePkt));
+            if (wis.readByte() != Packet.WELCOME) throw new IOException("Expected WELCOME");
+            localId = wis.readInt();
+            byte[] blocks = new byte[wis.available()];
+            wis.readFully(blocks);
+            level.setRawBlocks(blocks);
 
-        conn = new Connection(localId, sock);
+            sock.setSoTimeout(0);
+            // hand the bootstrap stream over: a second buffered stream on this socket would
+            // discard the packets it already read ahead while draining WELCOME
+            conn = new Connection(localId, sock, bootstrapIn);
+        } catch (IOException e) {
+            try { sock.close(); } catch (IOException ignored) {}
+            throw e;
+        }
     }
 
     /** Send our name right after connecting. */
@@ -63,7 +79,8 @@ public class GameClient {
                 }
                 case Packet.SET_TILE -> {
                     int x = dis.readInt(), y = dis.readInt(), z = dis.readInt(), tile = dis.readInt();
-                    level.setTile(x, y, z, tile);
+                    // a rogue host is no more trusted than a rogue peer
+                    if (Packet.isPlaceable(tile)) level.setTile(x, y, z, tile);
                 }
                 case Packet.PLAYER_NAME -> {
                     int id = dis.readInt();

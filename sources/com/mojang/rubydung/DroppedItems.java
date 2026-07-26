@@ -8,6 +8,7 @@ import com.mojang.rubydung.render.vk.GameRenderer;
 import com.mojang.rubydung.render.vk.Pipelines;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Random;
 
@@ -26,9 +27,11 @@ public class DroppedItems {
         float spin;       // render rotation, radians
     }
 
-    private static final float SIZE = 0.18f;       // half-extent of the cube
-    private static final int   DESPAWN = 20 * 300; // ~5 min at 20 tps
+    private static final float SIZE = 0.18f;                    // half-extent of the cube
+    private static final int   DESPAWN = Timer.seconds(300);    // ~5 min
     private static final float PICKUP_RANGE = 1.1f;
+    /** Shared so the usual "walked over nothing" tick allocates nothing. */
+    private static final byte[] NO_PICKUPS = new byte[0];
 
     private final List<Drop> drops = new ArrayList<>();
     private final Random rng = new Random();
@@ -54,9 +57,9 @@ public class DroppedItems {
         drops.add(d);
     }
 
-    /** Advance physics + handle pickup. Returns the block id collected this tick, or 0. */
-    public byte tick(Player player) {
-        byte collected = 0;
+    /** Advance physics + handle pickup. Returns every block id collected this tick. */
+    public byte[] tick(Player player) {
+        byte[] collected = NO_PICKUPS;
         for (int i = drops.size() - 1; i >= 0; i--) {
             Drop d = drops.get(i);
             d.age++;
@@ -76,7 +79,9 @@ public class DroppedItems {
                 float dx = player.x - d.x, dy = (player.y - 0.9f) - d.y, dz = player.z - d.z;
                 float dist2 = dx * dx + dy * dy + dz * dz;
                 if (dist2 < PICKUP_RANGE * PICKUP_RANGE) {
-                    collected = d.type;
+                    // grow by one: several drops can be swept up in the same tick
+                    collected = Arrays.copyOf(collected, collected.length + 1);
+                    collected[collected.length - 1] = d.type;
                     swapRemove(i);
                 }
             }
@@ -118,20 +123,22 @@ public class DroppedItems {
         r.setPipeline(Pipelines.Pipeline.WORLD_OPAQUE);
         r.bindWhite();
         for (Drop d : drops) {
-            float[] col = colorFor(d.type);
+            // swatch() hands back a shared cached array, so copy it out before shading
+            float[] col = Tile.swatch(d.type);
+            float cr = col[0], cg = col[1], cb = col[2];
             // gentle bob so drops read as floating items
             float bob = (float) Math.sin((d.age + a) * 0.15f) * 0.05f;
             float cx = d.x, cy = d.y + bob, cz = d.z;
             float c = (float) Math.cos(d.spin), s = (float) Math.sin(d.spin);
             t.init();
             // build a cube rotated about Y so it spins in place
-            emitCube(cx, cy, cz, c, s, col);
+            emitCube(cx, cy, cz, c, s, cr, cg, cb);
             t.flush();
         }
     }
 
-    /** Emit a SIZE-cube centred at (cx,cy,cz), rotated yaw (c=cos,s=sin), tinted col. */
-    private void emitCube(float cx, float cy, float cz, float c, float s, float[] col) {
+    /** Emit a SIZE-cube centred at (cx,cy,cz), rotated yaw (c=cos,s=sin), tinted (cr,cg,cb). */
+    private void emitCube(float cx, float cy, float cz, float c, float s, float cr, float cg, float cb) {
         // 8 corners in local space, rotated around Y then translated
         float e = SIZE;
         float[][] local = {
@@ -146,38 +153,19 @@ public class DroppedItems {
             w[i][2] = cz + (lx * s + lz * c);
         }
         // face shading to fake lighting (top brightest, sides dimmer)
-        quad(w, 4, 5, 6, 7, col, 1.0f);   // top
-        quad(w, 3, 2, 1, 0, col, 0.5f);   // bottom
-        quad(w, 0, 1, 5, 4, col, 0.8f);   // -z
-        quad(w, 2, 3, 7, 6, col, 0.8f);   // +z
-        quad(w, 3, 0, 4, 7, col, 0.6f);   // -x
-        quad(w, 1, 2, 6, 5, col, 0.6f);   // +x
+        quad(w, 4, 5, 6, 7, cr, cg, cb, 1.0f);   // top
+        quad(w, 3, 2, 1, 0, cr, cg, cb, 0.5f);   // bottom
+        quad(w, 0, 1, 5, 4, cr, cg, cb, 0.8f);   // -z
+        quad(w, 2, 3, 7, 6, cr, cg, cb, 0.8f);   // +z
+        quad(w, 3, 0, 4, 7, cr, cg, cb, 0.6f);   // -x
+        quad(w, 1, 2, 6, 5, cr, cg, cb, 0.6f);   // +x
     }
 
-    private void quad(float[][] w, int a, int b, int c, int d, float[] col, float shade) {
-        t.color(col[0] * shade, col[1] * shade, col[2] * shade, 1f);
+    private void quad(float[][] w, int a, int b, int c, int d, float cr, float cg, float cb, float shade) {
+        t.color(cr * shade, cg * shade, cb * shade, 1f);
         t.vertex(w[a][0], w[a][1], w[a][2]);
         t.vertex(w[b][0], w[b][1], w[b][2]);
         t.vertex(w[c][0], w[c][1], w[c][2]);
         t.vertex(w[d][0], w[d][1], w[d][2]);
-    }
-
-    /** Approximate tint colour for a block id (mirrors Tile tints). */
-    private static float[] colorFor(byte b) {
-        return switch (b) {
-            case Tile.GRASS  -> new float[]{0.35f, 0.65f, 0.25f};
-            case Tile.DIRT   -> new float[]{0.52f, 0.38f, 0.24f};
-            case Tile.SAND   -> new float[]{0.86f, 0.80f, 0.56f};
-            case Tile.SNOW   -> new float[]{0.95f, 0.97f, 1.00f};
-            case Tile.WOOD   -> new float[]{0.45f, 0.31f, 0.16f};
-            case Tile.LEAVES -> new float[]{0.42f, 0.62f, 0.30f};
-            case Tile.COAL   -> new float[]{0.28f, 0.28f, 0.30f};
-            case Tile.IRON   -> new float[]{0.78f, 0.66f, 0.52f};
-            case Tile.GOLD   -> new float[]{0.92f, 0.80f, 0.30f};
-            case Tile.DIAMOND-> new float[]{0.45f, 0.85f, 0.88f};
-            case Tile.GRAVEL -> new float[]{0.52f, 0.52f, 0.55f};
-            case Tile.BEDROCK-> new float[]{0.22f, 0.22f, 0.24f};
-            default          -> new float[]{0.58f, 0.58f, 0.60f}; // stone
-        };
     }
 }

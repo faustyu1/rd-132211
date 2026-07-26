@@ -115,8 +115,11 @@ public class GameServer {
                 }
                 case Packet.SET_TILE -> {
                     int x = dis.readInt(), y = dis.readInt(), z = dis.readInt(), tile = dis.readInt();
-                    level.setTile(x, y, z, tile);
-                    broadcast(PacketWriter.setTile(x, y, z, tile), senderId);
+                    // drop edits from a peer that names an id it is not allowed to place
+                    if (Packet.isPlaceable(tile)) {
+                        level.setTile(x, y, z, tile);
+                        broadcast(PacketWriter.setTile(x, y, z, tile), senderId);
+                    }
                 }
                 case Packet.CHAT -> {
                     int mlen = dis.readShort() & 0xFFFF;

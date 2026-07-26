@@ -110,7 +110,8 @@ public class VkContext {
         return set;
     }
 
-    private boolean hasValidationLayer(MemoryStack stack) {        IntBuffer count = stack.mallocInt(1);
+    private boolean hasValidationLayer(MemoryStack stack) {
+        IntBuffer count = stack.mallocInt(1);
         vkEnumerateInstanceLayerProperties(count, null);
         if (count.get(0) == 0) return false;
         VkLayerProperties.Buffer props = VkLayerProperties.malloc(count.get(0), stack);
@@ -154,19 +155,30 @@ public class VkContext {
             PointerBuffer devices = stack.mallocPointer(count.get(0));
             vkEnumeratePhysicalDevices(instance, count, devices);
 
+            // Score instead of taking the first match: on a hybrid machine the first device
+            // that can graphics+present is often the integrated GPU.
+            VkPhysicalDeviceProperties props = VkPhysicalDeviceProperties.malloc(stack);
+            int bestScore = -1;
             for (int i = 0; i < devices.capacity(); i++) {
                 VkPhysicalDevice candidate = new VkPhysicalDevice(devices.get(i), instance);
                 int fam = findGraphicsPresentQueue(candidate, stack);
-                if (fam >= 0) {
+                if (fam < 0) continue;
+                vkGetPhysicalDeviceProperties(candidate, props);
+                int score = switch (props.deviceType()) {
+                    case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU -> 2;
+                    case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU -> 1;
+                    default -> 0;
+                };
+                if (score > bestScore) {
+                    bestScore = score;
                     physicalDevice = candidate;
                     queueFamily = fam;
-                    VkPhysicalDeviceProperties props = VkPhysicalDeviceProperties.malloc(stack);
-                    vkGetPhysicalDeviceProperties(candidate, props);
-                    System.out.println("[vk] using device: " + props.deviceNameString());
-                    return;
                 }
             }
-            throw new RuntimeException("No suitable Vulkan device with graphics+present queue");
+            if (physicalDevice == null)
+                throw new RuntimeException("No suitable Vulkan device with graphics+present queue");
+            vkGetPhysicalDeviceProperties(physicalDevice, props);
+            System.out.println("[vk] using device: " + props.deviceNameString());
         }
     }
 

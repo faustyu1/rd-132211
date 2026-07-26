@@ -19,7 +19,10 @@ public class Textures {
         VkTexture cached = cache.get(resourceName);
         if (cached != null) return cached;
         try {
-            BufferedImage img = ImageIO.read(Textures.class.getResourceAsStream(resourceName));
+            var in = Textures.class.getResourceAsStream(resourceName);
+            // ImageIO.read throws IllegalArgumentException on a null stream, which escapes the catch below
+            if (in == null) throw new RuntimeException("Texture resource not found: " + resourceName);
+            BufferedImage img = ImageIO.read(in);
             int w = img.getWidth(), h = img.getHeight();
             int[] rawPixels = new int[w * h];
             img.getRGB(0, 0, w, h, rawPixels, 0, w);

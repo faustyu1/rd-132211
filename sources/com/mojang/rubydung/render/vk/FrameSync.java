@@ -22,8 +22,14 @@ public class FrameSync {
     private final long[] commandPools = new long[FRAMES_IN_FLIGHT];
     private final VkCommandBuffer[] commandBuffers = new VkCommandBuffer[FRAMES_IN_FLIGHT];
     private final long[] imageAvailable = new long[FRAMES_IN_FLIGHT];
-    private final long[] renderFinished = new long[FRAMES_IN_FLIGHT];
     private final long[] inFlight = new long[FRAMES_IN_FLIGHT];
+    // One present semaphore per swapchain image rather than per frame-in-flight: this is the
+    // semaphore vkQueuePresentKHR waits on, and inFlight only proves the submission finished,
+    // not the present. Signalling it again while an earlier present still waits on it is the
+    // classic semaphore-reuse hazard — and the swapchain image count need not match
+    // FRAMES_IN_FLIGHT anyway. Indexing by acquired image makes re-signalling safe, because
+    // vkAcquireNextImageKHR only hands back an image the presentation engine is done with.
+    private long[] renderFinished;
 
     // one-shot pool for transfers (init-time texture uploads)
     private long oneShotPool = VK_NULL_HANDLE;
@@ -59,14 +65,14 @@ public class FrameSync {
                 VkFenceCreateInfo fenceCi = VkFenceCreateInfo.calloc(stack)
                     .sType(VK_STRUCTURE_TYPE_FENCE_CREATE_INFO)
                     .flags(VK_FENCE_CREATE_SIGNALED_BIT);
-                LongBuffer pSem1 = stack.mallocLong(1), pSem2 = stack.mallocLong(1), pFence = stack.mallocLong(1);
-                vkCreateSemaphore(ctx.device, semCi, null, pSem1);
-                vkCreateSemaphore(ctx.device, semCi, null, pSem2);
+                LongBuffer pSem = stack.mallocLong(1), pFence = stack.mallocLong(1);
+                vkCreateSemaphore(ctx.device, semCi, null, pSem);
                 vkCreateFence(ctx.device, fenceCi, null, pFence);
-                imageAvailable[i] = pSem1.get(0);
-                renderFinished[i] = pSem2.get(0);
+                imageAvailable[i] = pSem.get(0);
                 inFlight[i] = pFence.get(0);
             }
+
+            createRenderFinished(stack);
 
             VkCommandPoolCreateInfo poolCi = VkCommandPoolCreateInfo.calloc(stack)
                 .sType(VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO)
@@ -75,6 +81,35 @@ public class FrameSync {
             LongBuffer pPool = stack.mallocLong(1);
             vkCreateCommandPool(ctx.device, poolCi, null, pPool);
             oneShotPool = pPool.get(0);
+        }
+    }
+
+    private void createRenderFinished(MemoryStack stack) {
+        VkSemaphoreCreateInfo semCi = VkSemaphoreCreateInfo.calloc(stack)
+            .sType(VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO);
+        LongBuffer pSem = stack.mallocLong(1);
+        renderFinished = new long[swapchain.images.length];
+        for (int i = 0; i < renderFinished.length; i++) {
+            vkCreateSemaphore(ctx.device, semCi, null, pSem);
+            renderFinished[i] = pSem.get(0);
+        }
+    }
+
+    private void destroyRenderFinished() {
+        if (renderFinished == null) return;
+        for (long s : renderFinished) if (s != VK_NULL_HANDLE) vkDestroySemaphore(ctx.device, s, null);
+        renderFinished = null;
+    }
+
+    /**
+     * Re-create the per-image present semaphores after the swapchain was recreated: the image
+     * count can change, and the old semaphores belong to presents against the dead swapchain.
+     * Safe to call only right after Swapchain.recreate(), which waits for the device to be idle.
+     */
+    public void onSwapchainRecreated() {
+        destroyRenderFinished();
+        try (MemoryStack stack = stackPush()) {
+            createRenderFinished(stack);
         }
     }
 
@@ -166,13 +201,13 @@ public class FrameSync {
                 .pWaitSemaphores(stack.longs(imageAvailable[frameIndex]))
                 .pWaitDstStageMask(stack.ints(VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT))
                 .pCommandBuffers(stack.pointers(cmd))
-                .pSignalSemaphores(stack.longs(renderFinished[frameIndex]));
+                .pSignalSemaphores(stack.longs(renderFinished[acquiredImage]));
             if (vkQueueSubmit(ctx.queue, submit, inFlight[frameIndex]) != VK_SUCCESS)
                 throw new RuntimeException("vkQueueSubmit failed");
 
             VkPresentInfoKHR present = VkPresentInfoKHR.calloc(stack)
                 .sType(VK_STRUCTURE_TYPE_PRESENT_INFO_KHR)
-                .pWaitSemaphores(stack.longs(renderFinished[frameIndex]))
+                .pWaitSemaphores(stack.longs(renderFinished[acquiredImage]))
                 .swapchainCount(1)
                 .pSwapchains(stack.longs(swapchain.swapchain))
                 .pImageIndices(stack.ints(acquiredImage));
@@ -232,9 +267,9 @@ public class FrameSync {
     }
 
     public void destroy() {
+        destroyRenderFinished();
         for (int i = 0; i < FRAMES_IN_FLIGHT; i++) {
             if (imageAvailable[i] != VK_NULL_HANDLE) vkDestroySemaphore(ctx.device, imageAvailable[i], null);
-            if (renderFinished[i] != VK_NULL_HANDLE) vkDestroySemaphore(ctx.device, renderFinished[i], null);
             if (inFlight[i] != VK_NULL_HANDLE) vkDestroyFence(ctx.device, inFlight[i], null);
             if (commandPools[i] != VK_NULL_HANDLE) vkDestroyCommandPool(ctx.device, commandPools[i], null);
         }

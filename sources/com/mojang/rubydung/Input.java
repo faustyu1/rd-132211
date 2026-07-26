@@ -59,4 +59,16 @@ public class Input {
         mouseDX = 0; mouseDY = 0;
         return new double[]{dx, dy};
     }
+
+    /**
+     * Drop every buffered event and pointer delta. Held-key/button state is kept, so a
+     * key that is still physically down keeps working across the screen change.
+     */
+    public static void drainEvents() {
+        keyEvents.clear();
+        charEvents.clear();
+        mouseEvents.clear();
+        scrollY = 0;
+        mouseDX = 0; mouseDY = 0;
+    }
 }

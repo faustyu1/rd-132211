@@ -26,6 +26,11 @@ public class WorldChunk {
     // propagated sky light 0..15 per block (BFS): full overhead sky = 15, decays 1 per block
     final byte[] skyLight = new byte[SIZE * HEIGHT * SIZE];
     private static final int MAX_LIGHT = 15;
+    // BFS scratch queue: relighting runs on the chunk-gen threads, the mesh pool and the
+    // main thread, so it is per-thread — a shared buffer would race, and a per-chunk one
+    // would cost 128 KB times every loaded chunk.
+    private static final ThreadLocal<int[]> lightQueue =
+        ThreadLocal.withInitial(() -> new int[SIZE * HEIGHT * SIZE]);
 
     /** One renderable vertical slice (16^3). Owns its own mesh + dirty state. */
     private final class Section {
@@ -49,10 +54,12 @@ public class WorldChunk {
 
     private final Section[] sections = new Section[SECTIONS];
 
-    public boolean hasMesh() {
-        for (Section s : sections) if (s.vertexCount[0] > 0 || s.vertexCount[1] > 0) return true;
-        return false;
-    }
+    // true once a player/network edit touched this chunk: generated-but-untouched chunks
+    // can be regenerated from the seed, edited ones must be flushed to disk before unloading
+    volatile boolean modified = false;
+
+    /** Flag this chunk as edited. Only Level's own mutators may call this — the generator must not. */
+    public void markModified() { modified = true; }
 
     public static int rebuiltThisFrame = 0;
     public static int updates = 0;
@@ -93,16 +100,30 @@ public class WorldChunk {
     public void calcLightDepths() {
         for (int lx = 0; lx < SIZE; lx++) {
             for (int lz = 0; lz < SIZE; lz++) {
-                int y = HEIGHT - 1;
-                while (y > 0) {
-                    byte b = getBlock(lx, y, lz);
-                    if (b != 0 && b != 3 && !Tile.isWater(b)) break;
-                    y--;
-                }
-                lightDepths[lz * SIZE + lx] = y;
+                lightDepths[lz * SIZE + lx] = surfaceDepth(lx, lz);
             }
         }
         calcSkyLight();
+    }
+
+    /**
+     * Relight after a single block edit: only the edited column's depth can have
+     * changed, so rescanning all 256 columns per placed block is wasted work.
+     */
+    public void updateLightAt(int lx, int lz) {
+        if (lx < 0 || lx >= SIZE || lz < 0 || lz >= SIZE) return;
+        lightDepths[lz * SIZE + lx] = surfaceDepth(lx, lz);
+        calcSkyLight();
+    }
+
+    /** Highest y in this column that still blocks light (0 if the column is fully open). */
+    private int surfaceDepth(int lx, int lz) {
+        int y = HEIGHT - 1;
+        while (y > 0) {
+            if (blocksLight(getBlock(lx, y, lz))) break;
+            y--;
+        }
+        return y;
     }
 
     private static boolean blocksLight(byte b) {
@@ -118,8 +139,7 @@ public class WorldChunk {
      */
     private void calcSkyLight() {
         java.util.Arrays.fill(skyLight, (byte) 0);
-        int cap = SIZE * HEIGHT * SIZE;
-        int[] queue = new int[cap];
+        int[] queue = lightQueue.get();
         int head = 0, tail = 0;
         // seed: open columns from the top down to the first light blocker get full sky
         for (int lx = 0; lx < SIZE; lx++) {
@@ -187,7 +207,7 @@ public class WorldChunk {
             if (s.rebuilding.getAndSet(true)) continue;
             s.dirty = false;
             final Section sec = s;
-            java.util.concurrent.ForkJoinPool.commonPool().execute(() -> buildSection(sec));
+            java.util.concurrent.ForkJoinPool.commonPool().execute(() -> buildSectionSafe(sec));
         }
     }
 
@@ -196,9 +216,30 @@ public class WorldChunk {
         for (Section s : sections) {
             s.rebuilding.set(true);
             s.dirty = false;
-            buildSection(s);
+            buildSectionSafe(s);
         }
     }
+
+    /**
+     * A section whose build throws would stay dirty=false/rebuilding=true forever, i.e.
+     * a silent 16^3 hole in the world, so hand it back to the retry path. Only the first
+     * failure is logged: a systematic bug would otherwise spam the console every frame.
+     */
+    private void buildSectionSafe(Section sec) {
+        try {
+            buildSection(sec);
+        } catch (Throwable e) {
+            if (!buildFailureLogged) {
+                buildFailureLogged = true;
+                System.err.println("chunk section build failed at chunk " + cx + "," + cz + " section " + sec.sy);
+                e.printStackTrace();
+            }
+            sec.dirty = true;
+            sec.rebuilding.set(false);
+        }
+    }
+
+    private static volatile boolean buildFailureLogged = false;
 
     private void buildSection(Section sec) {
         float[][] verts = new float[2][];
@@ -285,13 +326,13 @@ public class WorldChunk {
                 sec.urgent = false;
                 sec.dirty = false;
                 sec.rebuilding.set(true);
-                buildSection(sec);
+                buildSectionSafe(sec);
                 uploadPending(sec);
             } else if (sec.dirty && !sec.rebuilding.get() && rebuiltThisFrame < 16) {
                 sec.dirty = false;
                 sec.rebuilding.set(true);
                 final Section s = sec;
-                java.util.concurrent.ForkJoinPool.commonPool().execute(() -> buildSection(s));
+                java.util.concurrent.ForkJoinPool.commonPool().execute(() -> buildSectionSafe(s));
             }
 
             if (sec.vertexCount[layer] == 0 || sec.buf[layer] == null) continue;
