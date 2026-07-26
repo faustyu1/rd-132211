@@ -8,6 +8,91 @@ This project follows [Semantic Versioning](https://semver.org/) while in `0.x`:
 
 Do not bump versions for every commit; group changes into a release and tag once.
 
+## [0.4.1] - 2026-07-26
+
+A full line-by-line review of the codebase, and the fixes for everything it found.
+No new features.
+
+### Fixed
+- **Crash when pressing Escape during world generation**: the key fell through to the
+  pause screen, whose render path dereferences a player that does not exist until
+  loading finishes. The 3D path is now unreachable without a live world.
+- **Buildings vanished when you walked away**: chunks that streamed out of range were
+  dropped without being written, and `save()` only ever wrote resident chunks. Edited
+  chunks are now flushed on unload and read back from disk when they stream in again;
+  if the write fails, the chunk stays in memory rather than taking your work with it.
+- **Inventory leaked between worlds**: the hotbar and item counts live on the game
+  object, not on the player, and were never reset — a brand-new world started with the
+  previous world's blocks.
+- **Multiplayer joins dropped or split packets**: the client read `WELCOME` through a
+  `BufferedInputStream` it then threw away, losing whatever that buffer had read ahead;
+  a half-buffered packet left the reader mid-stream, reading a garbage length and
+  closing the connection. One buffered stream now lives for the whole session.
+- **Joining a server corrupted the open single-player world**: the session reused that
+  world's `Level`, so the host's snapshot overwrote it in memory (and, with the new
+  unload flush, on disk). A joined session now gets its own `Level`.
+- **World snapshot raced chunk streaming**: `getRawBlocks` sized its buffer from
+  `chunks.size()` and then iterated the live map, overflowing it if a chunk arrived in
+  between — which is exactly what happens while the host is walking around.
+- **`HOST GAME` from the main menu** passed a null level to `GameServer`, because
+  `startWorld` publishes the world from a background thread.
+- **Unvalidated network input**: the join handshake allocated `byte[len]` straight from
+  the wire, and block ids arrived unchecked; both are now bounded and validated.
+- **Leaves could not be hit**: the picking ray tested solidity, which deliberately
+  excludes leaves, so the breaking code for them was unreachable. Their collision and
+  lighting are unchanged — they are still walk-through and still let light past.
+- **Survival had no economy**: placing never consumed anything and the creative palette
+  handed out infinite stacks in any mode.
+- **Water checks were off by one at negative coordinates** (truncation instead of floor),
+  so swim drag and fall-damage cancelling misfired across half the world.
+- **Only one of several simultaneously collected drops was credited.**
+- **Water rendered as a magenta checkerboard**: it sampled atlas tile 14, which is the
+  missing-texture placeholder — the atlas only ships two real tiles.
+- **Ambient occlusion on walls** sampled voxels outside the face plane and never sampled
+  vertical neighbours, so overhangs cast no shading. Top and bottom faces are unchanged.
+- **The crosshair's inverse blend was silently ignored** (`glBlendFunc` was a no-op), so
+  it disappeared against light terrain.
+- **Caves stopped dead** at the generator's search radius, which was smaller than a
+  tunnel's reach; **trees never crossed chunk borders**, leaving bald strips on a
+  16-block grid. Trunk spacing now spans borders and stays a pure function of seed and
+  chunk coordinates, so parallel generation still agrees on every block.
+- **Silent holes in the world**: an exception in a background section build left that
+  section permanently unbuilt, with no log.
+- **Durations were three times too short**: constants written for Minecraft's 20 tps ran
+  on a 60 Hz tick — regeneration, break speed, drop despawn, damage flash and the
+  day/night cycle now mean what they say. Movement and physics constants are untouched.
+- **Clicks made during world generation** were replayed into the world the moment it
+  appeared, breaking or placing blocks at spawn.
+- **Vulkan**: resources were freed a frame before the fence proved the GPU was done with
+  them; the present semaphore was reused per frame-in-flight although `vkQueuePresentKHR`
+  waits on it (now one per swapchain image); the first device with graphics+present was
+  taken rather than preferring a discrete GPU; scratch buffers leaked on shutdown.
+- **The font atlas** packed every glyph into one unchecked 4096px row, and text
+  measurement disagreed with what was drawn for unsupported characters.
+- **`./build.sh` and `./run.sh` were broken**: both `cd`'d to a directory that no longer
+  exists, so the documented build command failed instantly. They now resolve their own
+  location and fall back to `$JAVA_HOME` or `PATH`; `run2.sh` is no longer pre-Vulkan.
+
+### Changed
+- Flowing water no longer forces synchronous mesh rebuilds on the render thread; the
+  "rebuild this frame" path is reserved for player edits, as it was meant to be.
+- Marking geometry dirty no longer scans every loaded chunk per changed block, a block
+  edit no longer re-runs a whole-chunk light flood-fill with a 128 KB allocation, and
+  meshing no longer evaluates faces for the render layer it does not emit into.
+- UI text is drawn once per string instead of once per glyph.
+- `player.dat` is now version 3: the unused 36-byte slot array is gone. Version 2 files
+  still load.
+- `CLAUDE.md` and `README.md` corrected — both still described an OpenGL 2.1 renderer, a
+  `level.dat` save file and a five-screen menu, none of which have been true since 0.3.0.
+- Dead code removed (`Tile.rock`, `renderFace`, `Level.getOrLoadChunk`/`Biome`/
+  `animalSpawns`, `WorldChunk.hasMesh`, `LevelListener.lightColumnChanged`, and the three
+  duplicate copies of the block-colour table).
+
+### Known limitations
+- Back-face culling stays disabled and vertex buffers stay host-visible. Both are
+  worthwhile optimisations, but the first needs consistent winding across every geometry
+  path and the second buys nothing on unified-memory hardware.
+
 ## [0.4.0] - 2026-06-13
 
 ### Added
