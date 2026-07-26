@@ -19,7 +19,7 @@ import static org.lwjgl.glfw.GLFWVulkan.glfwVulkanSupported;
 
 public class RubyDung implements Runnable {
     /** Shown on the main menu; keep in step with the CHANGELOG release being tagged. */
-    private static final String VERSION = "0.5.0";
+    private static final String VERSION = "0.5.1";
 
     private int width;
     private int height;
@@ -187,7 +187,7 @@ public class RubyDung implements Runnable {
         if (ww[0] > 0)  { winWidth = ww[0]; winHeight = wh[0]; }
 
         renderer = new GameRenderer(window, settings.vsync);
-        fontRenderer = new FontRenderer(21);
+        fontRenderer = new FontRenderer(32);
 
         screen = -1;
         menuCooldown = 5;
@@ -2033,13 +2033,13 @@ public class RubyDung implements Runnable {
         int logoY = height / 2 - 200;
         String logo = "RUBYDUNG";
         GL.glColor4f(0.1f, 0.1f, 0.1f, 0.8f);
-        drawTextCentered(logo, width / 2 + 3, logoY + 3, 52);
+        drawPixelCentered(logo, width / 2 + 4, logoY + 4, 28, 38, 5, width - 40, 48);
         GL.glColor4f(1.0f, 0.85f, 0.3f, 1.0f);
-        drawTextCentered(logo, width / 2, logoY, 52);
+        drawPixelCentered(logo, width / 2, logoY, 28, 38, 5, width - 40, 48);
 
         int btnW = 380, btnH = 60, gap = 12;
         int bx = (width - btnW) / 2;
-        int by0 = logoY + 52 + 50;   // logo height + gap
+        int by0 = logoY + 38 + 50;   // logo height + gap
 
         int mx = mouseScreenX(), my = mouseScreenY();
         boolean h0 = hover(mx, my, bx, by0,              btnW, btnH);
@@ -2292,7 +2292,30 @@ public class RubyDung implements Runnable {
 
     private void drawTitle(String title, int y) {
         GL.glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
-        drawTextFitCentered(title, width / 2, y, 42, width - 40);
+        drawPixelCentered(title, width / 2, y, 30, 42, 5, width - 40, 42);
+    }
+
+    /**
+     * Headline text in the block font, centred and shrunk to fit. Falls back to the atlas
+     * font for anything the block font has no glyph for, rather than dropping characters.
+     */
+    private void drawPixelCentered(String text, int centerX, int y, int charW, int charH, int gap,
+                                   int maxWidth, int fallbackHeight) {
+        if (!PixelFont.canRender(text)) {
+            drawTextFitCentered(text, centerX, y, fallbackHeight, maxWidth);
+            return;
+        }
+        int pitch = charW + gap;
+        int w = PixelFont.width(text, charW, pitch);
+        if (w > maxWidth && w > 0) {
+            // scale the cell down as a whole so the glyph grid stays square
+            float k = maxWidth / (float) w;
+            charW = Math.max(5, Math.round(charW * k));
+            charH = Math.max(7, Math.round(charH * k));
+            pitch = charW + Math.max(1, Math.round(gap * k));
+            w = PixelFont.width(text, charW, pitch);
+        }
+        PixelFont.draw(text, centerX - w / 2, y, charW, charH, pitch);
     }
 
     private void drawButton(int x, int y, int w, int h, String label, boolean hover) {

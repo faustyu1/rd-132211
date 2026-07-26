@@ -38,26 +38,36 @@ public class FontRenderer {
 
     private final java.util.HashMap<Character, Integer> charIndex = new java.util.HashMap<>();
 
+    /**
+     * Glyphs are separated by this much transparent padding. One pixel is not enough: the UI
+     * scales text up (a 52px logo out of this atlas), and a magnifying bilinear sample at the
+     * edge of a glyph reaches past its rectangle, dragging a sliver of the neighbouring letter
+     * in with it. That fringe is what makes big text look misshapen.
+     */
+    private static final int PAD = 4;
+
     public FontRenderer(int fontSize) {
         System.setProperty("java.awt.headless", "true");
-        Font font = new Font("SansSerif", Font.PLAIN, fontSize);
+        // BOLD, and built large enough that the biggest text in the UI is barely upscaled:
+        // this atlas is the only font in the game, from 12px labels to the 52px logo.
+        Font font = new Font("SansSerif", Font.BOLD, fontSize);
         BufferedImage tmp = new BufferedImage(1, 1, BufferedImage.TYPE_INT_ARGB);
         Graphics2D gtmp = tmp.createGraphics();
         gtmp.setFont(font);
         FontMetrics fm = gtmp.getFontMetrics();
         glyphH = fm.getHeight();
-        int rowH = glyphH + 1;   // 1px gutter so antialiased rows cannot bleed into each other
+        int rowH = glyphH + PAD;
         int x = 0, row = 0;
         for (int i = 0; i < RANGES.length(); i++) {
             char c = RANGES.charAt(i);
             int w = fm.charWidth(c);
             // wrap onto a new row instead of running off the end of the atlas
-            if (x + w + 1 > atlasW) { x = 0; row++; }
+            if (x + w + PAD > atlasW) { x = 0; row++; }
             charIndex.put(c, i);
             charX[i] = x;
             charY[i] = row * rowH;
             charW[i] = w;
-            x += w + 1;
+            x += w + PAD;
         }
         gtmp.dispose();
         fallbackIndex = charIndex.getOrDefault('?', 0);

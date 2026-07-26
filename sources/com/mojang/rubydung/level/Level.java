@@ -20,7 +20,9 @@ public class Level {
         java.util.concurrent.Executors.newFixedThreadPool(
             Math.max(2, Runtime.getRuntime().availableProcessors() - 1),
             r -> { Thread t = new Thread(r, "chunk-gen"); t.setDaemon(true); return t; });
-    private final ChunkGenerator generator;
+    // not final: load() replaces it when a saved world turns out to have a different seed.
+    // volatile because the chunk-generation pool reads it.
+    private volatile ChunkGenerator generator;
     private long seed;
     private final List<LevelListener> levelListeners = new ArrayList<>();
     // world folder to flush edited chunks into when they stream out; null = nowhere to write yet
@@ -32,6 +34,19 @@ public class Level {
     }
 
     public long getSeed() { return seed; }
+
+    /**
+     * Adopt a seed read from disk. The generator has to be rebuilt with it: callers open an
+     * existing world by constructing a Level with a placeholder seed and then loading, and a
+     * generator still holding the placeholder quietly produces a different world for every
+     * chunk that is not on disk — which, now that only edited chunks are stored, is nearly
+     * all of them.
+     */
+    private void setSeed(long seed) {
+        if (this.seed == seed && generator != null) return;
+        this.seed = seed;
+        this.generator = new ChunkGenerator(seed);
+    }
 
     private static long chunkKey(int cx, int cz) {
         return (long) cx << 32 | (cz & 0xFFFFFFFFL);
@@ -607,7 +622,7 @@ public class Level {
         File seedFile = new File(dir, "seed.dat");
         if (seedFile.exists()) {
             try (var dis = new DataInputStream(new GZIPInputStream(new FileInputStream(seedFile)))) {
-                seed = dis.readLong();
+                setSeed(dis.readLong());
             } catch (Exception e) {
                 e.printStackTrace();
             }

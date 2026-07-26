@@ -8,6 +8,28 @@ This project follows [Semantic Versioning](https://semver.org/) while in `0.x`:
 
 Do not bump versions for every commit; group changes into a release and tag once.
 
+## [0.5.1] - 2026-07-26
+
+### Fixed
+- **Reopening a world regenerated it as a different world.** `Level` built its
+  `ChunkGenerator` once in the constructor, while `load()` only overwrote the `seed` field —
+  and the game opens an existing world by constructing a `Level` with a placeholder seed and
+  loading afterwards, so the generator kept the placeholder forever. Everything not on disk
+  was therefore generated from the wrong seed. The bug predates 0.5.0 but was hidden by the
+  old save behaviour, which wrote every loaded chunk; once 0.5.0 started storing only edited
+  chunks, it became "my building is still there and the rest of the world is not".
+  `load()` now rebuilds the generator with the seed it read.
+
+### Changed
+- **The block font is back for the logo and screen titles** (`PixelFont`). Headline type is
+  part of the game's identity and a smooth sans-serif "RUBYDUNG" is not it. Everything else
+  keeps the texture atlas, so menus still have lowercase and Cyrillic; a headline the block
+  font cannot spell falls back to the atlas instead of dropping characters, and a headline
+  too wide for the window is scaled down as a whole rather than clipped.
+- The text atlas is now bold and built at 32px instead of 21px, with 4px of padding between
+  glyphs. At 1px, a magnifying bilinear sample at the edge of a glyph reached into its
+  neighbour, which is what made large text look misshapen.
+
 ## [0.5.0] - 2026-07-26
 
 Everything below is new gameplay or a protocol change, so this is a MINOR bump rather than
