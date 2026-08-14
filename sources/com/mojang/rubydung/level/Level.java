@@ -27,6 +27,8 @@ public class Level {
     private final List<LevelListener> levelListeners = new ArrayList<>();
     // world folder to flush edited chunks into when they stream out; null = nowhere to write yet
     private volatile File saveDir;
+    // chunk-granular access to the world's Linear region files (32x32 chunks per file)
+    private final LinearRegionCache regions = new LinearRegionCache();
 
     public Level(long seed) {
         this.seed = seed;
@@ -558,24 +560,19 @@ public class Level {
     }
 
     /**
-     * Write one chunk's blocks to its own file. Shared by save() and the unload flush.
-     * Returns false if the write failed — the unload path must then keep the chunk
-     * resident, because evicting it would discard the only copy of those edits.
+     * Write one chunk's blocks into its Linear region file. Shared by save() and the
+     * unload flush. Returns false if the write failed — the unload path must then keep
+     * the chunk resident, because evicting it would discard the only copy of those edits.
      */
     private boolean writeChunk(File dir, WorldChunk chunk) {
-        File f = new File(dir, chunk.cx + "_" + chunk.cz + ".dat");
-        try (var dos = new DataOutputStream(new GZIPOutputStream(new FileOutputStream(f)))) {
-            dos.write(chunk.blocks);
-        } catch (Exception e) {
-            e.printStackTrace();
-            return false;
-        }
+        int now = (int) (System.currentTimeMillis() / 1000L);
+        if (!regions.write(dir, chunk.cx, chunk.cz, chunk.blocks.clone(), now)) return false;
         chunk.modified = false;
         return true;
     }
 
     /**
-     * Restore a chunk's blocks from its save file, if it has one. A chunk that streams
+     * Restore a chunk's blocks from the save, if it is stored there. A chunk that streams
      * back in must come from disk: regenerating it from the seed would silently undo
      * every edit ever made there, and the next save() would then overwrite the file.
      * Returns false (leaving the chunk empty) when there is nothing usable to read.
@@ -583,23 +580,45 @@ public class Level {
     private boolean readChunk(WorldChunk chunk) {
         File dir = saveDir;
         if (dir == null) return false;
-        File f = new File(dir, chunk.cx + "_" + chunk.cz + ".dat");
-        if (!f.exists()) return false;
-        byte[] buf = chunk.blocks;
+        byte[] stored = regions.read(dir, chunk.cx, chunk.cz);
+        if (stored == null) stored = readLegacyChunk(dir, chunk.cx, chunk.cz);
+        if (stored == null) return false;
+        if (stored.length != chunk.blocks.length) {
+            // incompatible save (e.g. old world height) -> hand a clean chunk to the generator
+            java.util.Arrays.fill(chunk.blocks, (byte) 0);
+            return false;
+        }
+        System.arraycopy(stored, 0, chunk.blocks, 0, stored.length);
+        chunk.calcLightDepths();
+        return true;
+    }
+
+    /**
+     * Pre-Linear saves kept one gzip file per edited chunk. They are still read so old
+     * worlds keep their builds; the chunk moves into a region file the next time it is
+     * written, after which the stale .dat is ignored.
+     */
+    private byte[] readLegacyChunk(File dir, int cx, int cz) {
+        File f = new File(dir, cx + "_" + cz + ".dat");
+        if (!f.exists()) return null;
+        byte[] buf = new byte[WorldChunk.SIZE * WorldChunk.HEIGHT * WorldChunk.SIZE];
         int off = 0;
         try (var dis = new DataInputStream(new GZIPInputStream(new FileInputStream(f)))) {
             int n;
             while (off < buf.length && (n = dis.read(buf, off, buf.length - off)) > 0) off += n;
         } catch (Exception e) {
             e.printStackTrace();
+            return null;
         }
-        if (off != buf.length) {
-            // incompatible save (e.g. old world height) -> hand a clean chunk to the generator
-            java.util.Arrays.fill(buf, (byte) 0);
-            return false;
-        }
-        chunk.calcLightDepths();
-        return true;
+        return off == buf.length ? buf : null;
+    }
+
+    /** Bring a stored chunk into memory at load time; ignored if the save has nothing usable. */
+    private void adoptStoredChunk(int cx, int cz) {
+        WorldChunk chunk = new WorldChunk(cx, cz, this);
+        if (!readChunk(chunk)) return;
+        chunk.setDirty();
+        chunks.put(chunkKey(cx, cz), chunk);
     }
 
     public void save(File dir) {
@@ -627,31 +646,22 @@ public class Level {
                 e.printStackTrace();
             }
         }
+        for (int[] c : regions.storedChunks(dir)) adoptStoredChunk(c[0], c[1]);
+        // legacy per-chunk files, for the ones no region file covers yet
         File[] files = dir.listFiles((d, name) -> name.matches("-?\\d+_-?\\d+\\.dat"));
-        if (files == null) return;
-        for (File f : files) {
-            String name = f.getName().replace(".dat", "");
-            String[] parts = name.split("_");
-            // handle negative coords: split on last _ before second number
-            try {
-                int cx, cz;
-                // find split point: second number may start with -
-                int sep = name.lastIndexOf('_');
-                cx = Integer.parseInt(name.substring(0, sep));
-                cz = Integer.parseInt(name.substring(sep + 1));
-                WorldChunk chunk = new WorldChunk(cx, cz, this);
-                byte[] buf = chunk.blocks;
-                int off = 0;
-                try (var dis = new DataInputStream(new GZIPInputStream(new FileInputStream(f)))) {
-                    int n;
-                    while (off < buf.length && (n = dis.read(buf, off, buf.length - off)) > 0) off += n;
+        if (files != null) {
+            for (File f : files) {
+                String name = f.getName().replace(".dat", "");
+                try {
+                    // handle negative coords: the second number may start with -
+                    int sep = name.lastIndexOf('_');
+                    int cx = Integer.parseInt(name.substring(0, sep));
+                    int cz = Integer.parseInt(name.substring(sep + 1));
+                    if (chunks.containsKey(chunkKey(cx, cz))) continue; // region file wins
+                    adoptStoredChunk(cx, cz);
+                } catch (Exception e) {
+                    e.printStackTrace();
                 }
-                if (off != buf.length) continue; // incompatible save (e.g. old world height) -> regenerate
-                chunk.calcLightDepths();
-                chunk.setDirty();
-                chunks.put(chunkKey(cx, cz), chunk);
-            } catch (Exception e) {
-                e.printStackTrace();
             }
         }
         for (var listener : levelListeners) listener.allChanged();
@@ -668,18 +678,11 @@ public class Level {
         if (c != null && c.modified) return c.blocks.clone();
         File dir = saveDir;
         if (dir == null) return null;
-        File f = new File(dir, cx + "_" + cz + ".dat");
-        if (!f.exists()) return null;
-        byte[] buf = new byte[WorldChunk.SIZE * WorldChunk.HEIGHT * WorldChunk.SIZE];
-        int off = 0;
-        try (var dis = new DataInputStream(new GZIPInputStream(new FileInputStream(f)))) {
-            int n;
-            while (off < buf.length && (n = dis.read(buf, off, buf.length - off)) > 0) off += n;
-        } catch (Exception e) {
-            e.printStackTrace();
-            return null;
-        }
-        return off == buf.length ? buf : null;
+        byte[] stored = regions.read(dir, cx, cz);
+        if (stored == null) stored = readLegacyChunk(dir, cx, cz);
+        if (stored == null) return null;
+        // clone: the cache still owns its copy, and the caller ships this over the wire
+        return stored.length == WorldChunk.SIZE * WorldChunk.HEIGHT * WorldChunk.SIZE ? stored.clone() : null;
     }
 
     /**

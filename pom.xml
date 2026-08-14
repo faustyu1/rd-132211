@@ -15,6 +15,7 @@
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <lwjgl.version>3.4.1</lwjgl.version>
         <joml.version>1.10.7</joml.version>
+        <zstd.version>1.5.7-6</zstd.version>
     </properties>
 
     <dependencies>
@@ -45,6 +46,9 @@
         <dependency><groupId>org.lwjgl</groupId><artifactId>lwjgl-shaderc</artifactId><version>${lwjgl.version}</version><classifier>natives-linux</classifier></dependency>
 
         <dependency><groupId>org.joml</groupId><artifactId>joml</artifactId><version>${joml.version}</version></dependency>
+
+        <!-- zstd: compression for Linear region files (natives bundled in the jar) -->
+        <dependency><groupId>com.github.luben</groupId><artifactId>zstd-jni</artifactId><version>${zstd.version}</version></dependency>
     </dependencies>
 
     <build>
