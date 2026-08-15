@@ -52,8 +52,16 @@ public class WorldChunk {
         }
     }
 
-    // interleaved vertex array per layer (pos3+uv2+color4+light2 = 11 floats/vertex)
+    // interleaved vertex array per layer (pos3+uv2+color4+light2 = 11 floats/vertex),
+    // trimmed to the vertices actually emitted — see buildSection
     private record MeshData(float[][] verts, int[] floatCount, int[] count) {}
+
+    private static final float[] NO_VERTS = new float[0];
+    // One builder per meshing thread instead of two per section. Its buffer grows to the
+    // largest section that thread ever built and is then reused, so the pool holds a
+    // handful of them rather than allocating a fresh pair for every rebuild.
+    private static final ThreadLocal<Tesselator> meshBuilder =
+        ThreadLocal.withInitial(Tesselator::new);
 
     private final Section[] sections = new Section[SECTIONS];
 
@@ -341,8 +349,8 @@ public class WorldChunk {
         int bx0 = cx * SIZE, bz0 = cz * SIZE;
         int y0 = sec.sy * SECTION, y1 = y0 + SECTION;
 
+        Tesselator t = meshBuilder.get();
         for (int layer = 0; layer < 2; layer++) {
-            Tesselator t = new Tesselator();
             t.init();
             for (int lx = 0; lx < SIZE; lx++) {
                 for (int y = y0; y < y1; y++) {
@@ -360,9 +368,16 @@ public class WorldChunk {
                     }
                 }
             }
-            verts[layer] = t.getBackingArray();
             count[layer] = t.getVertexCount();
             floatCount[layer] = count[layer] * Tesselator.FLOATS_PER_VERTEX;
+            // Copy out, do not hand over the builder's array: it is reused by the next
+            // section on this thread, and it is sized for the worst case that thread has
+            // seen — keeping it would pin ~5x the bytes this mesh needs until the render
+            // thread gets around to uploading it, and the queue of built-but-not-yet-
+            // uploaded sections is what ran the heap out of memory.
+            verts[layer] = count[layer] == 0
+                ? NO_VERTS
+                : java.util.Arrays.copyOf(t.getBackingArray(), floatCount[layer]);
         }
         sec.pendingMesh.set(new MeshData(verts, floatCount, count));
     }

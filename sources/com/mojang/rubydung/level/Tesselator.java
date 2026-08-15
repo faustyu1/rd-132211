@@ -116,9 +116,10 @@ public class Tesselator {
     public int getVertexCount() { return vertices; }
 
     /**
-     * Returns the raw backing array (may be larger than the live data). Valid range is
-     * the first {@code getVertexCount() * 9} floats. Only safe when this Tesselator is
-     * not reused afterwards (e.g. a throwaway chunk-build instance).
+     * Returns the raw backing array, which is usually larger than the live data and is
+     * reused by the next build on this thread. Valid range is the first
+     * {@code getVertexCount() * FLOATS_PER_VERTEX} floats, and the caller must copy what
+     * it wants to keep before touching this Tesselator again.
      */
     public float[] getBackingArray() { return data; }
 }
