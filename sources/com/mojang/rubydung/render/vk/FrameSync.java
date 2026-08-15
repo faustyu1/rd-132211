@@ -117,11 +117,17 @@ public class FrameSync {
     public VkCommandBuffer cmd() { return commandBuffers[frameIndex]; }
 
     /**
-     * Begin a frame: wait for fence, acquire image, reset pool, begin cmd, transition to
-     * color attachment, begin dynamic rendering with the given clear color.
+     * Open the frame's command buffer: wait for the fence, acquire an image, reset the pool
+     * and put the attachments into the layouts rendering needs.
+     *
+     * Rendering itself is <em>not</em> started here. Chunk meshes are copied from staging
+     * into the vertex arena on this same command buffer, and a copy cannot be recorded inside
+     * a render pass — so the frame gets a transfer phase first and
+     * {@link #beginRendering} runs once that is done.
+     *
      * @return false if the swapchain is out of date and the frame should be skipped.
      */
-    public boolean begin(float cr, float cg, float cb) {
+    public boolean beginCommands() {
         try (MemoryStack stack = stackPush()) {
             vkWaitForFences(ctx.device, inFlight[frameIndex], true, Long.MAX_VALUE);
 
@@ -152,6 +158,14 @@ public class FrameSync {
                 VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
                 0, VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
                 VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT);
+            return true;
+        }
+    }
+
+    /** Start dynamic rendering into the acquired image, clearing it to the given colour. */
+    public void beginRendering(float cr, float cg, float cb) {
+        try (MemoryStack stack = stackPush()) {
+            VkCommandBuffer cmd = commandBuffers[frameIndex];
 
             VkRenderingAttachmentInfoKHR.Buffer colorAtt = VkRenderingAttachmentInfoKHR.calloc(1, stack)
                 .sType(VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR)
@@ -178,7 +192,6 @@ public class FrameSync {
             renderingInfo.renderArea().extent().set(swapchain.width, swapchain.height);
 
             vkCmdBeginRenderingKHR(cmd, renderingInfo);
-            return true;
         }
     }
 

@@ -28,7 +28,7 @@ need() {
 # picking the classifier matching the JVM arch (macos / macos-arm64).
 CP="$DIR/target/classes:$DIR/resources"
 natives=0
-for a in lwjgl lwjgl-glfw lwjgl-vulkan lwjgl-shaderc; do
+for a in lwjgl lwjgl-glfw lwjgl-vulkan lwjgl-stb; do
   need "$M2/org/lwjgl/$a/$V/$a-$V.jar"
   CP="$CP:$M2/org/lwjgl/$a/$V/$a-$V.jar"
   for n in natives-macos natives-macos-arm64; do
@@ -46,6 +46,5 @@ CP="$CP:$M2/com/github/luben/zstd-jni/$ZSTD/zstd-jni-$ZSTD.jar"
 
 exec "$JAVA" \
   -XstartOnFirstThread \
-  -Dapple.awt.UIElement=true \
   -cp "$CP" \
   com.mojang.rubydung.RubyDung

@@ -22,7 +22,7 @@ need() {
 }
 
 CP="resources"
-for a in lwjgl lwjgl-glfw lwjgl-vulkan lwjgl-shaderc; do
+for a in lwjgl lwjgl-glfw lwjgl-vulkan lwjgl-stb; do
   need "$M2/org/lwjgl/$a/$V/$a-$V.jar"
   CP="$CP:$M2/org/lwjgl/$a/$V/$a-$V.jar"
 done

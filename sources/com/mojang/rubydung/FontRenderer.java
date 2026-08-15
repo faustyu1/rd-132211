@@ -5,14 +5,26 @@ import com.mojang.rubydung.render.vk.GameRenderer;
 import com.mojang.rubydung.render.vk.Pipelines;
 import com.mojang.rubydung.render.vk.VkTexture;
 
-import java.awt.*;
-import java.awt.image.BufferedImage;
+import java.io.InputStream;
 import java.nio.ByteBuffer;
+import java.nio.file.Files;
+import java.nio.file.Path;
+
+import org.lwjgl.stb.STBTTFontinfo;
+import org.lwjgl.stb.STBTruetype;
+import org.lwjgl.system.MemoryStack;
 import org.lwjgl.system.MemoryUtil;
 
 /**
- * Bitmap font atlas built from a system font at init time.
- * Covers ASCII printable + Cyrillic (U+0400–U+04FF).
+ * Bitmap font atlas rasterised from a TrueType file at init time, covering ASCII printable
+ * plus Cyrillic (U+0400–U+04FF).
+ *
+ * The glyphs used to come from {@code java.awt.Font("SansSerif")}, which dragged the whole
+ * AWT stack into a Vulkan game and — worse — resolved to a different typeface with different
+ * metrics on every operating system, so a layout tuned on one machine drifted on the next.
+ * A font file is rasterised with stb_truetype instead: ship {@code resources/font.ttf} and
+ * every platform gets identical text. Failing that a known system font is used, which keeps
+ * the game running but gives up that guarantee.
  */
 public class FontRenderer {
     private VkTexture texture;
@@ -46,57 +58,122 @@ public class FontRenderer {
      */
     private static final int PAD = 4;
 
+    /** Bold faces first: this atlas is the game's only font and reads better heavy. */
+    private static final String[] SYSTEM_FONTS = {
+        "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "C:\\Windows\\Fonts\\arialbd.ttf",
+        "C:\\Windows\\Fonts\\segoeuib.ttf",
+    };
+
     public FontRenderer(int fontSize) {
-        System.setProperty("java.awt.headless", "true");
-        // BOLD, and built large enough that the biggest text in the UI is barely upscaled:
-        // this atlas is the only font in the game, from 12px labels to the 52px logo.
-        Font font = new Font("SansSerif", Font.BOLD, fontSize);
-        BufferedImage tmp = new BufferedImage(1, 1, BufferedImage.TYPE_INT_ARGB);
-        Graphics2D gtmp = tmp.createGraphics();
-        gtmp.setFont(font);
-        FontMetrics fm = gtmp.getFontMetrics();
-        glyphH = fm.getHeight();
+        ByteBuffer ttf = loadFont();
+        STBTTFontinfo info = STBTTFontinfo.create();
+        if (!STBTruetype.stbtt_InitFont(info, ttf))
+            throw new RuntimeException("stb_truetype could not parse the font");
+
+        float scale = STBTruetype.stbtt_ScaleForPixelHeight(info, fontSize);
+        int ascentPx, rowHeight;
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            var ascent = stack.mallocInt(1);
+            var descent = stack.mallocInt(1);
+            var lineGap = stack.mallocInt(1);
+            STBTruetype.stbtt_GetFontVMetrics(info, ascent, descent, lineGap);
+            ascentPx = Math.round(ascent.get(0) * scale);
+            // same definition AWT's FontMetrics.getHeight() used, so the UI's line spacing
+            // and every box sized from glyphH keep their proportions
+            rowHeight = Math.round((ascent.get(0) - descent.get(0) + lineGap.get(0)) * scale);
+        }
+        glyphH = rowHeight;
+
+        // lay the glyphs out in rows, exactly as the atlas was packed before
         int rowH = glyphH + PAD;
         int x = 0, row = 0;
-        for (int i = 0; i < RANGES.length(); i++) {
-            char c = RANGES.charAt(i);
-            int w = fm.charWidth(c);
-            // wrap onto a new row instead of running off the end of the atlas
-            if (x + w + PAD > atlasW) { x = 0; row++; }
-            charIndex.put(c, i);
-            charX[i] = x;
-            charY[i] = row * rowH;
-            charW[i] = w;
-            x += w + PAD;
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            var advance = stack.mallocInt(1);
+            var bearing = stack.mallocInt(1);
+            for (int i = 0; i < RANGES.length(); i++) {
+                char c = RANGES.charAt(i);
+                STBTruetype.stbtt_GetCodepointHMetrics(info, c, advance, bearing);
+                int w = Math.round(advance.get(0) * scale);
+                if (x + w + PAD > atlasW) { x = 0; row++; }
+                charIndex.put(c, i);
+                charX[i] = x;
+                charY[i] = row * rowH;
+                charW[i] = w;
+                x += w + PAD;
+            }
         }
-        gtmp.dispose();
         fallbackIndex = charIndex.getOrDefault('?', 0);
         atlasH = nextPow2((row + 1) * rowH);
 
-        BufferedImage atlas = new BufferedImage(atlasW, atlasH, BufferedImage.TYPE_INT_ARGB);
-        Graphics2D g = atlas.createGraphics();
-        g.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
-        g.setFont(font);
-        g.setColor(new Color(0, 0, 0, 0));
-        g.fillRect(0, 0, atlasW, atlasH);
-        g.setColor(Color.WHITE);
-        for (int i = 0; i < RANGES.length(); i++) {
-            g.drawString(String.valueOf(RANGES.charAt(i)), charX[i], charY[i] + fm.getAscent());
-        }
-        g.dispose();
+        // Rasterise coverage into an 8-bit atlas, then expand to white-with-alpha. Drawing
+        // straight into the RGBA buffer would mean stb writing every fourth byte.
+        byte[] coverage = new byte[atlasW * atlasH];
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            var x0 = stack.mallocInt(1);
+            var y0 = stack.mallocInt(1);
+            var x1 = stack.mallocInt(1);
+            var y1 = stack.mallocInt(1);
+            for (int i = 0; i < RANGES.length(); i++) {
+                char c = RANGES.charAt(i);
+                STBTruetype.stbtt_GetCodepointBitmapBox(info, c, scale, scale, x0, y0, x1, y1);
+                int gw = x1.get(0) - x0.get(0), gh = y1.get(0) - y0.get(0);
+                if (gw <= 0 || gh <= 0) continue;   // space and friends have no ink
 
-        int[] px = new int[atlasW * atlasH];
-        atlas.getRGB(0, 0, atlasW, atlasH, px, 0, atlasW);
+                ByteBuffer glyph = MemoryUtil.memAlloc(gw * gh);
+                STBTruetype.stbtt_MakeCodepointBitmap(info, glyph, gw, gh, gw, scale, scale, c);
+                int dstX = charX[i] + Math.max(0, x0.get(0));
+                int dstY = charY[i] + ascentPx + y0.get(0);
+                for (int gy = 0; gy < gh; gy++) {
+                    int ay = dstY + gy;
+                    if (ay < 0 || ay >= atlasH) continue;
+                    for (int gx = 0; gx < gw; gx++) {
+                        int ax = dstX + gx;
+                        if (ax < 0 || ax >= atlasW) continue;
+                        coverage[ay * atlasW + ax] = glyph.get(gy * gw + gx);
+                    }
+                }
+                MemoryUtil.memFree(glyph);
+            }
+        }
+        MemoryUtil.memFree(ttf);
+
         ByteBuffer buf = MemoryUtil.memAlloc(atlasW * atlasH * 4);
-        for (int p : px) {
-            buf.put((byte)((p >> 16) & 0xFF)); // R
-            buf.put((byte)((p >>  8) & 0xFF)); // G
-            buf.put((byte)( p        & 0xFF)); // B
-            buf.put((byte)((p >> 24) & 0xFF)); // A
+        for (byte cov : coverage) {
+            buf.put((byte) 0xFF).put((byte) 0xFF).put((byte) 0xFF).put(cov);
         }
         buf.flip();
         texture = GameRenderer.instance.createTexture(atlasW, atlasH, buf, true);
         MemoryUtil.memFree(buf);
+    }
+
+    /** Prefer the bundled font, so text is identical on every platform. */
+    private static ByteBuffer loadFont() {
+        try (InputStream in = FontRenderer.class.getResourceAsStream("/font.ttf")) {
+            if (in != null) return toBuffer(in.readAllBytes());
+        } catch (Exception ignored) {}
+
+        for (String path : SYSTEM_FONTS) {
+            try {
+                Path p = Path.of(path);
+                if (Files.isReadable(p)) {
+                    System.out.println("[font] resources/font.ttf missing, falling back to " + path);
+                    return toBuffer(Files.readAllBytes(p));
+                }
+            } catch (Exception ignored) {}
+        }
+        throw new RuntimeException("no font available: put a TrueType file at resources/font.ttf");
+    }
+
+    private static ByteBuffer toBuffer(byte[] bytes) {
+        ByteBuffer buf = MemoryUtil.memAlloc(bytes.length);
+        buf.put(bytes).flip();
+        return buf;
     }
 
     /** Width of a string at a scale factor, in screen pixels. */

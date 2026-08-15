@@ -10,11 +10,33 @@ import static org.lwjgl.system.MemoryStack.stackPush;
 import static org.lwjgl.vulkan.KHRDynamicRendering.VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO_KHR;
 import static org.lwjgl.vulkan.VK10.*;
 
-/** Builds the shared pipeline layout and all graphics pipelines. Vertex format: pos3+uv2+color4+light2 (44B). */
+/**
+ * Builds the shared pipeline layout and all graphics pipelines. Two vertex formats are in
+ * play:
+ *
+ * <ul>
+ *   <li>the chunk format, 16 bytes of packed integers plus a per-instance section origin,
+ *       used by the two CHUNK_* pipelines;</li>
+ *   <li>the streaming format, 44 bytes of floats, used by everything the Tesselator feeds —
+ *       UI, text, particles, dropped items, name tags.</li>
+ * </ul>
+ */
 public class Pipelines {
-    public static final int VERTEX_STRIDE = 44; // 11 floats
+    /** Streaming (Tesselator) vertex: pos3 + uv2 + color4 + light2. */
+    public static final int VERTEX_STRIDE = 44;
+    /** Packed chunk vertex, see ChunkTesselator. */
+    public static final int CHUNK_VERTEX_STRIDE = 16;
+    /** Per-instance chunk section origin: three floats. */
+    public static final int CHUNK_INSTANCE_STRIDE = 12;
 
-    public enum Pipeline { WORLD_OPAQUE, WORLD_TRANSLUCENT, OVERLAY_3D, LINES, UI, UI_LINES, UI_INVERT }
+    public enum Pipeline {
+        CHUNK_OPAQUE, CHUNK_WATER,
+        WORLD_OPAQUE, WORLD_TRANSLUCENT, OVERLAY_3D, LINES, UI, UI_LINES, UI_INVERT
+    }
+
+    private static boolean isChunk(Pipeline p) {
+        return p == Pipeline.CHUNK_OPAQUE || p == Pipeline.CHUNK_WATER;
+    }
 
     private final VkContext ctx;
     public long pipelineLayout = VK_NULL_HANDLE;
@@ -22,6 +44,8 @@ public class Pipelines {
 
     private long vertModule = VK_NULL_HANDLE;
     private long fragModule = VK_NULL_HANDLE;
+    private long chunkVertModule = VK_NULL_HANDLE;
+    private long chunkFragModule = VK_NULL_HANDLE;
 
     public Pipelines(VkContext ctx, DescriptorAllocator descriptors, int colorFormat, int depthFormat) {
         this.ctx = ctx;
@@ -30,9 +54,10 @@ public class Pipelines {
         for (Pipeline p : Pipeline.values()) {
             pipelines[p.ordinal()] = build(p, colorFormat, depthFormat);
         }
-        // modules can be destroyed after pipeline creation
         vkDestroyShaderModule(ctx.device, vertModule, null);
         vkDestroyShaderModule(ctx.device, fragModule, null);
+        vkDestroyShaderModule(ctx.device, chunkVertModule, null);
+        vkDestroyShaderModule(ctx.device, chunkFragModule, null);
     }
 
     public long get(Pipeline p) { return pipelines[p.ordinal()]; }
@@ -56,12 +81,10 @@ public class Pipelines {
     }
 
     private void createModules() {
-        ByteBuffer vertSpv = ShaderCompiler.compileResource("/shaders/main.vert", ShaderCompiler.VERTEX);
-        ByteBuffer fragSpv = ShaderCompiler.compileResource("/shaders/main.frag", ShaderCompiler.FRAGMENT);
-        vertModule = createModule(vertSpv);
-        fragModule = createModule(fragSpv);
-        org.lwjgl.system.MemoryUtil.memFree(vertSpv);
-        org.lwjgl.system.MemoryUtil.memFree(fragSpv);
+        vertModule = createModule(ShaderCompiler.loadVertex("main"));
+        fragModule = createModule(ShaderCompiler.loadFragment("main"));
+        chunkVertModule = createModule(ShaderCompiler.loadVertex("chunk"));
+        chunkFragModule = createModule(ShaderCompiler.loadFragment("chunk"));
     }
 
     private long createModule(ByteBuffer spv) {
@@ -72,40 +95,63 @@ public class Pipelines {
             LongBuffer pModule = stack.mallocLong(1);
             if (vkCreateShaderModule(ctx.device, ci, null, pModule) != VK_SUCCESS)
                 throw new RuntimeException("vkCreateShaderModule failed");
+            org.lwjgl.system.MemoryUtil.memFree(spv);
             return pModule.get(0);
         }
     }
 
     private long build(Pipeline p, int colorFormat, int depthFormat) {
+        boolean chunk = isChunk(p);
         boolean lines = (p == Pipeline.LINES || p == Pipeline.UI_LINES);
-        boolean depthTest = (p == Pipeline.WORLD_OPAQUE || p == Pipeline.WORLD_TRANSLUCENT || p == Pipeline.LINES);
-        // layer 1 (WORLD_TRANSLUCENT) carries water AND shaded opaque faces; it must write
-        // depth so those opaque faces occlude geometry behind them (otherwise caves show
-        // through solid blocks). Water alpha (0.65) tolerates depth-write fine here.
-        boolean depthWrite = (p == Pipeline.WORLD_OPAQUE || p == Pipeline.WORLD_TRANSLUCENT);
-        boolean blend = (p != Pipeline.WORLD_OPAQUE);
+        boolean depthTest = chunk || p == Pipeline.WORLD_OPAQUE || p == Pipeline.WORLD_TRANSLUCENT
+                            || p == Pipeline.LINES;
+        // Water writes colour but not depth: two water surfaces seen through each other have
+        // to both survive the depth test for the blend to mean anything. The renderer draws
+        // water sections back to front to keep the blend order right without sorting quads.
+        boolean depthWrite = (p == Pipeline.CHUNK_OPAQUE || p == Pipeline.WORLD_OPAQUE
+                              || p == Pipeline.WORLD_TRANSLUCENT);
+        boolean blend = (p != Pipeline.CHUNK_OPAQUE && p != Pipeline.WORLD_OPAQUE);
+
+        // Chunk geometry has consistent winding and closed blocks, so the far side of every
+        // face is genuinely invisible. Water keeps both sides: its surface has to be there
+        // when the camera is under it. -Drd.noCull=true disables this if a mesh ever regresses.
+        boolean cullBack = p == Pipeline.CHUNK_OPAQUE
+                           && !"true".equalsIgnoreCase(System.getProperty("rd.noCull"));
 
         try (MemoryStack stack = stackPush()) {
             VkPipelineShaderStageCreateInfo.Buffer stages = VkPipelineShaderStageCreateInfo.calloc(2, stack);
             stages.get(0)
                 .sType(VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO)
                 .stage(VK_SHADER_STAGE_VERTEX_BIT)
-                .module(vertModule)
+                .module(chunk ? chunkVertModule : vertModule)
                 .pName(stack.UTF8("main"));
             stages.get(1)
                 .sType(VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO)
                 .stage(VK_SHADER_STAGE_FRAGMENT_BIT)
-                .module(fragModule)
+                .module(chunk ? chunkFragModule : fragModule)
                 .pName(stack.UTF8("main"));
 
-            // vertex input: one interleaved binding, 3 attributes
-            VkVertexInputBindingDescription.Buffer binding = VkVertexInputBindingDescription.calloc(1, stack)
-                .binding(0).stride(VERTEX_STRIDE).inputRate(VK_VERTEX_INPUT_RATE_VERTEX);
-            VkVertexInputAttributeDescription.Buffer attrs = VkVertexInputAttributeDescription.calloc(4, stack);
-            attrs.get(0).location(0).binding(0).format(VK_FORMAT_R32G32B32_SFLOAT).offset(0);   // pos
-            attrs.get(1).location(1).binding(0).format(VK_FORMAT_R32G32_SFLOAT).offset(12);      // uv
-            attrs.get(2).location(2).binding(0).format(VK_FORMAT_R32G32B32A32_SFLOAT).offset(20);// color
-            attrs.get(3).location(3).binding(0).format(VK_FORMAT_R32G32_SFLOAT).offset(36);      // light (sky, block)
+            VkVertexInputBindingDescription.Buffer binding;
+            VkVertexInputAttributeDescription.Buffer attrs;
+            if (chunk) {
+                binding = VkVertexInputBindingDescription.calloc(2, stack);
+                binding.get(0).binding(0).stride(CHUNK_VERTEX_STRIDE).inputRate(VK_VERTEX_INPUT_RATE_VERTEX);
+                binding.get(1).binding(1).stride(CHUNK_INSTANCE_STRIDE).inputRate(VK_VERTEX_INPUT_RATE_INSTANCE);
+                attrs = VkVertexInputAttributeDescription.calloc(4, stack);
+                // xyz position (1/2048 block) + texture array layer, all packed as uint16
+                attrs.get(0).location(0).binding(0).format(VK_FORMAT_R16G16B16A16_UINT).offset(0);
+                attrs.get(1).location(1).binding(0).format(VK_FORMAT_R8G8B8A8_UNORM).offset(8);   // color
+                attrs.get(2).location(2).binding(0).format(VK_FORMAT_R8G8B8A8_UNORM).offset(12);  // u,v,sky,block
+                attrs.get(3).location(3).binding(1).format(VK_FORMAT_R32G32B32_SFLOAT).offset(0); // section origin
+            } else {
+                binding = VkVertexInputBindingDescription.calloc(1, stack)
+                    .binding(0).stride(VERTEX_STRIDE).inputRate(VK_VERTEX_INPUT_RATE_VERTEX);
+                attrs = VkVertexInputAttributeDescription.calloc(4, stack);
+                attrs.get(0).location(0).binding(0).format(VK_FORMAT_R32G32B32_SFLOAT).offset(0);   // pos
+                attrs.get(1).location(1).binding(0).format(VK_FORMAT_R32G32_SFLOAT).offset(12);      // uv
+                attrs.get(2).location(2).binding(0).format(VK_FORMAT_R32G32B32A32_SFLOAT).offset(20);// color
+                attrs.get(3).location(3).binding(0).format(VK_FORMAT_R32G32_SFLOAT).offset(36);      // light
+            }
 
             VkPipelineVertexInputStateCreateInfo vertexInput = VkPipelineVertexInputStateCreateInfo.calloc(stack)
                 .sType(VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO)
@@ -126,7 +172,9 @@ public class Pipelines {
                 .depthClampEnable(false)
                 .rasterizerDiscardEnable(false)
                 .polygonMode(lines ? VK_POLYGON_MODE_LINE : VK_POLYGON_MODE_FILL)
-                .cullMode(VK_CULL_MODE_NONE)
+                .cullMode(cullBack ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE)
+                // The viewport has a negative height so GL-style matrices work unchanged, which
+                // also puts screen-space winding back the GL way round: counter-clockwise front.
                 .frontFace(VK_FRONT_FACE_COUNTER_CLOCKWISE)
                 .depthBiasEnable(false)
                 .lineWidth(1.0f);

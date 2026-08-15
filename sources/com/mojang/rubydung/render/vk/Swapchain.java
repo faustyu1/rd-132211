@@ -26,7 +26,7 @@ public class Swapchain {
     // the per-frame fence in FrameSync, which prevents two in-flight frames sharing a
     // depth image and corrupting each other's depth test.
     public long[] depthImages;
-    public long[] depthMemories;
+    public GpuAllocator.Alloc[] depthMemories;
     public long[] depthViews;
     public static final int DEPTH_FORMAT = VK_FORMAT_D32_SFLOAT;
 
@@ -138,7 +138,7 @@ public class Swapchain {
     private void createDepth(MemoryStack stack) {
         int n = FrameSync.FRAMES_IN_FLIGHT;
         depthImages = new long[n];
-        depthMemories = new long[n];
+        depthMemories = new GpuAllocator.Alloc[n];
         depthViews = new long[n];
         for (int i = 0; i < n; i++) {
             VkImageCreateInfo ci = VkImageCreateInfo.calloc(stack)
@@ -160,15 +160,8 @@ public class Swapchain {
 
             VkMemoryRequirements req = VkMemoryRequirements.malloc(stack);
             vkGetImageMemoryRequirements(ctx.device, depthImages[i], req);
-            VkMemoryAllocateInfo ai = VkMemoryAllocateInfo.calloc(stack)
-                .sType(VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO)
-                .allocationSize(req.size())
-                .memoryTypeIndex(ctx.findMemoryType(req.memoryTypeBits(), VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT));
-            LongBuffer pMem = stack.mallocLong(1);
-            if (vkAllocateMemory(ctx.device, ai, null, pMem) != VK_SUCCESS)
-                throw new RuntimeException("vkAllocateMemory (depth) failed");
-            depthMemories[i] = pMem.get(0);
-            vkBindImageMemory(ctx.device, depthImages[i], depthMemories[i], 0);
+            depthMemories[i] = ctx.allocator.allocate(req, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, true);
+            vkBindImageMemory(ctx.device, depthImages[i], depthMemories[i].memory, depthMemories[i].offset);
 
             depthViews[i] = createView(stack, depthImages[i], DEPTH_FORMAT, VK_IMAGE_ASPECT_DEPTH_BIT);
         }
@@ -200,7 +193,7 @@ public class Swapchain {
         if (depthImages != null)
             for (long im : depthImages) if (im != VK_NULL_HANDLE) vkDestroyImage(ctx.device, im, null);
         if (depthMemories != null)
-            for (long m : depthMemories) if (m != VK_NULL_HANDLE) vkFreeMemory(ctx.device, m, null);
+            for (GpuAllocator.Alloc m : depthMemories) ctx.allocator.free(m);
         if (imageViews != null)
             for (long v : imageViews) if (v != VK_NULL_HANDLE) vkDestroyImageView(ctx.device, v, null);
         if (swapchain != VK_NULL_HANDLE) vkDestroySwapchainKHR(ctx.device, swapchain, null);

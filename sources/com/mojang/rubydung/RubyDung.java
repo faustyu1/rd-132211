@@ -9,6 +9,7 @@ import com.mojang.rubydung.net.GameClient;
 import com.mojang.rubydung.net.GameServer;
 import com.mojang.rubydung.render.GL;
 import com.mojang.rubydung.render.vk.GameRenderer;
+import com.mojang.rubydung.render.vk.GpuProfiler;
 import com.mojang.rubydung.render.vk.Pipelines;
 import org.joml.Matrix4f;
 import java.util.HashMap;
@@ -243,8 +244,18 @@ public class RubyDung implements Runnable {
                 }
                 render(timer.a);
                 while (System.currentTimeMillis() >= lastTime + 1000) {
-                    System.out.printf("%d fps, %d chunk updates, fb=%dx%d win=%dx%d%n",
-                        displayFps, WorldChunk.updates, width, height, winWidth, winHeight);
+                    var prof = renderer.profiler;
+                    System.out.printf(
+                        "%d fps, %d chunk updates, mesh %d/%d MB, %d draws, gpu %.2fms "
+                        + "(chunks %.2f water %.2f ui %.2f), fb=%dx%d win=%dx%d%n",
+                        displayFps, WorldChunk.updates,
+                        renderer.chunkArena.usedBytes() >> 20, renderer.chunkArena.reservedBytes() >> 20,
+                        renderer.chunkDrawCount(),
+                        prof.millis(GpuProfiler.Zone.FRAME),
+                        prof.millis(GpuProfiler.Zone.CHUNKS_OPAQUE),
+                        prof.millis(GpuProfiler.Zone.CHUNKS_WATER),
+                        prof.millis(GpuProfiler.Zone.UI),
+                        width, height, winWidth, winHeight);
                     WorldChunk.updates = 0;
                     lastTime += 1000;
                 }
@@ -778,6 +789,7 @@ public class RubyDung implements Runnable {
 
         renderer.disableFog();
 
+        renderer.zoneBegin(GpuProfiler.Zone.ENTITIES);
         particles.render(a);
         if (drops != null) drops.render(a);
 
@@ -785,6 +797,9 @@ public class RubyDung implements Runnable {
         if (breaking && breakProgress > 0f && screen == 0) renderBreakProgress();
 
         renderRemotePlayers(timer.a);
+        renderer.zoneEnd(GpuProfiler.Zone.ENTITIES);
+
+        renderer.zoneBegin(GpuProfiler.Zone.UI);
         renderHud();
 
         if      (screen == 0) { renderCrosshair(); renderHotbar(); renderHealth(); renderChat(); renderTabList(); }
@@ -796,6 +811,7 @@ public class RubyDung implements Runnable {
         else if (screen == 6) renderInventory();
         else if (screen == 7) renderCrafting();
         else if (screen == 10) renderAddServer();
+        renderer.zoneEnd(GpuProfiler.Zone.UI);
 
         renderer.endFrame();
     }

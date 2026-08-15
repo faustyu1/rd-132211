@@ -68,28 +68,50 @@ final class LinearRegionCache {
         }
     }
 
-    /** Store one chunk and rewrite its region file. False means nothing reached disk. */
-    synchronized boolean write(File d, int cx, int cz, byte[] blocks, int timestamp) {
-        int rx = LinearRegionFile.regionOf(cx), rz = LinearRegionFile.regionOf(cz);
-        try {
-            LinearRegionFile.Region r = region(d, rx, rz);
-            byte[] previous = r.get(cx, cz);
-            r.put(cx, cz, blocks, timestamp);
+    /** One chunk's blocks waiting to be stored. */
+    record Entry(int cx, int cz, byte[] blocks) {}
+
+    /**
+     * Store several chunks, rewriting each touched region file once. Writing them one by
+     * one costs a full zstd compression of the whole 32x32 region per chunk, which is what
+     * made an autosave after a building session stutter; a batch pays it once per region.
+     * Returns the region keys that failed, so the caller can keep those chunks in memory
+     * rather than dropping the only copy of somebody's edits.
+     */
+    synchronized java.util.Set<Long> writeBatch(File d, List<Entry> entries, int timestamp) {
+        java.util.Set<Long> failed = new java.util.HashSet<>();
+        Map<Long, List<Entry>> byRegion = new java.util.HashMap<>();
+        for (Entry e : entries)
+            byRegion.computeIfAbsent(regionKeyOf(e.cx(), e.cz()), k -> new ArrayList<>()).add(e);
+
+        for (var group : byRegion.entrySet()) {
+            int rx = (int) (group.getKey() >> 32), rz = (int) (long) group.getKey();
             try {
-                LinearRegionFile.write(d, r);
-            } catch (Exception writeFailed) {
-                // keep the cache honest about what is on disk, so a later read does not
-                // hand back a chunk that was never written
-                r.put(cx, cz, previous, timestamp);
-                throw writeFailed;
+                LinearRegionFile.Region r = region(d, rx, rz);
+                List<byte[]> previous = new ArrayList<>();
+                for (Entry e : group.getValue()) previous.add(r.get(e.cx(), e.cz()));
+                try {
+                    for (Entry e : group.getValue()) r.put(e.cx(), e.cz(), e.blocks(), timestamp);
+                    LinearRegionFile.write(d, r);
+                } catch (Exception writeFailed) {
+                    for (int i = 0; i < previous.size(); i++) {
+                        Entry e = group.getValue().get(i);
+                        r.put(e.cx(), e.cz(), previous.get(i), timestamp);
+                    }
+                    throw writeFailed;
+                }
+            } catch (Exception e) {
+                e.printStackTrace();
+                open.remove(group.getKey());
+                failed.add(group.getKey());
             }
-            return true;
-        } catch (Exception e) {
-            e.printStackTrace();
-            // a half-applied region is worse than a cold one: drop it and re-read next time
-            open.remove(key(rx, rz));
-            return false;
         }
+        return failed;
+    }
+
+    /** The region file key a chunk belongs to; callers use it to match writeBatch failures. */
+    static long regionKeyOf(int cx, int cz) {
+        return key(LinearRegionFile.regionOf(cx), LinearRegionFile.regionOf(cz));
     }
 
     /** Every chunk coordinate stored in the world's region files. */

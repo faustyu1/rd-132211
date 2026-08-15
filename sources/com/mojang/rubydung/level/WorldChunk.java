@@ -2,12 +2,10 @@ package com.mojang.rubydung.level;
 
 import com.mojang.rubydung.phys.AABB;
 import com.mojang.rubydung.render.vk.GameRenderer;
-import com.mojang.rubydung.render.vk.VkBuf;
+import com.mojang.rubydung.render.vk.VertexArena;
 
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
-
-import static org.lwjgl.vulkan.VK10.VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
 
 public class WorldChunk {
     public static final int SIZE = 16;
@@ -35,6 +33,18 @@ public class WorldChunk {
     private static final ThreadLocal<int[]> lightQueue =
         ThreadLocal.withInitial(() -> new int[SIZE * HEIGHT * SIZE]);
 
+    // ---- section visibility graph (occlusion culling) -------------------------
+    // Faces of a section, used both as bit positions and as BFS step directions.
+    public static final int FACE_DOWN = 0, FACE_UP = 1, FACE_NORTH = 2, FACE_SOUTH = 3,
+                            FACE_WEST = 4, FACE_EAST = 5;
+    /** All 6x6 face pairs connected — what an unbuilt section claims, so it is never culled. */
+    public static final long VIS_ALL = (1L << 36) - 1;
+
+    /** The faces sight can leave a section by, having entered through face {@code from}. */
+    public static int visExits(long graph, int from) {
+        return (int) ((graph >>> (from * 6)) & 0x3F);
+    }
+
     /** One renderable vertical slice (16^3). Owns its own mesh + dirty state. */
     private final class Section {
         final int sy;                 // section index 0..SECTIONS-1 (y0 = sy*SECTION)
@@ -42,9 +52,14 @@ public class WorldChunk {
         volatile boolean urgent = false;
         final AtomicBoolean rebuilding = new AtomicBoolean(false);
         final AtomicReference<MeshData> pendingMesh = new AtomicReference<>(null);
-        final VkBuf[] buf = new VkBuf[2];
+        final VertexArena.Slice[] slice = new VertexArena.Slice[2];
         final int[] vertexCount = new int[2];
         final float ay0, ay1;         // world-space Y bounds for frustum test
+        // which faces of this section see each other through non-opaque blocks; the
+        // renderer's flood fill only steps through a section along a connected pair,
+        // which is what keeps buried caves out of the draw list
+        volatile long visGraph = VIS_ALL;
+        int visitStamp = 0;           // render thread only
         Section(int sy) {
             this.sy = sy;
             this.ay0 = sy * SECTION;
@@ -52,16 +67,20 @@ public class WorldChunk {
         }
     }
 
-    // interleaved vertex array per layer (pos3+uv2+color4+light2 = 11 floats/vertex),
-    // trimmed to the vertices actually emitted — see buildSection
-    private record MeshData(float[][] verts, int[] floatCount, int[] count) {}
+    // set by LevelRenderer's visibility pass each frame: which sections to draw
+    public int visMask = 0;
+    public int visFrame = -1;
 
-    private static final float[] NO_VERTS = new float[0];
+    // packed vertex data per layer (16 bytes/vertex, see ChunkTesselator), trimmed to the
+    // vertices actually emitted — see buildSection
+    private record MeshData(int[][] verts, int[] intCount, int[] count) {}
+
+    private static final int[] NO_VERTS = new int[0];
     // One builder per meshing thread instead of two per section. Its buffer grows to the
     // largest section that thread ever built and is then reused, so the pool holds a
     // handful of them rather than allocating a fresh pair for every rebuild.
-    private static final ThreadLocal<Tesselator> meshBuilder =
-        ThreadLocal.withInitial(Tesselator::new);
+    private static final ThreadLocal<ChunkTesselator> meshBuilder =
+        ThreadLocal.withInitial(ChunkTesselator::new);
 
     private final Section[] sections = new Section[SECTIONS];
 
@@ -72,8 +91,37 @@ public class WorldChunk {
     /** Flag this chunk as edited. Only Level's own mutators may call this — the generator must not. */
     public void markModified() { modified = true; }
 
-    public static int rebuiltThisFrame = 0;
+    // Per-frame work budgets. Uploads are what pin built-but-not-yet-uploaded meshes in
+    // the heap, so capping them also caps how much meshing may run ahead of the renderer.
+    private static final int MAX_UPLOADS = 48;
+    private static final int MAX_SCHEDULED = 64;
+    // A section mesh runs from a few KB to a few hundred; 48 large ones in a frame is a
+    // 20 MB memcpy and a visible stall, so the byte budget is what really paces streaming
+    // and the count is only there to bound the per-section overhead.
+    private static final long MAX_UPLOAD_BYTES = 3L << 20;
+    static int uploadsThisFrame = 0;
+    static int scheduledThisFrame = 0;
+    static long uploadedBytesThisFrame = 0;
     public static int updates = 0;
+
+    public static void beginFrame() {
+        uploadsThisFrame = 0;
+        scheduledThisFrame = 0;
+        uploadedBytesThisFrame = 0;
+    }
+
+    private static boolean uploadBudgetLeft() {
+        return uploadsThisFrame < MAX_UPLOADS && uploadedBytesThisFrame < MAX_UPLOAD_BYTES;
+    }
+
+    /**
+     * Meshing pool. Deliberately not the common ForkJoinPool: that is sized at all cores
+     * but one and the chunk generator has a pool of its own, so between them they can keep
+     * every core busy and leave the render thread waiting to be scheduled — streaming then
+     * shows up as frame hitches rather than as background work. See {@link Threads}.
+     */
+    private static final java.util.concurrent.ExecutorService meshPool =
+        java.util.concurrent.Executors.newFixedThreadPool(Threads.MESH, Threads.factory("chunk-mesh"));
 
     private final Level level;
 
@@ -301,17 +349,6 @@ public class WorldChunk {
         for (int sy = s0; sy <= s1; sy++) { sections[sy].dirty = true; if (urgent) sections[sy].urgent = true; }
     }
 
-    /** Schedule a background mesh build for every dirty section (call after generation). */
-    public void scheduleBuild() {
-        for (Section s : sections) {
-            if (!s.dirty) continue;
-            if (s.rebuilding.getAndSet(true)) continue;
-            s.dirty = false;
-            final Section sec = s;
-            java.util.concurrent.ForkJoinPool.commonPool().execute(() -> buildSectionSafe(sec));
-        }
-    }
-
     /** Build all sections synchronously on the calling thread (bulk parallel preload). */
     public void buildNow() {
         for (Section s : sections) {
@@ -343,15 +380,17 @@ public class WorldChunk {
     private static volatile boolean buildFailureLogged = false;
 
     private void buildSection(Section sec) {
-        float[][] verts = new float[2][];
-        int[] floatCount = new int[2];
+        int[][] verts = new int[2][];
+        int[] intCount = new int[2];
         int[] count = new int[2];
         int bx0 = cx * SIZE, bz0 = cz * SIZE;
         int y0 = sec.sy * SECTION, y1 = y0 + SECTION;
 
-        Tesselator t = meshBuilder.get();
+        ChunkTesselator t = meshBuilder.get();
         for (int layer = 0; layer < 2; layer++) {
-            t.init();
+            // positions are stored relative to the section origin; the shader adds it back
+            // from a per-instance attribute, which is what lets sections share a draw call
+            t.init(bx0, y0, bz0);
             for (int lx = 0; lx < SIZE; lx++) {
                 for (int y = y0; y < y1; y++) {
                     for (int lz = 0; lz < SIZE; lz++) {
@@ -369,7 +408,7 @@ public class WorldChunk {
                 }
             }
             count[layer] = t.getVertexCount();
-            floatCount[layer] = count[layer] * Tesselator.FLOATS_PER_VERTEX;
+            intCount[layer] = t.getIntCount();
             // Copy out, do not hand over the builder's array: it is reused by the next
             // section on this thread, and it is sized for the worst case that thread has
             // seen — keeping it would pin ~5x the bytes this mesh needs until the render
@@ -377,9 +416,105 @@ public class WorldChunk {
             // uploaded sections is what ran the heap out of memory.
             verts[layer] = count[layer] == 0
                 ? NO_VERTS
-                : java.util.Arrays.copyOf(t.getBackingArray(), floatCount[layer]);
+                : java.util.Arrays.copyOf(t.getBackingArray(), intCount[layer]);
         }
-        sec.pendingMesh.set(new MeshData(verts, floatCount, count));
+        sec.visGraph = buildVisGraph(sec.sy);
+        sec.pendingMesh.set(new MeshData(verts, intCount, count));
+    }
+
+    // Flood-fill scratch for the visibility graph: 16^3 cells, per meshing thread.
+    private static final ThreadLocal<byte[]> visSeen = ThreadLocal.withInitial(() -> new byte[SECTION * SECTION * SECTION]);
+    private static final ThreadLocal<int[]> visQueue = ThreadLocal.withInitial(() -> new int[SECTION * SECTION * SECTION]);
+
+    /**
+     * Which of a section's 6 faces can see each other through non-opaque blocks. Every
+     * connected pocket of air/water/leaves is flooded once; the faces one pocket touches
+     * are all mutually visible through it. A section of solid rock connects nothing, so
+     * the renderer's flood fill stops there — that is what removes the caves and tunnels
+     * sealed behind it from the draw list.
+     */
+    private long buildVisGraph(int sy) {
+        int y0 = sy * SECTION;
+        byte[] seen = visSeen.get();
+        int[] queue = visQueue.get();
+        java.util.Arrays.fill(seen, (byte) 0);
+        long graph = 0;
+        for (int start = 0; start < SECTION * SECTION * SECTION; start++) {
+            if (seen[start] != 0) continue;
+            seen[start] = 1;
+            if (Tile.isSolid(getBlock(start & 15, y0 + (start >> 8), (start >> 4) & 15))) continue;
+            int faces = 0, head = 0, tail = 0;
+            queue[tail++] = start;
+            while (head < tail) {
+                int idx = queue[head++];
+                int ly = idx >> 8, lz = (idx >> 4) & 15, lx = idx & 15;
+                if (ly == 0)  faces |= 1 << FACE_DOWN;
+                if (ly == 15) faces |= 1 << FACE_UP;
+                if (lz == 0)  faces |= 1 << FACE_NORTH;
+                if (lz == 15) faces |= 1 << FACE_SOUTH;
+                if (lx == 0)  faces |= 1 << FACE_WEST;
+                if (lx == 15) faces |= 1 << FACE_EAST;
+                tail = visPush(lx - 1, ly, lz, y0, seen, queue, tail);
+                tail = visPush(lx + 1, ly, lz, y0, seen, queue, tail);
+                tail = visPush(lx, ly - 1, lz, y0, seen, queue, tail);
+                tail = visPush(lx, ly + 1, lz, y0, seen, queue, tail);
+                tail = visPush(lx, ly, lz - 1, y0, seen, queue, tail);
+                tail = visPush(lx, ly, lz + 1, y0, seen, queue, tail);
+            }
+            for (int a = 0; a < 6; a++) {
+                if ((faces & (1 << a)) == 0) continue;
+                for (int b = 0; b < 6; b++)
+                    if ((faces & (1 << b)) != 0) graph |= 1L << (a * 6 + b);
+            }
+        }
+        return graph;
+    }
+
+    /**
+     * The faces of a section that the single open pocket around (lx,y,lz) touches. The
+     * flood fill starts here, and its section graph — the OR of every pocket in the
+     * section — would let it escape through faces belonging to some other, unrelated
+     * cave. A camera in a dead-end cave should light up that cave and nothing else.
+     * Falls back to all six faces if the cell itself is solid.
+     */
+    public int pocketFaces(int lx, int y, int lz) {
+        if (lx < 0 || lx >= SIZE || lz < 0 || lz >= SIZE || y < 0 || y >= HEIGHT) return 0x3F;
+        if (Tile.isSolid(getBlock(lx, y, lz))) return 0x3F;
+        int y0 = (y / SECTION) * SECTION;
+        byte[] seen = visSeen.get();
+        int[] queue = visQueue.get();
+        java.util.Arrays.fill(seen, (byte) 0);
+        int faces = 0, head = 0, tail = 0;
+        int startIdx = ((y - y0) << 8) | (lz << 4) | lx;
+        seen[startIdx] = 1;
+        queue[tail++] = startIdx;
+        while (head < tail) {
+            int idx = queue[head++];
+            int ly = idx >> 8, lz2 = (idx >> 4) & 15, lx2 = idx & 15;
+            if (ly == 0)  faces |= 1 << FACE_DOWN;
+            if (ly == 15) faces |= 1 << FACE_UP;
+            if (lz2 == 0)  faces |= 1 << FACE_NORTH;
+            if (lz2 == 15) faces |= 1 << FACE_SOUTH;
+            if (lx2 == 0)  faces |= 1 << FACE_WEST;
+            if (lx2 == 15) faces |= 1 << FACE_EAST;
+            tail = visPush(lx2 - 1, ly, lz2, y0, seen, queue, tail);
+            tail = visPush(lx2 + 1, ly, lz2, y0, seen, queue, tail);
+            tail = visPush(lx2, ly - 1, lz2, y0, seen, queue, tail);
+            tail = visPush(lx2, ly + 1, lz2, y0, seen, queue, tail);
+            tail = visPush(lx2, ly, lz2 - 1, y0, seen, queue, tail);
+            tail = visPush(lx2, ly, lz2 + 1, y0, seen, queue, tail);
+        }
+        return faces;
+    }
+
+    private int visPush(int lx, int ly, int lz, int y0, byte[] seen, int[] queue, int tail) {
+        if (lx < 0 || lx > 15 || ly < 0 || ly > 15 || lz < 0 || lz > 15) return tail;
+        int idx = (ly << 8) | (lz << 4) | lx;
+        if (seen[idx] != 0) return tail;
+        seen[idx] = 1;
+        if (Tile.isSolid(getBlock(lx, y0 + ly, lz))) return tail;
+        queue[tail++] = idx;
+        return tail;
     }
 
     private Tile getTile(byte blockType) {
@@ -403,51 +538,98 @@ public class WorldChunk {
         };
     }
 
+    /**
+     * Copy a finished mesh into the vertex arena, if this frame's staging ring still has room
+     * for the whole thing. An all-or-nothing check up front matters: the old slice is only
+     * released once the new data is on its way, so a section is never left with one layer
+     * uploaded and the other pointing at freed memory.
+     */
     private void uploadPending(Section sec) {
-        MeshData mesh = sec.pendingMesh.getAndSet(null);
+        MeshData mesh = sec.pendingMesh.get();
         if (mesh == null) return;
         GameRenderer r = GameRenderer.instance;
+        long need = ((long) mesh.intCount()[0] + mesh.intCount()[1]) * 4;
+        if (need > r.stagingRemaining()) return;   // retry next frame
+        sec.pendingMesh.set(null);
+
         for (int layer = 0; layer < 2; layer++) {
             sec.vertexCount[layer] = mesh.count()[layer];
-            final VkBuf old = sec.buf[layer];
-            if (old != null) r.deleter.enqueue(old::free);
-            sec.buf[layer] = null;
+            final VertexArena.Slice old = sec.slice[layer];
+            // the slice cannot be reused until the frames still drawing it have retired,
+            // or the next upload would overwrite geometry the GPU is reading
+            if (old != null) r.deleter.enqueue(() -> r.freeChunkMesh(old));
+            sec.slice[layer] = null;
             if (mesh.count()[layer] == 0) continue;
-            float[] data = mesh.verts()[layer];
-            int floats = mesh.floatCount()[layer];
-            VkBuf vb = new VkBuf(r.ctx, (long) floats * 4, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
-            vb.upload2(data, 0, floats);
-            sec.buf[layer] = vb;
+            int ints = mesh.intCount()[layer];
+            VertexArena.Slice s = r.allocChunkMesh((long) ints * 4);
+            r.uploadChunkMesh(mesh.verts()[layer], ints, s);
+            sec.slice[layer] = s;
+            uploadedBytesThisFrame += (long) ints * 4;
         }
         updates++;
-        rebuiltThisFrame++;
+        uploadsThisFrame++;
         sec.rebuilding.set(false);
     }
 
-    /** Render this chunk's sections for a layer, skipping sections outside the frustum. */
-    public void render(int layer, Frustum frustum) {
-        float x0 = cx * SIZE, z0 = cz * SIZE, x1 = x0 + SIZE, z1 = z0 + SIZE;
-        for (Section sec : sections) {
-            if (sec.pendingMesh.get() != null) uploadPending(sec);
+    /** True if any section still has a mesh to upload or to rebuild. */
+    public boolean hasWork() {
+        for (Section sec : sections)
+            if (sec.dirty || sec.pendingMesh.get() != null) return true;
+        return false;
+    }
 
-            if (sec.dirty && sec.urgent && !sec.rebuilding.get()) {
+    /**
+     * Move this chunk's meshes forward one step: upload what the pool finished and
+     * schedule what is dirty. Kept out of {@link #render} on purpose — a chunk that is
+     * currently hidden still has to converge, otherwise turning around shows the holes
+     * of everything that went dirty while it was out of sight.
+     */
+    public void pump() {
+        for (Section sec : sections) {
+            if (sec.pendingMesh.get() != null && uploadBudgetLeft()) uploadPending(sec);
+            if (!sec.dirty || sec.rebuilding.get()) continue;
+            if (sec.urgent) {
                 // player edit: rebuild now on this thread and upload immediately (no 1-frame lag)
                 sec.urgent = false;
                 sec.dirty = false;
                 sec.rebuilding.set(true);
                 buildSectionSafe(sec);
                 uploadPending(sec);
-            } else if (sec.dirty && !sec.rebuilding.get() && rebuiltThisFrame < 16) {
+            } else if (scheduledThisFrame < MAX_SCHEDULED && level.neighborsLoaded(cx, cz)) {
+                // meshing before the four neighbours exist would cull the border faces
+                // against air and then need a second pass per neighbour that arrives
+                scheduledThisFrame++;
                 sec.dirty = false;
                 sec.rebuilding.set(true);
                 final Section s = sec;
-                java.util.concurrent.ForkJoinPool.commonPool().execute(() -> buildSectionSafe(s));
+                meshPool.execute(() -> buildSectionSafe(s));
             }
+        }
+    }
 
-            if (sec.vertexCount[layer] == 0 || sec.buf[layer] == null) continue;
-            // per-section frustum cull (vertical slices behind you / above-below are skipped)
-            if (frustum != null && !frustum.cubeInFrustum(x0, sec.ay0, z0, x1, sec.ay1, z1)) continue;
-            GameRenderer.instance.draw(sec.buf[layer], sec.vertexCount[layer]);
+    /** The visibility graph of one section; conservatively "open" until it is meshed. */
+    public long visGraph(int sy) { return sections[sy].visGraph; }
+
+    /** Mark a section visible this frame. False if the flood fill already reached it. */
+    public boolean markVisible(int sy, int stamp) {
+        Section sec = sections[sy];
+        if (sec.visitStamp == stamp) return false;
+        sec.visitStamp = stamp;
+        if (visFrame != stamp) { visFrame = stamp; visMask = 0; }
+        visMask |= 1 << sy;
+        return true;
+    }
+
+    /** Queue the sections the visibility pass selected, for one layer, into the chunk batch. */
+    public void render(int layer, int mask) {
+        GameRenderer r = GameRenderer.instance;
+        float ox = cx * SIZE, oz = cz * SIZE;
+        for (int sy = 0; sy < SECTIONS; sy++) {
+            if ((mask & (1 << sy)) == 0) continue;
+            Section sec = sections[sy];
+            VertexArena.Slice s = sec.slice[layer];
+            if (s == null || sec.vertexCount[layer] == 0) continue;
+            r.addChunkDraw(s, sec.vertexCount[layer], ox, sy * SECTION, oz);
         }
     }
 
@@ -455,9 +637,10 @@ public class WorldChunk {
         GameRenderer r = GameRenderer.instance;
         for (Section sec : sections) {
             for (int layer = 0; layer < 2; layer++) {
-                final VkBuf b = sec.buf[layer];
-                if (b != null && r != null) r.deleter.enqueue(b::free);
-                sec.buf[layer] = null;
+                final VertexArena.Slice s = sec.slice[layer];
+                if (s != null && r != null) r.deleter.enqueue(() -> r.freeChunkMesh(s));
+                sec.slice[layer] = null;
+                sec.vertexCount[layer] = 0;
             }
         }
     }

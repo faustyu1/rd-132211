@@ -31,7 +31,22 @@ public class VkContext {
     public VkDevice device;
     public VkQueue queue;
     public int queueFamily;
+    /** Device ceiling on live vkAllocateMemory calls — chunk meshes must stay well under it. */
+    public int maxMemoryAllocations;
     public VkPhysicalDeviceMemoryProperties memProps;
+    public GpuAllocator allocator;
+
+    // ── optional device features, decided once at device creation ──
+    /** One vkCmdDrawIndexedIndirect may cover many draws instead of one. */
+    public boolean multiDrawIndirect;
+    /** Indirect draws may carry a non-zero firstInstance, which is how a draw finds its chunk origin. */
+    public boolean drawIndirectFirstInstance;
+    public boolean samplerAnisotropy;
+    public float maxAnisotropy = 1f;
+    /** Nanoseconds per timestamp tick; the queue cannot be profiled when validBits is 0. */
+    public float timestampPeriod;
+    public int timestampValidBits;
+    public long minUniformBufferOffsetAlignment = 256;
 
     private long debugMessenger = VK_NULL_HANDLE;
     private final boolean validation;
@@ -44,6 +59,7 @@ public class VkContext {
         createLogicalDevice();
         this.memProps = VkPhysicalDeviceMemoryProperties.malloc();
         vkGetPhysicalDeviceMemoryProperties(physicalDevice, memProps);
+        this.allocator = new GpuAllocator(this);
     }
 
     private void createInstance() {
@@ -178,7 +194,20 @@ public class VkContext {
             if (physicalDevice == null)
                 throw new RuntimeException("No suitable Vulkan device with graphics+present queue");
             vkGetPhysicalDeviceProperties(physicalDevice, props);
-            System.out.println("[vk] using device: " + props.deviceNameString());
+            maxMemoryAllocations = props.limits().maxMemoryAllocationCount();
+            System.out.println("[vk] using device: " + props.deviceNameString()
+                + " (max memory allocations: " + maxMemoryAllocations + ")");
+
+            maxAnisotropy = props.limits().maxSamplerAnisotropy();
+            timestampPeriod = props.limits().timestampPeriod();
+            minUniformBufferOffsetAlignment = Math.max(1, props.limits().minUniformBufferOffsetAlignment());
+
+            // A queue family reporting 0 valid timestamp bits cannot be profiled at all.
+            IntBuffer famCount = stack.mallocInt(1);
+            vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, famCount, null);
+            VkQueueFamilyProperties.Buffer fams = VkQueueFamilyProperties.malloc(famCount.get(0), stack);
+            vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, famCount, fams);
+            timestampValidBits = fams.get(queueFamily).timestampValidBits();
         }
     }
 
@@ -230,7 +259,19 @@ public class VkContext {
                 .sType(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES_KHR)
                 .dynamicRendering(true);
 
-            VkPhysicalDeviceFeatures features = VkPhysicalDeviceFeatures.calloc(stack);
+            // Ask only for what is reported: a device that cannot batch draws still runs, it
+            // just falls back to one vkCmdDrawIndexed per chunk section.
+            VkPhysicalDeviceFeatures available = VkPhysicalDeviceFeatures.calloc(stack);
+            vkGetPhysicalDeviceFeatures(physicalDevice, available);
+            multiDrawIndirect = available.multiDrawIndirect();
+            drawIndirectFirstInstance = available.drawIndirectFirstInstance();
+            samplerAnisotropy = available.samplerAnisotropy();
+            if (!samplerAnisotropy) maxAnisotropy = 1f;
+
+            VkPhysicalDeviceFeatures features = VkPhysicalDeviceFeatures.calloc(stack)
+                .multiDrawIndirect(multiDrawIndirect)
+                .drawIndirectFirstInstance(drawIndirectFirstInstance)
+                .samplerAnisotropy(samplerAnisotropy);
 
             VkDeviceCreateInfo ci = VkDeviceCreateInfo.calloc(stack)
                 .sType(VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO)
@@ -262,6 +303,7 @@ public class VkContext {
     }
 
     public void destroy() {
+        if (allocator != null) allocator.destroy();
         if (memProps != null) memProps.free();
         if (device != null) vkDestroyDevice(device, null);
         if (debugMessenger != VK_NULL_HANDLE) vkDestroyDebugUtilsMessengerEXT(instance, debugMessenger, null);
