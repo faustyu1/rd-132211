@@ -10,49 +10,80 @@ import static org.lwjgl.system.MemoryStack.stackPush;
 import static org.lwjgl.vulkan.VK10.*;
 
 /**
- * Owns the descriptor set layout, pool, and fog UBOs.
- * Layout: binding0 = combined image sampler (FRAG), binding1 = fog UBO (FRAG).
- * Per texture we allocate FRAMES_IN_FLIGHT x 2 sets: [fogOff|fogOn][frame].
+ * Owns the descriptor set layout, pool, and the per-frame fog uniform buffer.
+ * Layout: binding0 = combined image sampler (FRAG), binding1 = dynamic fog UBO (FRAG).
+ *
+ * Fog used to be a second dimension of the descriptor sets — every texture carried a
+ * "fog on" set and a "fog off" set, per frame — even though the shader already reads an
+ * {@code enabled} flag out of the buffer. It is a dynamic uniform buffer instead: the frame
+ * writes each distinct fog state into its own slot and a bind picks one by offset, so a
+ * texture needs one set per frame rather than two, and turning fog off mid-frame costs an
+ * offset rather than a whole parallel set of descriptors.
  */
 public class DescriptorAllocator {
-    public static final int FOG_UBO_SIZE = 32; // vec4 color(16) + start(4)+end(4)+enabled(4)+pad(4)
+    public static final int FOG_UBO_SIZE = 32; // vec4 color(16) + start+end+enabled+brightness
+    /** Distinct fog states one frame may use. Off, world fog, and room to spare. */
+    private static final int SLOTS = 16;
     private static final int MAX_TEXTURES = 64;
 
     private final VkContext ctx;
     public long setLayout = VK_NULL_HANDLE;
     private long pool = VK_NULL_HANDLE;
 
-    // fog UBOs: fogOff is constant; fogOn[frame] updated once per frame
-    public final VkBuf fogOff;
-    public final VkBuf[] fogOn = new VkBuf[FrameSync.FRAMES_IN_FLIGHT];
+    /** Distance between two fog slots, padded up to the device's UBO offset alignment. */
+    public final int slotStride;
+    private final VkBuf[] fogBuf = new VkBuf[FrameSync.FRAMES_IN_FLIGHT];
+    private final int[] slotsUsed = new int[FrameSync.FRAMES_IN_FLIGHT];
+    // params of every slot written this frame, so an unchanged setFog reuses its slot
+    private final float[][][] slotState = new float[FrameSync.FRAMES_IN_FLIGHT][SLOTS][6];
 
     public DescriptorAllocator(VkContext ctx) {
         this.ctx = ctx;
+        long align = Math.max(ctx.minUniformBufferOffsetAlignment, 1);
+        this.slotStride = (int) ((FOG_UBO_SIZE + align - 1) / align * align);
         createSetLayout();
         createPool();
 
-        fogOff = new VkBuf(ctx, FOG_UBO_SIZE, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
-        writeFog(fogOff, 0, 0, 0, 0, 0, false, 1.0f); // disabled, full brightness (UI/HUD)
         for (int i = 0; i < FrameSync.FRAMES_IN_FLIGHT; i++) {
-            fogOn[i] = new VkBuf(ctx, FOG_UBO_SIZE, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
-            writeFog(fogOn[i], 0.5f, 0.8f, 1.0f, 0f, 128f, true, 1.0f);
+            fogBuf[i] = new VkBuf(ctx, (long) slotStride * SLOTS, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+            // slot 0 is the constant "no fog, full brightness" state the UI and HUD draw with
+            writeSlot(i, 0, 0, 0, 0, 0, 0, false, 1.0f);
+            slotsUsed[i] = 1;
         }
     }
 
-    // last-written fog params per frame, to skip redundant rewrites
-    private final float[][] fogOnState = new float[FrameSync.FRAMES_IN_FLIGHT][6];
-
-    public void updateFogOn(int frame, float r, float g, float b, float start, float end, float brightness) {
-        float[] s = fogOnState[frame];
-        if (s[0] == r && s[1] == g && s[2] == b && s[3] == start && s[4] == end && s[5] == brightness) return;
-        s[0] = r; s[1] = g; s[2] = b; s[3] = start; s[4] = end; s[5] = brightness;
-        writeFog(fogOn[frame], r, g, b, start, end, true, brightness);
+    /** Reset the frame's slot ring. Slot 0 stays the constant fog-off state. */
+    public void beginFrame(int frame) {
+        slotsUsed[frame] = 1;
     }
 
-    private void writeFog(VkBuf buf, float r, float g, float b, float start, float end, boolean enabled, float brightness) {
-        ByteBuffer bb = buf.map();
-        bb.putFloat(r).putFloat(g).putFloat(b).putFloat(1.0f); // color vec4
+    /** Byte offset of the fog-off slot. */
+    public int fogOffOffset() { return 0; }
+
+    /**
+     * Byte offset of a slot holding these fog parameters, writing a new one if the frame has
+     * not used them yet. Falls back to reusing the last slot when the ring is exhausted,
+     * which cannot happen with the handful of fog states the game actually sets.
+     */
+    public int fogOffset(int frame, float r, float g, float b, float start, float end, float brightness) {
+        for (int s = 1; s < slotsUsed[frame]; s++) {
+            float[] st = slotState[frame][s];
+            if (st[0] == r && st[1] == g && st[2] == b && st[3] == start && st[4] == end && st[5] == brightness)
+                return s * slotStride;
+        }
+        int slot = slotsUsed[frame] < SLOTS ? slotsUsed[frame]++ : SLOTS - 1;
+        writeSlot(frame, slot, r, g, b, start, end, true, brightness);
+        return slot * slotStride;
+    }
+
+    private void writeSlot(int frame, int slot, float r, float g, float b,
+                           float start, float end, boolean enabled, float brightness) {
+        ByteBuffer bb = fogBuf[frame].map();
+        bb.position(slot * slotStride);
+        bb.putFloat(r).putFloat(g).putFloat(b).putFloat(1.0f);
         bb.putFloat(start).putFloat(end).putFloat(enabled ? 1.0f : 0.0f).putFloat(brightness);
+        float[] st = slotState[frame][slot];
+        st[0] = r; st[1] = g; st[2] = b; st[3] = start; st[4] = end; st[5] = brightness;
     }
 
     private void createSetLayout() {
@@ -65,7 +96,7 @@ public class DescriptorAllocator {
                 .stageFlags(VK_SHADER_STAGE_FRAGMENT_BIT);
             bindings.get(1)
                 .binding(1)
-                .descriptorType(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER)
+                .descriptorType(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC)
                 .descriptorCount(1)
                 .stageFlags(VK_SHADER_STAGE_FRAGMENT_BIT);
 
@@ -81,11 +112,10 @@ public class DescriptorAllocator {
 
     private void createPool() {
         try (MemoryStack stack = stackPush()) {
-            int setsPerTexture = FrameSync.FRAMES_IN_FLIGHT * 2;
-            int maxSets = MAX_TEXTURES * setsPerTexture;
+            int maxSets = MAX_TEXTURES * FrameSync.FRAMES_IN_FLIGHT;
             VkDescriptorPoolSize.Buffer sizes = VkDescriptorPoolSize.calloc(2, stack);
             sizes.get(0).type(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(maxSets);
-            sizes.get(1).type(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER).descriptorCount(maxSets);
+            sizes.get(1).type(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC).descriptorCount(maxSets);
 
             VkDescriptorPoolCreateInfo ci = VkDescriptorPoolCreateInfo.calloc(stack)
                 .sType(VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO)
@@ -98,64 +128,52 @@ public class DescriptorAllocator {
         }
     }
 
-    /** Allocate and write descriptor sets for a texture. Populates tex.descSets (length FRAMES*2). */
+    /** Allocate and write one descriptor set per frame-in-flight for a texture. */
     public void allocateForTexture(VkTexture tex) {
         int frames = FrameSync.FRAMES_IN_FLIGHT;
-        int total = frames * 2;
-        tex.descSets = new long[total];
+        tex.descSets = new long[frames];
         try (MemoryStack stack = stackPush()) {
-            LongBuffer layouts = stack.mallocLong(total);
-            for (int i = 0; i < total; i++) layouts.put(i, setLayout);
+            LongBuffer layouts = stack.mallocLong(frames);
+            for (int i = 0; i < frames; i++) layouts.put(i, setLayout);
 
             VkDescriptorSetAllocateInfo ai = VkDescriptorSetAllocateInfo.calloc(stack)
                 .sType(VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO)
                 .descriptorPool(pool)
                 .pSetLayouts(layouts);
-            LongBuffer pSets = stack.mallocLong(total);
+            LongBuffer pSets = stack.mallocLong(frames);
             if (vkAllocateDescriptorSets(ctx.device, ai, pSets) != VK_SUCCESS)
                 throw new RuntimeException("vkAllocateDescriptorSets failed");
-            for (int i = 0; i < total; i++) tex.descSets[i] = pSets.get(i);
+            for (int i = 0; i < frames; i++) tex.descSets[i] = pSets.get(i);
 
-            // write each set: image = tex, ubo = (fogMode==0 ? fogOff : fogOn[frame])
-            for (int fogMode = 0; fogMode < 2; fogMode++) {
-                for (int frame = 0; frame < frames; frame++) {
-                    int idx = setIndex(fogMode, frame);
-                    long set = tex.descSets[idx];
-                    long ubo = (fogMode == 0) ? fogOff.buffer : fogOn[frame].buffer;
+            for (int frame = 0; frame < frames; frame++) {
+                VkDescriptorImageInfo.Buffer imgInfo = VkDescriptorImageInfo.calloc(1, stack)
+                    .sampler(tex.sampler)
+                    .imageView(tex.view)
+                    .imageLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                // range is what one dynamic offset makes visible, not the whole slot ring
+                VkDescriptorBufferInfo.Buffer bufInfo = VkDescriptorBufferInfo.calloc(1, stack)
+                    .buffer(fogBuf[frame].buffer).offset(0).range(FOG_UBO_SIZE);
 
-                    VkDescriptorImageInfo.Buffer imgInfo = VkDescriptorImageInfo.calloc(1, stack)
-                        .sampler(tex.sampler)
-                        .imageView(tex.view)
-                        .imageLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-                    VkDescriptorBufferInfo.Buffer bufInfo = VkDescriptorBufferInfo.calloc(1, stack)
-                        .buffer(ubo).offset(0).range(FOG_UBO_SIZE);
-
-                    VkWriteDescriptorSet.Buffer writes = VkWriteDescriptorSet.calloc(2, stack);
-                    writes.get(0)
-                        .sType(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET)
-                        .dstSet(set).dstBinding(0).dstArrayElement(0)
-                        .descriptorType(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
-                        .descriptorCount(1)
-                        .pImageInfo(imgInfo);
-                    writes.get(1)
-                        .sType(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET)
-                        .dstSet(set).dstBinding(1).dstArrayElement(0)
-                        .descriptorType(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER)
-                        .descriptorCount(1)
-                        .pBufferInfo(bufInfo);
-                    vkUpdateDescriptorSets(ctx.device, writes, null);
-                }
+                VkWriteDescriptorSet.Buffer writes = VkWriteDescriptorSet.calloc(2, stack);
+                writes.get(0)
+                    .sType(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET)
+                    .dstSet(tex.descSets[frame]).dstBinding(0).dstArrayElement(0)
+                    .descriptorType(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
+                    .descriptorCount(1)
+                    .pImageInfo(imgInfo);
+                writes.get(1)
+                    .sType(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET)
+                    .dstSet(tex.descSets[frame]).dstBinding(1).dstArrayElement(0)
+                    .descriptorType(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC)
+                    .descriptorCount(1)
+                    .pBufferInfo(bufInfo);
+                vkUpdateDescriptorSets(ctx.device, writes, null);
             }
         }
     }
 
-    public static int setIndex(int fogMode, int frame) {
-        return fogMode * FrameSync.FRAMES_IN_FLIGHT + frame;
-    }
-
     public void destroy() {
-        fogOff.free();
-        for (VkBuf b : fogOn) if (b != null) b.free();
+        for (VkBuf b : fogBuf) if (b != null) b.free();
         if (pool != VK_NULL_HANDLE) vkDestroyDescriptorPool(ctx.device, pool, null);
         if (setLayout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(ctx.device, setLayout, null);
     }

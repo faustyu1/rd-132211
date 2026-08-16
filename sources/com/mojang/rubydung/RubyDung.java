@@ -9,7 +9,9 @@ import com.mojang.rubydung.net.GameClient;
 import com.mojang.rubydung.net.GameServer;
 import com.mojang.rubydung.render.GL;
 import com.mojang.rubydung.render.vk.GameRenderer;
+import com.mojang.rubydung.render.vk.GpuProfiler;
 import com.mojang.rubydung.render.vk.Pipelines;
+import com.mojang.rubydung.ui.Ui;
 import org.joml.Matrix4f;
 import java.util.HashMap;
 import java.util.Map;
@@ -19,7 +21,7 @@ import static org.lwjgl.glfw.GLFWVulkan.glfwVulkanSupported;
 
 public class RubyDung implements Runnable {
     /** Shown on the main menu; keep in step with the CHANGELOG release being tagged. */
-    private static final String VERSION = "0.5.1";
+    private static final String VERSION = "0.6.0";
 
     private int width;
     private int height;
@@ -59,6 +61,8 @@ public class RubyDung implements Runnable {
     // multiplayer
     private GameServer server;
     private GameClient client;
+    // last render distance reported to the host, so a settings change reaches it
+    private int sentViewDist = -1;
     private final Map<Integer, RemotePlayer> remotePlayers = new HashMap<>();
     private String ipInput    = "";
     private String portInput  = "25565";
@@ -114,14 +118,14 @@ public class RubyDung implements Runnable {
     private long breakNextMs  = 0;   // ms timestamp: next allowed creative break
     private long placeNextMs  = 0;   // ms timestamp: next allowed place
 
-    // hotbar
-    private static final int[] DEFAULT_HOTBAR = {1, 2, 3, 4, 5, 6, 7, 8, 9};
-    private final int[] hotbar = DEFAULT_HOTBAR.clone();
+    // inventory: 36 stacks, slots 0..8 being the hotbar
+    private final Inventory inv = new Inventory();
     private int selectedSlot = 0;
-    // collected block counts, indexed by block id (survival inventory tally)
-    private final int[] itemCounts = new int[256];
-    // creative inventory: block id currently carried on the cursor (0 = none)
-    private int cursorItem = 0;
+    // the stack held on the mouse while rearranging (id 0 = empty hand)
+    private int cursorId = 0, cursorCount = 0;
+    // slot metrics, shared by the inventory screen and the HUD hotbar so the two match
+    private static final int SLOT = 36, SLOT_GAP = 4, INV_COLS = Inventory.HOTBAR_SIZE;
+    private static final int HEART_SIZE = 16;
     // all placeable block ids shown in the creative palette
     private static final int[] CREATIVE_BLOCKS = {
         Tile.GRASS, Tile.DIRT, Tile.STONE, Tile.GRAVEL, Tile.SAND, Tile.SNOW,
@@ -243,8 +247,18 @@ public class RubyDung implements Runnable {
                 }
                 render(timer.a);
                 while (System.currentTimeMillis() >= lastTime + 1000) {
-                    System.out.printf("%d fps, %d chunk updates, fb=%dx%d win=%dx%d%n",
-                        displayFps, WorldChunk.updates, width, height, winWidth, winHeight);
+                    var prof = renderer.profiler;
+                    System.out.printf(
+                        "%d fps, %d chunk updates, mesh %d/%d MB, %d draws, gpu %.2fms "
+                        + "(chunks %.2f water %.2f ui %.2f), fb=%dx%d win=%dx%d%n",
+                        displayFps, WorldChunk.updates,
+                        renderer.chunkArena.usedBytes() >> 20, renderer.chunkArena.reservedBytes() >> 20,
+                        renderer.chunkDrawCount(),
+                        prof.millis(GpuProfiler.Zone.FRAME),
+                        prof.millis(GpuProfiler.Zone.CHUNKS_OPAQUE),
+                        prof.millis(GpuProfiler.Zone.CHUNKS_WATER),
+                        prof.millis(GpuProfiler.Zone.UI),
+                        width, height, winWidth, winHeight);
                     WorldChunk.updates = 0;
                     lastTime += 1000;
                 }
@@ -285,7 +299,16 @@ public class RubyDung implements Runnable {
             }
             remotePlayers.keySet().retainAll(posMap.keySet());
         }
-        if (client != null && client.isAlive()) {
+        if (client != null && !client.isAlive()) {
+            // the socket died, or the host has been silent past the keepalive timeout
+            addChat("Disconnected from server");
+            stopMultiplayer();
+        }
+        if (client != null) {
+            if (sentViewDist != settings.chunkRadius()) {
+                sentViewDist = settings.chunkRadius();
+                client.sendViewDistance(sentViewDist);
+            }
             client.tick(player.x, player.y, player.z, player.yRot, player.xRot);
             String cm;
             while ((cm = client.pollChat()) != null) addChat(cm);
@@ -395,7 +418,10 @@ public class RubyDung implements Runnable {
                                 String formatted = "<" + name + "> " + msg;
                                 addChat(formatted);
                                 if (server != null) server.broadcastChat(formatted);
-                                else if (client != null) client.sendChat(formatted);
+                                // the host puts the name on it from its own record of who this
+                                // connection is; a client that formatted its own line could
+                                // claim to be anybody
+                                else if (client != null) client.sendChat(msg);
                             }
                         }
                         chatInput = ""; chatOpen = false; Input.blocked = false; continue;
@@ -414,7 +440,9 @@ public class RubyDung implements Runnable {
                     else if (screen == 8) { screen = -1; menuCooldown = 2; }
                     else if (screen == 4) { screen = 5; ipInput = ""; mpStatus = ""; }
                     else if (screen == 10) { screen = 5; }
-                    else if (screen == 5) { screen = (level == null) ? -1 : 1; serverSelected = -1; mpStatus = ""; }
+                    // back to the multiplayer hub, the same place this screen's BACK button
+                    // goes — escape and the button disagreeing is how the hub got lost
+                    else if (screen == 5) { screen = 3; serverSelected = -1; mpStatus = ""; }
                     else if (screen == 3) { screen = (level == null) ? -1 : 1; }
                     else if (screen == 2) { screen = (level == null) ? -1 : 1; glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL); Input.consumeMouseDelta(); }
                     else if (screen == 1) { screen = 0; glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED); Input.consumeMouseDelta(); }
@@ -482,8 +510,7 @@ public class RubyDung implements Runnable {
                 } else if (screen == 7 && (key == GLFW_KEY_C || key == GLFW_KEY_E)) {
                     closeToGame();
                 } else if (screen == 6 && key == GLFW_KEY_E) {
-                    cursorItem = 0;
-                    screen = 0; glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED); Input.consumeMouseDelta();
+                    closeToGame();
                 }
             }
         }
@@ -597,11 +624,10 @@ public class RubyDung implements Runnable {
 
     private void tryPlaceBlock() {
         if (hitResult == null || player.mode == Player.GameMode.SPECTATOR) return;
-        int tileType = hotbar[selectedSlot];
+        int tileType = inv.id(selectedSlot);
         if (tileType == 0) return;            // empty slot: placing nothing must not touch the world
         if (!Items.isPlaceable(tileType)) return; // tools and sticks are not blocks
         boolean survival = player.mode == Player.GameMode.SURVIVAL;
-        if (survival && itemCounts[tileType & 0xFF] <= 0) return; // none of this block collected
         int x = hitResult.x(), y = hitResult.y(), z = hitResult.z();
         switch (hitResult.f()) {
             case 0 -> y--; case 1 -> y++;
@@ -614,7 +640,7 @@ public class RubyDung implements Runnable {
         // non-solid blocks (a torch) may be placed inside the player's own box
         if (!Tile.isSolid((byte) tileType) || !blockAABB.intersects(player.bb)) {
             level.setTile(x, y, z, tileType);
-            if (survival) itemCounts[tileType & 0xFF]--;
+            if (survival) inv.shrink(selectedSlot);   // the held stack pays for the block
             if (client != null) client.sendSetTile(x, y, z, tileType);
             else if (server != null) server.broadcastTile(x, y, z, tileType);
         }
@@ -626,27 +652,20 @@ public class RubyDung implements Runnable {
         particles.spawnBlockBreak(x, y, z, type);
         // stone and ore need the right pickaxe, or they shatter and leave nothing
         boolean yields = player.mode != Player.GameMode.SURVIVAL
-            || Items.canHarvest(hotbar[selectedSlot], type);
+            || Items.canHarvest(inv.id(selectedSlot), type);
         if (drops != null && yields) drops.spawn(x, y, z, dropFor(type));
         level.setTile(x, y, z, 0);
         if (client != null) client.sendSetTile(x, y, z, 0);
         else if (server != null) server.broadcastTile(x, y, z, 0);
     }
 
-    /** Tally a picked-up block; ensure it's reachable on the hotbar. */
+    /**
+     * Put a picked-up block away. {@link Inventory#add} tops up a partial stack before taking
+     * an empty slot and prefers the hotbar, so a pickup lands somewhere reachable. With every
+     * slot full the block is lost — the drop has already been consumed by then.
+     */
     private void collectItem(byte type) {
-        int id = type & 0xFF;
-        itemCounts[id]++;
-        ensureOnHotbar(id);
-    }
-
-    /** Make an id reachable: leave it alone if it is already there, else take an empty slot. */
-    private void ensureOnHotbar(int id) {
-        for (int v : hotbar) if (v == id) return;
-        for (int i = 0; i < hotbar.length; i++) {
-            if (hotbar[i] == 0) { hotbar[i] = id; return; }
-        }
-        hotbar[selectedSlot] = id; // no free slot: replace the held one
+        inv.add(type & 0xFF, 1);
     }
 
     /** What a broken block drops (e.g. grass -> dirt, leaves -> nothing). */
@@ -668,7 +687,7 @@ public class RubyDung implements Runnable {
             breaking = true; breakX = x; breakY = y; breakZ = z; breakProgress = 0f;
         }
         float perTick = (1f / Timer.TICKS_PER_SECOND)
-            * Items.miningSpeed(hotbar[selectedSlot], type) / Math.max(0.05f, Tile.hardness(type));
+            * Items.miningSpeed(inv.id(selectedSlot), type) / Math.max(0.05f, Tile.hardness(type));
         breakProgress += perTick;
         if (breakProgress >= 1f) {
             breakBlock(x, y, z);
@@ -778,6 +797,7 @@ public class RubyDung implements Runnable {
 
         renderer.disableFog();
 
+        renderer.zoneBegin(GpuProfiler.Zone.ENTITIES);
         particles.render(a);
         if (drops != null) drops.render(a);
 
@@ -785,6 +805,9 @@ public class RubyDung implements Runnable {
         if (breaking && breakProgress > 0f && screen == 0) renderBreakProgress();
 
         renderRemotePlayers(timer.a);
+        renderer.zoneEnd(GpuProfiler.Zone.ENTITIES);
+
+        renderer.zoneBegin(GpuProfiler.Zone.UI);
         renderHud();
 
         if      (screen == 0) { renderCrosshair(); renderHotbar(); renderHealth(); renderChat(); renderTabList(); }
@@ -796,6 +819,7 @@ public class RubyDung implements Runnable {
         else if (screen == 6) renderInventory();
         else if (screen == 7) renderCrafting();
         else if (screen == 10) renderAddServer();
+        renderer.zoneEnd(GpuProfiler.Zone.UI);
 
         renderer.endFrame();
     }
@@ -836,6 +860,8 @@ public class RubyDung implements Runnable {
         try {
             server = new GameServer(level, p);
             server.setHostName(nameInput.isEmpty() ? "Host" : nameInput);
+            // the host runs the only fluid simulation there is; clients are told its results
+            level.setFluidSink(server::broadcastFluid);
             mpStatus = "HOSTING ON PORT " + p;
         } catch (Exception ex) {
             mpStatus = "FAILED  " + (ex.getMessage() != null ? ex.getMessage().toUpperCase() : "ERROR");
@@ -846,6 +872,8 @@ public class RubyDung implements Runnable {
         pendingHostPort = 0;
         if (server != null) { server.stop(); server = null; }
         if (client != null) { client.stop(); client = null; }
+        if (level != null) level.setFluidSink(null);
+        sentViewDist = -1;
         remotePlayers.clear();
         mpStatus = "";
     }
@@ -997,6 +1025,7 @@ public class RubyDung implements Runnable {
                             } else {
                                 server = new GameServer(level, p);
                                 server.setHostName(nameInput.isEmpty() ? "Host" : nameInput);
+                                level.setFluidSink(server::broadcastFluid);
                                 mpStatus = "HOSTING ON PORT " + p;
                             }
                         } catch (Exception ex) {
@@ -1004,7 +1033,8 @@ public class RubyDung implements Runnable {
                         }
                     }
                 }
-                else if (h2) { screen = 4; ipInput = ""; editingPort = false; mpStatus = ""; }
+                // JOIN GAME opens the saved servers, which is where DIRECT CONNECT lives too
+                else if (h2) { refreshServerList(); screen = 5; editingPort = false; mpStatus = ""; }
                 else if (h3) {
                     if (server != null || client != null) { stopMultiplayer(); mpStatus = "DISCONNECTED"; }
                     else { screen = (level == null) ? -1 : 1; }
@@ -1094,7 +1124,9 @@ public class RubyDung implements Runnable {
     private void renderServerList() {
         beginOrtho();
         renderOverlay();
-        drawTitle("MULTIPLAYER", height / 2 - 160);
+        // not "MULTIPLAYER": that is the hub this screen is reached from, and two menus
+        // under one title is how the HOST button ends up looking like it does not exist
+        drawTitle("SERVERS", height / 2 - 160);
 
         int listW = 400, entryH = 40, gap = 6;
         int lx = (width - listW) / 2;
@@ -1114,21 +1146,13 @@ public class RubyDung implements Runnable {
 
             GL.glEnable(GL.GL_BLEND);
             GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA);
-            GL.glColor4f(1f, 1f, 1f, sel ? 0.25f : hov ? 0.15f : 0.08f);
-            GL.glBegin(GL.GL_QUADS);
-            GL.glVertex2f(lx, ey); GL.glVertex2f(lx+listW, ey);
-            GL.glVertex2f(lx+listW, ey+entryH); GL.glVertex2f(lx, ey+entryH);
-            GL.glEnd();
-            GL.glColor4f(1f, 1f, 1f, sel ? 1f : 0.4f);
-            GL.glLineWidth(1f);
-            GL.glBegin(GL.GL_LINE_LOOP);
-            GL.glVertex2f(lx+0.5f,ey+0.5f); GL.glVertex2f(lx+listW-0.5f,ey+0.5f);
-            GL.glVertex2f(lx+listW-0.5f,ey+entryH-0.5f); GL.glVertex2f(lx+0.5f,ey+entryH-0.5f);
-            GL.glEnd();
-            GL.glColor4f(1f, 1f, 1f, 1f);
+            Ui.rect(lx, ey, listW, entryH, sel || hov ? Ui.ACCENT_DIM : Ui.RAISED);
+            Ui.border(lx, ey, listW, entryH, 1, sel || hov ? Ui.ACCENT : Ui.EDGE);
+            if (sel) Ui.rect(lx, ey, 2, entryH, Ui.ACCENT);
+            Ui.color(Ui.TEXT);
             String label = s[0];
             drawText(label.substring(0, Math.min(label.length(), 30)), lx + 10, ey + 6, 14);
-            GL.glColor4f(0.7f, 0.7f, 0.7f, 1f);
+            Ui.color(Ui.TEXT_DIM);
             String addr = s[1];
             drawText(addr.substring(0, Math.min(addr.length(), 38)), lx + 10, ey + 22, 12);
         }
@@ -1277,18 +1301,8 @@ public class RubyDung implements Runnable {
     private void drawInputField(int x, int y, int w, int h, String text, boolean focused) {
         GL.glEnable(GL.GL_BLEND);
         GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA);
-        GL.glColor4f(1f, 1f, 1f, focused ? 0.18f : 0.08f);
-        GL.glBegin(GL.GL_QUADS);
-        GL.glVertex2f(x, y); GL.glVertex2f(x+w, y);
-        GL.glVertex2f(x+w, y+h); GL.glVertex2f(x, y+h);
-        GL.glEnd();
-        GL.glColor4f(1f, 1f, 1f, focused ? 1f : 0.5f);
-        GL.glLineWidth(focused ? 2f : 1f);
-        GL.glBegin(GL.GL_LINE_LOOP);
-        GL.glVertex2f(x+0.5f, y+0.5f); GL.glVertex2f(x+w-0.5f, y+0.5f);
-        GL.glVertex2f(x+w-0.5f, y+h-0.5f); GL.glVertex2f(x+0.5f, y+h-0.5f);
-        GL.glEnd();
-        GL.glColor4f(1f, 1f, 1f, 1f);
+        Ui.field(x, y, w, h, focused);
+        Ui.color(Ui.TEXT);
         drawText(text, x + 10, y + (h - 14) / 2, 14);
     }
 
@@ -1304,8 +1318,14 @@ public class RubyDung implements Runnable {
             // host has and only edited chunks ever travel
             client = new GameClient(ipInput, p);
             Level connLevel = new Level(client.worldSeed);
+            // the host owns the water: our own simulation would drift away from its within
+            // seconds, and every flow it moves arrives as a packet instead
+            connLevel.setSimulateFluids(false);
             client.attachLevel(connLevel);
             client.sendName(nameInput.isEmpty() ? "Player" : nameInput);
+            // so the host pushes its edited chunks as far out as we actually draw
+            sentViewDist = settings.chunkRadius();
+            client.sendViewDistance(sentViewDist);
             level = connLevel;                 // only after the connection succeeded
             worldSeedValue = client.worldSeed;
             levelRenderer = new LevelRenderer(level);
@@ -1337,7 +1357,7 @@ public class RubyDung implements Runnable {
         GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA);
 
         int lineH = fontRenderer.glyphH + 4, maxLines = 15, pad = 4;
-        int hotbarTop = height - 40 - 10;
+        int hotbarTop = hotbarTop();
         var msgs  = chatMessages.toArray(new String[0]);
         var times = chatTimes.toArray(new Long[0]);
         long now  = System.currentTimeMillis();
@@ -1352,25 +1372,20 @@ public class RubyDung implements Runnable {
             String line = msgs[i];
             int w = fontRenderer.stringWidth(line);
             int ly = baseY + (i - start) * lineH;
-            GL.glColor4f(0, 0, 0, alpha * 0.5f);
             GL.glDisable(GL.GL_TEXTURE_2D);
-            GL.glBegin(GL.GL_QUADS);
-            GL.glVertex2f(pad, ly); GL.glVertex2f(pad + w + 6, ly);
-            GL.glVertex2f(pad + w + 6, ly + lineH); GL.glVertex2f(pad, ly + lineH);
-            GL.glEnd();
-            fontRenderer.drawString(line, pad + 3, ly + 1, 1, 1, 1, alpha);
+            Ui.rect(pad, ly, w + 6, lineH, Ui.SUNKEN, alpha);
+            fontRenderer.drawString(line, pad + 3, ly + 1,
+                Ui.TEXT[0], Ui.TEXT[1], Ui.TEXT[2], alpha);
         }
 
         if (chatOpen) {
             String prompt = "> " + chatInput;
             int py = hotbarTop;
             GL.glDisable(GL.GL_TEXTURE_2D);
-            GL.glColor4f(0, 0, 0, 0.7f);
-            GL.glBegin(GL.GL_QUADS);
-            GL.glVertex2f(pad, py); GL.glVertex2f(width - pad, py);
-            GL.glVertex2f(width - pad, py + lineH + 4); GL.glVertex2f(pad, py + lineH + 4);
-            GL.glEnd();
-            fontRenderer.drawString(prompt, pad + 3, py + 2, 1, 1, 1, 1);
+            Ui.rect(pad, py, width - pad * 2, lineH + 4, Ui.SUNKEN);
+            Ui.border(pad, py, width - pad * 2, lineH + 4, 1, Ui.ACCENT);
+            fontRenderer.drawString(prompt, pad + 3, py + 2,
+                Ui.TEXT[0], Ui.TEXT[1], Ui.TEXT[2], 1f);
         }
 
         GL.glDisable(GL.GL_BLEND);
@@ -1400,15 +1415,9 @@ public class RubyDung implements Runnable {
         GL.glEnable(GL.GL_BLEND);
         GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA);
 
-        // background panel
-        GL.glColor4f(0, 0, 0, 0.7f);
-        GL.glBegin(GL.GL_QUADS);
-        GL.glVertex2f(px, py); GL.glVertex2f(px + panW, py);
-        GL.glVertex2f(px + panW, py + panH); GL.glVertex2f(px, py + panH);
-        GL.glEnd();
+        Ui.panel(px, py, panW, panH, 26);
 
-        // header
-        GL.glColor4f(1, 1, 1, 1);
+        Ui.color(Ui.TEXT);
         String header = players.size() + " player" + (players.size() != 1 ? "s" : "") + " online";
         drawTextCentered(header, px + panW / 2, py + 8, 12);
 
@@ -1417,13 +1426,10 @@ public class RubyDung implements Runnable {
             int col = i % cols, row = i / cols;
             int cx = px + cellGap + col * (cellW + cellGap);
             int cy = py + 28 + row * (cellH + cellGap);
-            GL.glColor4f(0.4f, 0.4f, 0.4f, 0.8f);
-            GL.glBegin(GL.GL_QUADS);
-            GL.glVertex2f(cx, cy); GL.glVertex2f(cx + cellW, cy);
-            GL.glVertex2f(cx + cellW, cy + cellH); GL.glVertex2f(cx, cy + cellH);
-            GL.glEnd();
-            GL.glColor4f(1, 1, 1, 1);
-            drawSmallText(players.get(i), cx + 6, cy + (cellH - 8) / 2);
+            Ui.rect(cx, cy, cellW, cellH, Ui.RAISED);
+            Ui.rect(cx, cy, 2, cellH, Ui.ACCENT, 0.6f);
+            Ui.color(Ui.TEXT);
+            drawText(players.get(i), cx + 8, cy + (cellH - 12) / 2, 12);
         }
 
         GL.glDisable(GL.GL_BLEND);
@@ -1431,112 +1437,140 @@ public class RubyDung implements Runnable {
     }
 
     /**
-     * Inventory: a palette of every placeable block plus the live hotbar row.
-     * In creative, left-click a palette block to pick it up onto the cursor; left-click a
-     * hotbar slot to drop the cursor item there. Click a hotbar slot with an empty
-     * cursor to pick that slot's block up (swap). Click outside to clear the cursor.
-     * In survival the palette is a read-only catalogue showing what you have collected —
-     * only the hotbar can be rearranged.
+     * Inventory (screen 6): the 27 storage slots above the live hotbar row, and in creative
+     * a palette of every placeable block on top of them.
+     *
+     * Slots hold stacks, so this is the ordinary set of gestures rather than the old
+     * pick-a-block-for-a-hotbar-key screen: left-click swaps the cursor stack with the slot
+     * (merging when the ids match), right-click splits a stack in half or puts a single item
+     * down. A creative palette click fills the cursor with a whole stack. Whatever is left on
+     * the cursor when the screen closes goes back into the inventory rather than vanishing.
      */
     private void renderInventory() {
         boolean creative = player.mode == Player.GameMode.CREATIVE;
-        beginOrtho();
-        renderOverlay();
-        drawTitle(creative ? "CREATIVE INVENTORY" : "INVENTORY", height / 2 - 170);
-
-        // creative shows the full palette; survival shows what has actually been collected
-        int[] palette = creative ? CREATIVE_BLOCKS : ownedItems();
-        int slot = 40, gap = 6, cols = 7;
-        int rows = Math.max(1, (palette.length + cols - 1) / cols);
-        int gridW = cols * (slot + gap) - gap;
-        int gridX = (width - gridW) / 2;
-        int gridY = height / 2 - 120;
         int mx = mouseScreenX(), my = mouseScreenY();
 
+        beginOrtho();
         GL.glEnable(GL.GL_BLEND);
         GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA);
+        Ui.rect(0, 0, width, height, Ui.SCREEN_DIM);
 
-        // palette
+        int gridW = INV_COLS * (SLOT + SLOT_GAP) - SLOT_GAP;
+        int pad = 14, headerH = 28, btnH = 28;
+        int paletteRows = creative ? (CREATIVE_BLOCKS.length + INV_COLS - 1) / INV_COLS : 0;
+        int paletteH = creative ? paletteRows * (SLOT + SLOT_GAP) + 14 : 0;
+        int mainH = 3 * (SLOT + SLOT_GAP);
+        int panelW = gridW + pad * 2;
+        int panelH = headerH + 10 + paletteH + mainH + 8 + SLOT + 14 + btnH + pad;
+        int px = (width - panelW) / 2, py = (height - panelH) / 2;
+        int gx = px + pad;
+
+        Ui.panel(px, py, panelW, panelH, headerH);
+        Ui.color(Ui.TEXT);
+        drawTextCentered(creative ? "CREATIVE INVENTORY" : "INVENTORY", px + panelW / 2, py + 7, 14);
+
+        int y = py + headerH + 10;
+
+        // creative palette: an endless source, so it is drawn but never written to
         int hoveredPalette = -1;
-        for (int i = 0; i < palette.length; i++) {
-            int r = i / cols, c = i % cols;
-            int x = gridX + c * (slot + gap), y = gridY + r * (slot + gap);
-            boolean hov = hover(mx, my, x, y, slot, slot);
-            if (hov) hoveredPalette = i;
-            // survival: no highlight (nothing to click) but show what has been collected
-            drawItemSlot(x, y, slot, palette[i], creative && hov, false,
-                creative ? -1 : itemCounts[palette[i] & 0xFF]);
-        }
-        if (!creative && palette.length == 0) {
-            GL.glColor4f(1, 1, 1, 0.6f);
-            drawSmallText("NOTHING COLLECTED YET", gridX, gridY + 12);
-        }
-
-        // hotbar row label + slots along the bottom of the panel
-        int hbY = gridY + rows * (slot + gap) + 24;
-        drawSmallText("HOTBAR", gridX, hbY - 16);
-        int hotbarW = 9 * (slot + gap) - gap;
-        int hbX = (width - hotbarW) / 2;
-        int hoveredHotbar = -1;
-        for (int i = 0; i < 9; i++) {
-            int x = hbX + i * (slot + gap);
-            boolean hov = hover(mx, my, x, hbY, slot, slot);
-            if (hov) hoveredHotbar = i;
-            drawItemSlot(x, hbY, slot, hotbar[i], hov, i == selectedSlot, itemCounts[hotbar[i] & 0xFF]);
+        if (creative) {
+            for (int i = 0; i < CREATIVE_BLOCKS.length; i++) {
+                int x = gx + (i % INV_COLS) * (SLOT + SLOT_GAP);
+                int sy = y + (i / INV_COLS) * (SLOT + SLOT_GAP);
+                boolean hov = hover(mx, my, x, sy, SLOT, SLOT);
+                if (hov) hoveredPalette = i;
+                drawSlotItem(x, sy, SLOT, CREATIVE_BLOCKS[i], 0, hov, false);
+            }
+            int ruleY = y + paletteRows * (SLOT + SLOT_GAP) + 5;
+            Ui.rect(gx, ruleY, gridW, 1, Ui.EDGE_SOFT);
+            y += paletteH;
         }
 
-        // close button
-        int closeY = hbY + slot + 24;
-        boolean hClose = hover(mx, my, (width - 120) / 2, closeY, 120, 30);
-        drawButton((width - 120) / 2, closeY, 120, 30, "CLOSE", hClose);
-
-        // cursor-carried item follows the mouse
-        if (cursorItem != 0) {
-            float[] col = Items.swatch(cursorItem);
-            GL.glColor4f(col[0], col[1], col[2], 1f);
-            GL.glBegin(GL.GL_QUADS);
-            GL.glVertex2f(mx, my); GL.glVertex2f(mx + 24, my);
-            GL.glVertex2f(mx + 24, my + 24); GL.glVertex2f(mx, my + 24);
-            GL.glEnd();
+        // the 27 storage slots, then the hotbar row a little apart from them
+        int hoveredSlot = -1;
+        for (int i = Inventory.HOTBAR_SIZE; i < Inventory.SIZE; i++) {
+            int k = i - Inventory.HOTBAR_SIZE;
+            int x = gx + (k % INV_COLS) * (SLOT + SLOT_GAP);
+            int sy = y + (k / INV_COLS) * (SLOT + SLOT_GAP);
+            boolean hov = hover(mx, my, x, sy, SLOT, SLOT);
+            if (hov) hoveredSlot = i;
+            drawSlotItem(x, sy, SLOT, inv.id(i), inv.count(i), hov, false);
         }
+        y += mainH + 8;
+        for (int i = 0; i < Inventory.HOTBAR_SIZE; i++) {
+            int x = gx + i * (SLOT + SLOT_GAP);
+            boolean hov = hover(mx, my, x, y, SLOT, SLOT);
+            if (hov) hoveredSlot = i;
+            drawSlotItem(x, y, SLOT, inv.id(i), inv.count(i), hov, i == selectedSlot);
+        }
+        y += SLOT + 14;
 
-        // tooltip for hovered palette block
-        if (hoveredPalette >= 0 && cursorItem == 0) {
-            GL.glColor4f(1, 1, 1, 1);
-            drawSmallText(Items.name(palette[hoveredPalette]), mx + 14, my - 4);
+        int btnW = 120, bx = px + (panelW - btnW) / 2;
+        boolean hClose = hover(mx, my, bx, y, btnW, btnH);
+        Ui.button(bx, y, btnW, btnH, hClose, true);
+        Ui.color(hClose ? Ui.ACCENT : Ui.TEXT);
+        drawTextFitCentered("CLOSE", bx + btnW / 2, y + (btnH - 14) / 2, 14, btnW - 12);
+
+        // the carried stack rides the cursor; the tooltip only shows with an empty hand
+        if (cursorId != 0) {
+            drawItemIcon(mx - 12, my - 12, 24, cursorId, cursorCount);
+        } else {
+            int tip = hoveredPalette >= 0 ? CREATIVE_BLOCKS[hoveredPalette]
+                    : hoveredSlot >= 0 ? inv.id(hoveredSlot) : 0;
+            if (tip != 0) drawTooltip(Items.name(tip), mx + 12, my - 6);
         }
 
         GL.glDisable(GL.GL_BLEND);
 
         for (var e : Input.pollMouseEvents()) {
-            if (e[0] == GLFW_MOUSE_BUTTON_1 && e[1] == GLFW_PRESS) {
-                if (hClose) {
-                    cursorItem = 0;
-                    screen = 0; glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED); Input.consumeMouseDelta();
-                } else if (creative && hoveredPalette >= 0) {
-                    cursorItem = palette[hoveredPalette]; // pick up an infinite stack
-                } else if (hoveredHotbar >= 0) {
-                    if (cursorItem != 0) {
-                        hotbar[hoveredHotbar] = cursorItem;       // place into slot
-                    } else {
-                        cursorItem = hotbar[hoveredHotbar];       // pick the slot's block up
-                    }
-                } else {
-                    cursorItem = 0;                                // click empty space: clear cursor
-                }
-            } else if (e[0] == GLFW_MOUSE_BUTTON_2 && e[1] == GLFW_PRESS) {
-                if (hoveredHotbar >= 0) hotbar[hoveredHotbar] = 0; // right-click clears a slot
+            if (e[1] != GLFW_PRESS) continue;
+            boolean right = e[0] == GLFW_MOUSE_BUTTON_2;
+            if (!right && e[0] != GLFW_MOUSE_BUTTON_1) continue;
+            if (hClose && !right) {
+                closeToGame();
+            } else if (hoveredPalette >= 0 && !right) {
+                cursorId = CREATIVE_BLOCKS[hoveredPalette];   // an endless stack off the palette
+                cursorCount = Items.maxStack(cursorId);
+            } else if (hoveredSlot >= 0) {
+                clickSlot(hoveredSlot, right);
+            } else if (!hover(mx, my, px, py, panelW, panelH)) {
+                returnCursorToInventory();                    // click outside: put it away
             }
         }
         endOrtho();
     }
 
-    /** Ids the player actually owns, blocks first then items, for the survival inventory. */
-    private int[] ownedItems() {
-        int n = 0;
-        int[] owned = new int[itemCounts.length];
-        for (int id = 0; id < itemCounts.length; id++) if (itemCounts[id] > 0) owned[n++] = id;
-        return java.util.Arrays.copyOf(owned, n);
+    /**
+     * Swap, merge or split the cursor stack against slot {@code s} — the whole grammar of the
+     * inventory screen. Nothing here can create or destroy items: every branch moves the same
+     * count out of one place and into the other.
+     */
+    private void clickSlot(int s, boolean right) {
+        int id = inv.id(s), n = inv.count(s);
+        if (cursorId == 0) {
+            if (id == 0) return;
+            int take = right ? (n + 1) / 2 : n;        // right-click takes the larger half
+            cursorId = id; cursorCount = take;
+            inv.set(s, id, n - take);
+        } else if (id == cursorId) {
+            int put = Math.min(Items.maxStack(id) - n, right ? 1 : cursorCount);
+            if (put <= 0) return;                      // the stack there is already full
+            inv.set(s, id, n + put);
+            if ((cursorCount -= put) <= 0) cursorId = 0;
+        } else if (id == 0 && right) {
+            inv.set(s, cursorId, 1);                   // right-click into empty: put one down
+            if (--cursorCount <= 0) cursorId = 0;
+        } else {
+            inv.set(s, cursorId, cursorCount);         // two different stacks: swap them
+            cursorId = id; cursorCount = n;
+        }
+    }
+
+    /** Put the carried stack back where it fits. What does not fit stays on the cursor. */
+    private void returnCursorToInventory() {
+        if (cursorId == 0) return;
+        cursorCount = inv.add(cursorId, cursorCount);
+        if (cursorCount <= 0) { cursorId = 0; cursorCount = 0; }
     }
 
     /**
@@ -1545,59 +1579,60 @@ public class RubyDung implements Runnable {
      * puzzle adds no depth here, and a list makes the whole recipe set discoverable.
      */
     private void renderCrafting() {
-        beginOrtho();
-        renderOverlay();
-        drawTitle("CRAFTING", 40);
-
         int mx = mouseScreenX(), my = mouseScreenY();
+        boolean creative = player.mode == Player.GameMode.CREATIVE;
+        int[] stock = inv.countsById();
+
+        beginOrtho();
         GL.glEnable(GL.GL_BLEND);
         GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA);
+        Ui.rect(0, 0, width, height, Ui.SCREEN_DIM);
 
-        boolean creative = player.mode == Player.GameMode.CREATIVE;
-        int rowH = 40, gap = 5;
-        int listW = Math.min(560, width - 60);
-        int lx = (width - listW) / 2;
-        int top = 104;
+        int rowH = 38, gap = 4, pad = 12, headerH = 28;
+        int listW = Math.min(520, width - 60);
+        int panelW = listW + pad * 2;
+        int panelH = headerH + pad + Items.RECIPES.length * (rowH + gap) + 10 + 28 + pad;
+        int px = (width - panelW) / 2, py = Math.max(10, (height - panelH) / 2);
+        int lx = px + pad;
+
+        Ui.panel(px, py, panelW, panelH, headerH);
+        Ui.color(Ui.TEXT);
+        drawTextCentered("CRAFTING", px + panelW / 2, py + 7, 14);
+
+        int top = py + headerH + pad;
         int hovered = -1;
 
         for (int i = 0; i < Items.RECIPES.length; i++) {
             Items.Recipe r = Items.RECIPES[i];
-            boolean can = creative || Items.canCraft(r, itemCounts);
+            boolean can = creative || (Items.canCraft(r, stock) && inv.hasRoomFor(r.result(), r.count()));
             int y = top + i * (rowH + gap);
             boolean hov = can && hover(mx, my, lx, y, listW, rowH);
             if (hov) hovered = i;
 
-            GL.glColor4f(1f, 1f, 1f, hov ? 0.22f : can ? 0.12f : 0.05f);
-            GL.glBegin(GL.GL_QUADS);
-            GL.glVertex2f(lx, y); GL.glVertex2f(lx + listW, y);
-            GL.glVertex2f(lx + listW, y + rowH); GL.glVertex2f(lx, y + rowH);
-            GL.glEnd();
+            Ui.rect(lx, y, listW, rowH, hov ? Ui.ACCENT_DIM : Ui.RAISED, can ? 1f : 0.5f);
+            Ui.border(lx, y, listW, rowH, 1, hov ? Ui.ACCENT : Ui.EDGE_SOFT);
+            drawItemIcon(lx + 7, y + 7, rowH - 14, r.result(), r.count());
 
-            float[] col = Items.swatch(r.result());
-            float dim = can ? 1f : 0.45f;
-            GL.glColor4f(col[0] * dim, col[1] * dim, col[2] * dim, 1f);
-            GL.glBegin(GL.GL_QUADS);
-            GL.glVertex2f(lx + 8, y + 8); GL.glVertex2f(lx + 32, y + 8);
-            GL.glVertex2f(lx + 32, y + 32); GL.glVertex2f(lx + 8, y + 32);
-            GL.glEnd();
-
-            GL.glColor4f(dim, dim, dim, 1f);
-            String head = Items.name(r.result()) + (r.count() > 1 ? "  X" + r.count() : "");
-            drawSmallText(head, lx + 42, y + 6);
+            Ui.color(can ? Ui.TEXT : Ui.TEXT_DIM);
+            drawText(Items.name(r.result()) + (r.count() > 1 ? "  X" + r.count() : ""), lx + rowH + 4, y + 5, 13);
 
             StringBuilder cost = new StringBuilder();
             for (int k = 0; k < r.need().length; k += 2) {
                 int id = r.need()[k], qty = r.need()[k + 1];
                 if (cost.length() > 0) cost.append("   ");
                 cost.append(Items.name(id)).append(" ")
-                    .append(creative ? qty : Math.min(itemCounts[id & 0xFF], qty)).append("/").append(qty);
+                    .append(creative ? qty : Math.min(stock[id & 0xFF], qty)).append("/").append(qty);
             }
-            drawSmallText(cost.toString(), lx + 42, y + 22);
+            Ui.color(Ui.TEXT_DIM);
+            drawText(cost.toString(), lx + rowH + 4, y + 21, 11);
         }
 
-        int closeY = top + Items.RECIPES.length * (rowH + gap) + 12;
-        boolean hClose = hover(mx, my, (width - 140) / 2, closeY, 140, 32);
-        drawButton((width - 140) / 2, closeY, 140, 32, "CLOSE", hClose);
+        int btnW = 140, btnH = 28;
+        int bx = px + (panelW - btnW) / 2, by = top + Items.RECIPES.length * (rowH + gap) + 10;
+        boolean hClose = hover(mx, my, bx, by, btnW, btnH);
+        Ui.button(bx, by, btnW, btnH, hClose, true);
+        Ui.color(hClose ? Ui.ACCENT : Ui.TEXT);
+        drawTextFitCentered("CLOSE", bx + btnW / 2, by + (btnH - 14) / 2, 14, btnW - 12);
 
         GL.glDisable(GL.GL_BLEND);
 
@@ -1606,52 +1641,64 @@ public class RubyDung implements Runnable {
             if (hClose) {
                 closeToGame();
             } else if (hovered >= 0) {
-                Items.Recipe r = Items.RECIPES[hovered];
-                if (creative) {
-                    itemCounts[r.result() & 0xFF] += r.count();   // creative pays nothing
-                } else if (Items.canCraft(r, itemCounts)) {
-                    Items.craft(r, itemCounts);
-                }
-                ensureOnHotbar(r.result());
+                craft(Items.RECIPES[hovered], creative);
             }
         }
         endOrtho();
     }
 
+    /**
+     * Spend the ingredients and stow the result. Creative pays nothing but still has to find
+     * room — an inventory is a fixed 36 slots in either mode.
+     */
+    private void craft(Items.Recipe r, boolean creative) {
+        if (!inv.hasRoomFor(r.result(), r.count())) return;
+        if (!creative) {
+            if (!Items.canCraft(r, inv.countsById())) return;
+            for (int k = 0; k < r.need().length; k += 2) inv.remove(r.need()[k], r.need()[k + 1]);
+        }
+        inv.add(r.result(), r.count());
+    }
+
     /** Leave an overlay screen and hand control back to the world. */
     private void closeToGame() {
-        cursorItem = 0;
+        returnCursorToInventory();
         screen = 0;
         glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
         Input.consumeMouseDelta();
     }
 
-    /** Draw one inventory slot: background, border, block swatch and optional count. */
-    private void drawItemSlot(int x, int y, int s, int id, boolean hov, boolean sel, int count) {
-        GL.glColor4f(1, 1, 1, sel ? 0.5f : hov ? 0.32f : 0.15f);
-        GL.glBegin(GL.GL_QUADS);
-        GL.glVertex2f(x, y); GL.glVertex2f(x + s, y);
-        GL.glVertex2f(x + s, y + s); GL.glVertex2f(x, y + s);
-        GL.glEnd();
-        if (id != 0) {
-            float[] col = Items.swatch(id);
-            int pad = 6;
-            GL.glColor4f(col[0], col[1], col[2], 1f);
-            GL.glBegin(GL.GL_QUADS);
-            GL.glVertex2f(x + pad, y + pad); GL.glVertex2f(x + s - pad, y + pad);
-            GL.glVertex2f(x + s - pad, y + s - pad); GL.glVertex2f(x + pad, y + s - pad);
-            GL.glEnd();
-            if (count > 0) {
-                GL.glColor4f(1, 1, 1, 1);
-                drawSmallText(String.valueOf(count), x + s - 16, y + s - 12);
-            }
-        }
-        GL.glColor4f(1, 1, 1, sel || hov ? 1f : 0.4f);
-        GL.glLineWidth(sel || hov ? 2f : 1f);
-        GL.glBegin(GL.GL_LINE_LOOP);
-        GL.glVertex2f(x + 0.5f, y + 0.5f); GL.glVertex2f(x + s - 0.5f, y + 0.5f);
-        GL.glVertex2f(x + s - 0.5f, y + s - 0.5f); GL.glVertex2f(x + 0.5f, y + s - 0.5f);
-        GL.glEnd();
+    /** One inventory cell: the shared slot frame with an item drawn inside it. */
+    private void drawSlotItem(int x, int y, int s, int id, int count, boolean hov, boolean sel) {
+        Ui.slot(x, y, s, hov, sel);
+        drawItemIcon(x + 5, y + 5, s - 10, id, count);
+    }
+
+    /**
+     * An item as a colour swatch with its count in the bottom-right corner. Blocks have no
+     * inventory sprites — the swatch is the same colour {@code Items} tints the block with,
+     * which is enough to tell one stack from another.
+     */
+    private void drawItemIcon(int x, int y, int s, int id, int count) {
+        if (id == 0) return;
+        float[] c = Items.swatch(id);
+        Ui.rect(x, y, s, s, new float[]{c[0], c[1], c[2], 1f});
+        Ui.rect(x, y, s, Math.max(1, s / 6), new float[]{1f, 1f, 1f, 0.18f});   // a lit top edge
+        if (count <= 1) return;
+        String n = String.valueOf(count);
+        int h = 11;
+        Ui.color(Ui.TEXT);
+        drawText(n, Math.round(x + s - fontRenderer.width(n, textScale(h))), y + s - h, h);
+    }
+
+    /** A one-line label boxed against the panel behind it, following the mouse. */
+    private void drawTooltip(String text, int x, int y) {
+        int h = 12, w = Math.round(fontRenderer.width(text, textScale(h)));
+        x = Math.min(x, width - w - 10);
+        Ui.rect(x - 4, y - 3, w + 8, h + 6, Ui.PANEL_HEAD);
+        Ui.border(x - 4, y - 3, w + 8, h + 6, 1, Ui.EDGE);
+        Ui.color(Ui.TEXT);
+        drawText(text, x, y, h);
     }
 
     private void renderHud() {
@@ -1671,55 +1718,49 @@ public class RubyDung implements Runnable {
 
     private void renderHotbar() {
         beginOrtho();
-        int slots = 9, slotSize = 40, gap = 2;
-        int totalW = slots * (slotSize + gap) - gap;
-        int startX = (width - totalW) / 2, y = height - slotSize - 10;
+        int totalW = Inventory.HOTBAR_SIZE * (SLOT + SLOT_GAP) - SLOT_GAP;
+        int startX = (width - totalW) / 2, y = hotbarTop();
         GL.glEnable(GL.GL_BLEND);
         GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA);
-        for (int i = 0; i < slots; i++) {
-            int x = startX + i * (slotSize + gap);
-            boolean sel = i == selectedSlot;
-            GL.glColor4f(1, 1, 1, sel ? 0.5f : 0.2f);
-            GL.glBegin(GL.GL_QUADS);
-            GL.glVertex2f(x, y); GL.glVertex2f(x + slotSize, y);
-            GL.glVertex2f(x + slotSize, y + slotSize); GL.glVertex2f(x, y + slotSize);
-            GL.glEnd();
-            GL.glColor4f(1, 1, 1, sel ? 1f : 0.5f);
-            GL.glLineWidth(sel ? 2f : 1f);
-            GL.glBegin(GL.GL_LINE_LOOP);
-            GL.glVertex2f(x + 0.5f, y + 0.5f); GL.glVertex2f(x + slotSize - 0.5f, y + 0.5f);
-            GL.glVertex2f(x + slotSize - 0.5f, y + slotSize - 0.5f); GL.glVertex2f(x + 0.5f, y + slotSize - 0.5f);
-            GL.glEnd();
-
-            // block swatch + collected count
-            int id = hotbar[i];
-            if (id != 0) {
-                float[] col = Items.swatch(id);
-                int pad = 8;
-                GL.glColor4f(col[0], col[1], col[2], 1f);
-                GL.glBegin(GL.GL_QUADS);
-                GL.glVertex2f(x + pad, y + pad); GL.glVertex2f(x + slotSize - pad, y + pad);
-                GL.glVertex2f(x + slotSize - pad, y + slotSize - pad); GL.glVertex2f(x + pad, y + slotSize - pad);
-                GL.glEnd();
-                int count = itemCounts[id & 0xFF];
-                if (count > 0) drawSmallText(String.valueOf(count), x + slotSize - 16, y + slotSize - 12);
-            }
+        // one strip behind the row, so the hotbar reads as a single object over the world
+        Ui.rect(startX - 4, y - 4, totalW + 8, SLOT + 8, Ui.PANEL, 0.75f);
+        Ui.border(startX - 4, y - 4, totalW + 8, SLOT + 8, 1, Ui.EDGE_SOFT);
+        for (int i = 0; i < Inventory.HOTBAR_SIZE; i++) {
+            drawSlotItem(startX + i * (SLOT + SLOT_GAP), y, SLOT, inv.id(i), inv.count(i),
+                false, i == selectedSlot);
+        }
+        // name of what is held, above the row — the only cue for an item with no count
+        int held = inv.id(selectedSlot);
+        if (held != 0) {
+            Ui.color(Ui.TEXT_DIM);
+            drawTextCentered(Items.name(held), width / 2, hudStackTop() - 16, 12);
         }
         GL.glDisable(GL.GL_BLEND);
         endOrtho();
+    }
+
+    /** Top edge of the HUD hotbar; the hearts and the chat log stack on top of it. */
+    private int hotbarTop() { return height - SLOT - 10; }
+
+    /** First free line above the hotbar — hearts and breath bubbles claim rows there first. */
+    private int hudStackTop() {
+        int y = hotbarTop();
+        if (player != null && player.mode == Player.GameMode.SURVIVAL) {
+            y -= HEART_SIZE + 8;
+            if (player.air < Player.MAX_AIR) y -= HEART_SIZE + 4;
+        }
+        return y;
     }
 
     /** Draw 10 hearts above the hotbar reflecting survival health (half-heart resolution). */
     private void renderHealth() {
         if (player == null || player.mode != Player.GameMode.SURVIVAL) return;
         beginOrtho();
-        int slots = 9, slotSize = 40, gap = 2;
-        int totalW = slots * (slotSize + gap) - gap;
+        int totalW = Inventory.HOTBAR_SIZE * (SLOT + SLOT_GAP) - SLOT_GAP;
         int startX = (width - totalW) / 2;
-        int hotbarTop = height - slotSize - 10;
-        int hs = 16;                  // heart size
+        int hs = HEART_SIZE;
         int hgap = 2;
-        int y = hotbarTop - hs - 8;
+        int y = hotbarTop() - hs - 8;
         boolean flash = player.hurtTime > 0 && (player.hurtTime % 4) >= 2;
         GL.glEnable(GL.GL_BLEND);
         GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA);
@@ -1822,11 +1863,7 @@ public class RubyDung implements Runnable {
     private void renderOverlay() {
         GL.glEnable(GL.GL_BLEND);
         GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA);
-        GL.glColor4f(0.0f, 0.0f, 0.0f, 0.6f);
-        GL.glBegin(GL.GL_QUADS);
-        GL.glVertex2f(0, 0); GL.glVertex2f(width, 0);
-        GL.glVertex2f(width, height); GL.glVertex2f(0, height);
-        GL.glEnd();
+        Ui.rect(0, 0, width, height, Ui.SCREEN_DIM);
     }
 
     /** Open (and create if missing) a named world folder. */
@@ -1890,22 +1927,21 @@ public class RubyDung implements Runnable {
         return new java.io.File(SAVES_DIR, sanitize(name));
     }
 
-    /** Persist player position, spawn, health, mode, hotbar and collected counts to player.dat. */
+    /** Persist player position, spawn, health, mode, selected slot and inventory to player.dat. */
     private void savePlayer(java.io.File dir) {
         if (player == null) return;
+        returnCursorToInventory();   // a stack held on the cursor must not be saved into nothing
         java.io.File f = new java.io.File(dir, "player.dat");
         try (var dos = new java.io.DataOutputStream(new java.util.zip.GZIPOutputStream(new java.io.FileOutputStream(f)))) {
-            dos.writeInt(3); // version
+            dos.writeInt(4); // version
             dos.writeFloat(player.x); dos.writeFloat(player.y); dos.writeFloat(player.z);
             dos.writeFloat(player.yRot); dos.writeFloat(player.xRot);
             dos.writeBoolean(player.hasSpawn);
             dos.writeFloat(player.spawnX); dos.writeFloat(player.spawnY); dos.writeFloat(player.spawnZ);
             dos.writeInt(player.health);
             dos.writeInt(player.mode.ordinal());
-            dos.writeInt(hotbar.length);
-            for (int v : hotbar) dos.writeInt(v);
-            dos.writeInt(itemCounts.length);
-            for (int v : itemCounts) dos.writeInt(v);
+            dos.writeInt(selectedSlot);
+            inv.write(dos);
         } catch (Exception e) {
             e.printStackTrace();
         }
@@ -1913,13 +1949,11 @@ public class RubyDung implements Runnable {
 
     /** Restore player state from player.dat if present (call after the player exists). */
     private void loadPlayer(java.io.File dir) {
-        // hotbar and item counts live on the RubyDung instance, not on Player, so they
-        // survive a world switch — reset them first or a new world inherits (and can
-        // spend, now that survival checks counts) whatever the last world collected
-        System.arraycopy(DEFAULT_HOTBAR, 0, hotbar, 0, hotbar.length);
-        java.util.Arrays.fill(itemCounts, 0);
+        // the inventory lives on the RubyDung instance, not on Player, so it survives a world
+        // switch — clear it first or a new world inherits (and can spend) the last one's stock
+        inv.clear();
         selectedSlot = 0;
-        cursorItem = 0;
+        cursorId = 0; cursorCount = 0;
         java.io.File f = new java.io.File(dir, "player.dat");
         if (player == null || !f.exists()) return;
         try (var dis = new java.io.DataInputStream(new java.util.zip.GZIPInputStream(new java.io.FileInputStream(f)))) {
@@ -1930,8 +1964,14 @@ public class RubyDung implements Runnable {
             float sx = dis.readFloat(), sy = dis.readFloat(), sz = dis.readFloat();
             int health = dis.readInt();
             int modeOrd = dis.readInt();
-            int hn = dis.readInt();
-            for (int i = 0; i < hn; i++) { int v = dis.readInt(); if (i < hotbar.length) hotbar[i] = v; }
+            int[] legacyHotbar = null;
+            if (version >= 4) {
+                selectedSlot = Math.clamp(dis.readInt(), 0, Inventory.HOTBAR_SIZE - 1);
+            } else {
+                int hn = dis.readInt();
+                legacyHotbar = new int[hn];
+                for (int i = 0; i < hn; i++) legacyHotbar[i] = dis.readInt();
+            }
             // apply core state first so a truncated/older file still restores the player
             player.hasSpawn = hasSpawn;
             player.spawnX = sx; player.spawnY = sy; player.spawnZ = sz;
@@ -1939,16 +1979,46 @@ public class RubyDung implements Runnable {
             var modes = Player.GameMode.values();
             player.mode = modes[Math.clamp(modeOrd, 0, modes.length - 1)];
             player.teleport(px, py, pz, yaw, pitch);
+
+            int[] legacyCounts = new int[256];
             try {
-                // v1/v2 stored an unused slot array here; read past it
-                if (version < 3) dis.skipNBytes(dis.readInt());
-                // v2+: collected item counts (absent in v1 -> EOFException, harmless)
-                int cn = dis.readInt();
-                for (int i = 0; i < cn; i++) { int v = dis.readInt(); if (i < itemCounts.length) itemCounts[i] = v; }
+                if (version >= 4) {
+                    inv.read(dis);
+                } else {
+                    // v1/v2 stored an unused slot array here; read past it
+                    if (version < 3) dis.skipNBytes(dis.readInt());
+                    // v2+: collected item counts (absent in v1 -> EOFException, harmless)
+                    int cn = dis.readInt();
+                    for (int i = 0; i < cn; i++) { int v = dis.readInt(); if (i < legacyCounts.length) legacyCounts[i] = v; }
+                }
             } catch (java.io.EOFException ignored) {}
+            if (version < 4) restoreLegacyInventory(legacyHotbar, legacyCounts,
+                player.mode == Player.GameMode.CREATIVE);
         } catch (Exception e) {
             e.printStackTrace();
         }
+    }
+
+    /**
+     * Convert a pre-v4 save. Those files held a list of hotbar ids plus one flat "how many of
+     * id X do I own" tally with no notion of a stack, so each hotbar id keeps its slot and
+     * draws as much of its tally as a stack holds; the remainder, and every id that was not on
+     * the hotbar, goes wherever it fits. A creative save tallied nothing — its hotbar was
+     * bottomless — so its slots are filled instead of coming back empty.
+     */
+    private void restoreLegacyInventory(int[] hotbarIds, int[] counts, boolean creative) {
+        if (hotbarIds != null) {
+            for (int i = 0; i < Math.min(hotbarIds.length, Inventory.HOTBAR_SIZE); i++) {
+                int id = hotbarIds[i] & 0xFF;
+                if (id == 0) continue;
+                int take = Math.min(counts[id], Items.maxStack(id));
+                if (take <= 0 && creative) take = Items.maxStack(id);
+                if (take <= 0) continue;
+                inv.set(i, id, take);
+                counts[id] -= Math.min(counts[id], take);
+            }
+        }
+        for (int id = 1; id < counts.length; id++) if (counts[id] > 0) inv.add(id, counts[id]);
     }
 
     private static String sanitize(String name) {
@@ -1994,22 +2064,15 @@ public class RubyDung implements Runnable {
         // progress bar background
         int barW = 400, barH = 12;
         int barX = (width - barW) / 2, barY = height / 2 + 20;
-        GL.glColor4f(1f, 1f, 1f, 0.15f);
-        GL.glBegin(GL.GL_QUADS);
-        GL.glVertex2f(barX, barY); GL.glVertex2f(barX+barW, barY);
-        GL.glVertex2f(barX+barW, barY+barH); GL.glVertex2f(barX, barY+barH);
-        GL.glEnd();
+        Ui.rect(barX, barY, barW, barH, Ui.SUNKEN);
         // animated fill
         float fill = (System.currentTimeMillis() % 2000) / 2000f;
-        GL.glColor4f(0.3f, 0.7f, 1f, 0.9f);
-        GL.glBegin(GL.GL_QUADS);
-        GL.glVertex2f(barX, barY); GL.glVertex2f(barX + barW * fill, barY);
-        GL.glVertex2f(barX + barW * fill, barY+barH); GL.glVertex2f(barX, barY+barH);
-        GL.glEnd();
+        Ui.rect(barX, barY, Math.round(barW * fill), barH, Ui.ACCENT);
+        Ui.border(barX, barY, barW, barH, 1, Ui.EDGE);
 
         drawTitle("RUBYDUNG", height / 2 - 80);
 
-        GL.glColor4f(0.8f, 0.8f, 0.8f, 1f);
+        Ui.color(Ui.TEXT_DIM);
         String s = loadingStatus;
         drawTextCentered(s, width / 2, height / 2 + 42, 14);
 
@@ -2023,11 +2086,7 @@ public class RubyDung implements Runnable {
         // background quad (sky tinted)
         GL.glEnable(GL.GL_BLEND);
         GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA);
-        GL.glColor4f(0f, 0f, 0f, 0.35f);
-        GL.glBegin(GL.GL_QUADS);
-        GL.glVertex2f(0, 0); GL.glVertex2f(width, 0);
-        GL.glVertex2f(width, height); GL.glVertex2f(0, height);
-        GL.glEnd();
+        Ui.rect(0, 0, width, height, Ui.SCREEN_DIM, 0.5f);
 
         // logo shadow
         int logoY = height / 2 - 200;
@@ -2062,8 +2121,9 @@ public class RubyDung implements Runnable {
             if (e[0] == GLFW_MOUSE_BUTTON_1 && e[1] == GLFW_PRESS) {
                 if (h0) { refreshWorldList(); screen = 8; menuCooldown = 2; }
                 else if (h2) {
-                    refreshServerList();
-                    screen = 5;
+                    screen = 3;
+                    mpStatus = "";
+                    editingPort = false;
                     glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
                     Input.consumeMouseDelta();
                 }
@@ -2208,7 +2268,9 @@ public class RubyDung implements Runnable {
         for (var e : Input.pollMouseEvents()) {
             if (e[0] == GLFW_MOUSE_BUTTON_1 && e[1] == GLFW_PRESS) {
                 if (h1) { screen = 0; glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED); Input.consumeMouseDelta(); }
-                if (h2) { refreshServerList(); screen = 5; }
+                // the multiplayer hub, not the server list: hosting the world we are standing
+                // in is the thing this button is reached for from inside a game
+                if (h2) { screen = 3; mpStatus = ""; editingPort = false; }
                 if (h3) { screen = 2; }
                 if (h4) { exitToMenu(); }
                 if (h5) { saveWorld(); shouldQuit = true; }
@@ -2321,40 +2383,17 @@ public class RubyDung implements Runnable {
     private void drawButton(int x, int y, int w, int h, String label, boolean hover) {
         GL.glEnable(GL.GL_BLEND);
         GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA);
-
-        // fill
-        if (hover) GL.glColor4f(1.0f, 1.0f, 1.0f, 0.18f);
-        else       GL.glColor4f(1.0f, 1.0f, 1.0f, 0.08f);
-        GL.glBegin(GL.GL_QUADS);
-        GL.glVertex2f(x,     y);
-        GL.glVertex2f(x + w, y);
-        GL.glVertex2f(x + w, y + h);
-        GL.glVertex2f(x,     y + h);
-        GL.glEnd();
-
-        // border
-        GL.glColor4f(1.0f, 1.0f, 1.0f, hover ? 1.0f : 0.6f);
-        GL.glLineWidth(hover ? 2.0f : 1.0f);
-        GL.glBegin(GL.GL_LINE_LOOP);
-        GL.glVertex2f(x + 0.5f,     y + 0.5f);
-        GL.glVertex2f(x + w - 0.5f, y + 0.5f);
-        GL.glVertex2f(x + w - 0.5f, y + h - 0.5f);
-        GL.glVertex2f(x + 0.5f,     y + h - 0.5f);
-        GL.glEnd();
-
-        // label
+        Ui.button(x, y, w, h, hover, true);
         int charH = Math.min(26, h - 8);
-        GL.glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
+        Ui.color(hover ? Ui.ACCENT : Ui.TEXT);
         drawTextFitCentered(label, x + w / 2, y + (h - charH) / 2, charH, w - 12);
     }
 
     /** Button-sized text without the box or hover highlight, for read-only rows. */
     private void drawLabel(int x, int y, int w, int h, String label) {
-        int charW = 18, charH = 26;
-        int spacing = charW + 3;
-        int textW = label.length() * spacing;
-        GL.glColor4f(1.0f, 1.0f, 1.0f, 0.7f);
-        drawText(label, x + (w - textW) / 2, y + (h - charH) / 2, charW, charH, spacing);
+        int charH = Math.min(26, h - 8);
+        Ui.color(Ui.TEXT_DIM);
+        drawTextFitCentered(label, x + w / 2, y + (h - charH) / 2, charH, w - 12);
     }
 
     private void beginOrtho() {

@@ -15,6 +15,7 @@
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <lwjgl.version>3.4.1</lwjgl.version>
         <joml.version>1.10.7</joml.version>
+        <zstd.version>1.5.7-6</zstd.version>
     </properties>
 
     <dependencies>
@@ -36,15 +37,18 @@
         <dependency><groupId>org.lwjgl</groupId><artifactId>lwjgl-vulkan</artifactId><version>${lwjgl.version}</version><classifier>natives-macos</classifier></dependency>
         <dependency><groupId>org.lwjgl</groupId><artifactId>lwjgl-vulkan</artifactId><version>${lwjgl.version}</version><classifier>natives-macos-arm64</classifier></dependency>
 
-        <!-- shaderc: compile GLSL → SPIR-V at runtime -->
-        <dependency><groupId>org.lwjgl</groupId><artifactId>lwjgl-shaderc</artifactId><version>${lwjgl.version}</version></dependency>
-        <dependency><groupId>org.lwjgl</groupId><artifactId>lwjgl-shaderc</artifactId><version>${lwjgl.version}</version><classifier>natives-macos</classifier></dependency>
-        <dependency><groupId>org.lwjgl</groupId><artifactId>lwjgl-shaderc</artifactId><version>${lwjgl.version}</version><classifier>natives-macos-arm64</classifier></dependency>
-        <dependency><groupId>org.lwjgl</groupId><artifactId>lwjgl-shaderc</artifactId><version>${lwjgl.version}</version><classifier>natives-windows</classifier></dependency>
-        <dependency><groupId>org.lwjgl</groupId><artifactId>lwjgl-shaderc</artifactId><version>${lwjgl.version}</version><classifier>natives-windows-arm64</classifier></dependency>
-        <dependency><groupId>org.lwjgl</groupId><artifactId>lwjgl-shaderc</artifactId><version>${lwjgl.version}</version><classifier>natives-linux</classifier></dependency>
+        <!-- stb: PNG decoding and the font atlas, in place of AWT -->
+        <dependency><groupId>org.lwjgl</groupId><artifactId>lwjgl-stb</artifactId><version>${lwjgl.version}</version></dependency>
+        <dependency><groupId>org.lwjgl</groupId><artifactId>lwjgl-stb</artifactId><version>${lwjgl.version}</version><classifier>natives-macos</classifier></dependency>
+        <dependency><groupId>org.lwjgl</groupId><artifactId>lwjgl-stb</artifactId><version>${lwjgl.version}</version><classifier>natives-macos-arm64</classifier></dependency>
+        <dependency><groupId>org.lwjgl</groupId><artifactId>lwjgl-stb</artifactId><version>${lwjgl.version}</version><classifier>natives-windows</classifier></dependency>
+        <dependency><groupId>org.lwjgl</groupId><artifactId>lwjgl-stb</artifactId><version>${lwjgl.version}</version><classifier>natives-windows-arm64</classifier></dependency>
+        <dependency><groupId>org.lwjgl</groupId><artifactId>lwjgl-stb</artifactId><version>${lwjgl.version}</version><classifier>natives-linux</classifier></dependency>
 
         <dependency><groupId>org.joml</groupId><artifactId>joml</artifactId><version>${joml.version}</version></dependency>
+
+        <!-- zstd: compression for Linear region files (natives bundled in the jar) -->
+        <dependency><groupId>com.github.luben</groupId><artifactId>zstd-jni</artifactId><version>${zstd.version}</version></dependency>
     </dependencies>
 
     <build>
@@ -131,4 +135,21 @@
             </plugin>
         </plugins>
     </build>
+    <profiles>
+        <!--
+          shaderc is not a dependency of the game: the shaders are compiled ahead of time by
+          tools/compile-shaders.sh and shipped as resources/shaders/*.spv. This profile only
+          exists so that script can fetch the compiler: mvn -Pdev dependency:resolve
+        -->
+        <profile>
+            <id>dev</id>
+            <dependencies>
+                <dependency><groupId>org.lwjgl</groupId><artifactId>lwjgl-shaderc</artifactId><version>${lwjgl.version}</version></dependency>
+                <dependency><groupId>org.lwjgl</groupId><artifactId>lwjgl-shaderc</artifactId><version>${lwjgl.version}</version><classifier>natives-macos</classifier></dependency>
+                <dependency><groupId>org.lwjgl</groupId><artifactId>lwjgl-shaderc</artifactId><version>${lwjgl.version}</version><classifier>natives-macos-arm64</classifier></dependency>
+                <dependency><groupId>org.lwjgl</groupId><artifactId>lwjgl-shaderc</artifactId><version>${lwjgl.version}</version><classifier>natives-windows</classifier></dependency>
+                <dependency><groupId>org.lwjgl</groupId><artifactId>lwjgl-shaderc</artifactId><version>${lwjgl.version}</version><classifier>natives-linux</classifier></dependency>
+            </dependencies>
+        </profile>
+    </profiles>
 </project>

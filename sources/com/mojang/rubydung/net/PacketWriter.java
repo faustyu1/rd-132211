@@ -1,30 +1,69 @@
 package com.mojang.rubydung.net;
 
+import com.github.luben.zstd.Zstd;
+
 import java.io.*;
+import java.nio.charset.StandardCharsets;
 
 /** Utility to build outgoing packet byte arrays. */
 public final class PacketWriter {
 
+    /** Same level the region files use: chunk payloads are the same kind of data. */
+    private static final int CHUNK_COMPRESSION = 3;
+
+    /**
+     * Builds one packet. A ByteArrayOutputStream never actually throws, so the checked
+     * IOException every writer would otherwise have to declare is swallowed here once.
+     */
+    private static byte[] build(int size, Body body) {
+        var bos = new ByteArrayOutputStream(size);
+        try (var dos = new DataOutputStream(bos)) {
+            body.write(dos);
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+        return bos.toByteArray();
+    }
+
+    private interface Body { void write(DataOutputStream dos) throws IOException; }
+
     public static byte[] playerPos(int connId, float x, float y, float z, float yRot, float xRot) {
-        try {
-            var bos = new ByteArrayOutputStream(26);
-            var dos = new DataOutputStream(bos);
+        return build(26, dos -> {
             dos.writeByte(Packet.PLAYER_POS);
             dos.writeInt(connId);
             dos.writeFloat(x); dos.writeFloat(y); dos.writeFloat(z);
             dos.writeFloat(yRot); dos.writeFloat(xRot);
-            return bos.toByteArray();
-        } catch (IOException e) { throw new RuntimeException(e); }
+        });
     }
 
     public static byte[] setTile(int x, int y, int z, int type) {
-        try {
-            var bos = new ByteArrayOutputStream(17);
-            var dos = new DataOutputStream(bos);
+        return build(17, dos -> {
             dos.writeByte(Packet.SET_TILE);
             dos.writeInt(x); dos.writeInt(y); dos.writeInt(z); dos.writeInt(type);
-            return bos.toByteArray();
-        } catch (IOException e) { throw new RuntimeException(e); }
+        });
+    }
+
+    /**
+     * The cells the host's fluid simulation moved this tick. Clients do not simulate water
+     * themselves — two independent simulations drift apart within seconds — so the host is
+     * the only authority and these are what keep the two worlds showing the same river.
+     *
+     * Batched because the simulation moves up to 64 cells per fluid tick: one packet each
+     * would be a thousand tiny packets a second per client, enough to fill the receive queue
+     * of a client that drains it once per frame.
+     */
+    public static byte[] fluidBatch(java.util.List<int[]> cells, int from, int count) {
+        return build(5 + count * 13, dos -> {
+            dos.writeByte(Packet.SET_FLUID);
+            dos.writeInt(count);
+            for (int i = from; i < from + count; i++) {
+                int[] c = cells.get(i);
+                dos.writeInt(c[0]);
+                dos.writeShort(c[1]);   // world height is 128; a short is room to spare
+                dos.writeInt(c[2]);
+                dos.writeByte(c[3]);
+            }
+        });
     }
 
     /**
@@ -35,56 +74,65 @@ public final class PacketWriter {
      * the client generated its own terrain outside that snapshot.
      */
     public static byte[] welcome(int assignedId, long seed) {
-        try {
-            var bos = new ByteArrayOutputStream(17);
-            var dos = new DataOutputStream(bos);
+        return build(17, dos -> {
             dos.writeByte(Packet.WELCOME);
             dos.writeInt(Packet.PROTOCOL_VERSION);
             dos.writeInt(assignedId);
             dos.writeLong(seed);
-            return bos.toByteArray();
-        } catch (IOException e) { throw new RuntimeException(e); }
+        });
     }
 
-    /** One edited chunk: everything the seed cannot reproduce. */
+    /**
+     * One edited chunk: everything the seed cannot reproduce. The 32 KiB block array is
+     * zstd-compressed — it is mostly long runs of one id, so it leaves at a fraction of the
+     * size, and a joining client is streamed several of these every tick.
+     */
     public static byte[] chunk(int cx, int cz, byte[] blocks) {
-        try {
-            var bos = new ByteArrayOutputStream(9 + blocks.length);
-            var dos = new DataOutputStream(bos);
+        byte[] comp = Zstd.compress(blocks, CHUNK_COMPRESSION);
+        return build(13 + comp.length, dos -> {
             dos.writeByte(Packet.CHUNK);
             dos.writeInt(cx);
             dos.writeInt(cz);
-            dos.write(blocks);
-            return bos.toByteArray();
-        } catch (IOException e) { throw new RuntimeException(e); }
+            dos.writeInt(blocks.length);   // decompressed size, so the reader can size its buffer
+            dos.write(comp);
+        });
     }
 
     public static byte[] chat(String message) {
-        try {
-            byte[] mb = message.getBytes(java.nio.charset.StandardCharsets.UTF_8);
-            var bos = new ByteArrayOutputStream(3 + mb.length);
-            var dos = new DataOutputStream(bos);
+        byte[] mb = message.getBytes(StandardCharsets.UTF_8);
+        return build(3 + mb.length, dos -> {
             dos.writeByte(Packet.CHAT);
             dos.writeShort(mb.length);
             dos.write(mb);
-            return bos.toByteArray();
-        } catch (IOException e) { throw new RuntimeException(e); }
+        });
     }
 
     public static byte[] ping() {
         return new byte[]{Packet.PING};
     }
 
+    public static byte[] playerLeave(int connId) {
+        return build(5, dos -> {
+            dos.writeByte(Packet.PLAYER_LEAVE);
+            dos.writeInt(connId);
+        });
+    }
+
+    /** Client's render distance in chunks, so the host knows how far its edits have to travel. */
+    public static byte[] clientInfo(int viewDistChunks) {
+        return build(5, dos -> {
+            dos.writeByte(Packet.CLIENT_INFO);
+            dos.writeInt(viewDistChunks);
+        });
+    }
+
     public static byte[] playerName(int connId, String name) {
-        try {
-            byte[] nameBytes = name.getBytes(java.nio.charset.StandardCharsets.UTF_8);
-            var bos = new ByteArrayOutputStream(5 + nameBytes.length);
-            var dos = new DataOutputStream(bos);
+        byte[] nameBytes = name.getBytes(StandardCharsets.UTF_8);
+        return build(7 + nameBytes.length, dos -> {
             dos.writeByte(Packet.PLAYER_NAME);
             dos.writeInt(connId);
             dos.writeShort(nameBytes.length);
             dos.write(nameBytes);
-            return bos.toByteArray();
-        } catch (IOException e) { throw new RuntimeException(e); }
+        });
     }
 }

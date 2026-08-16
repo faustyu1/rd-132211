@@ -7,6 +7,7 @@ cd "${RD_RUN_DIR:-$DIR}"
 
 M2="$HOME/.m2/repository"
 V=3.4.1
+ZSTD=1.5.7-6
 
 # Toolchain: $JAVA_HOME first, then PATH. The classes are compiled for Java 21.
 jdkMajor() { "$1" -version 2>&1 | head -1 | grep -oE '[0-9]+' | head -1; }
@@ -27,7 +28,7 @@ need() {
 # picking the classifier matching the JVM arch (macos / macos-arm64).
 CP="$DIR/target/classes:$DIR/resources"
 natives=0
-for a in lwjgl lwjgl-glfw lwjgl-vulkan lwjgl-shaderc; do
+for a in lwjgl lwjgl-glfw lwjgl-vulkan lwjgl-stb; do
   need "$M2/org/lwjgl/$a/$V/$a-$V.jar"
   CP="$CP:$M2/org/lwjgl/$a/$V/$a-$V.jar"
   for n in natives-macos natives-macos-arm64; do
@@ -40,9 +41,10 @@ done
 [ "$natives" -gt 0 ] || { echo "no LWJGL macOS natives jars under $M2: mvn -q dependency:resolve" >&2; exit 1; }
 need "$M2/org/joml/joml/1.10.7/joml-1.10.7.jar"
 CP="$CP:$M2/org/joml/joml/1.10.7/joml-1.10.7.jar"
+need "$M2/com/github/luben/zstd-jni/$ZSTD/zstd-jni-$ZSTD.jar"
+CP="$CP:$M2/com/github/luben/zstd-jni/$ZSTD/zstd-jni-$ZSTD.jar"
 
 exec "$JAVA" \
   -XstartOnFirstThread \
-  -Dapple.awt.UIElement=true \
   -cp "$CP" \
   com.mojang.rubydung.RubyDung

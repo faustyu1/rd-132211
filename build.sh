@@ -4,6 +4,7 @@ cd "$(dirname "$0")"
 
 M2="$HOME/.m2/repository"
 V=3.4.1
+ZSTD=1.5.7-6
 
 # Toolchain: $JAVA_HOME first, then PATH. The sources use Java 21 features (records,
 # Math.clamp), so an older candidate is skipped instead of failing mid-compile.
@@ -21,12 +22,14 @@ need() {
 }
 
 CP="resources"
-for a in lwjgl lwjgl-glfw lwjgl-vulkan lwjgl-shaderc; do
+for a in lwjgl lwjgl-glfw lwjgl-vulkan lwjgl-stb; do
   need "$M2/org/lwjgl/$a/$V/$a-$V.jar"
   CP="$CP:$M2/org/lwjgl/$a/$V/$a-$V.jar"
 done
 need "$M2/org/joml/joml/1.10.7/joml-1.10.7.jar"
 CP="$CP:$M2/org/joml/joml/1.10.7/joml-1.10.7.jar"
+need "$M2/com/github/luben/zstd-jni/$ZSTD/zstd-jni-$ZSTD.jar"
+CP="$CP:$M2/com/github/luben/zstd-jni/$ZSTD/zstd-jni-$ZSTD.jar"
 
 mkdir -p target/classes
 "$JAVAC" -d target/classes -cp "$CP" $(find sources -name "*.java")

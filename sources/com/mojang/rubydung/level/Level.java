@@ -17,9 +17,7 @@ public class Level {
     // chunk keys currently being generated on the background pool (avoid duplicate work)
     private final java.util.Set<Long> generating = ConcurrentHashMap.newKeySet();
     private final java.util.concurrent.ExecutorService genPool =
-        java.util.concurrent.Executors.newFixedThreadPool(
-            Math.max(2, Runtime.getRuntime().availableProcessors() - 1),
-            r -> { Thread t = new Thread(r, "chunk-gen"); t.setDaemon(true); return t; });
+        java.util.concurrent.Executors.newFixedThreadPool(Threads.GEN, Threads.factory("chunk-gen"));
     // not final: load() replaces it when a saved world turns out to have a different seed.
     // volatile because the chunk-generation pool reads it.
     private volatile ChunkGenerator generator;
@@ -27,6 +25,8 @@ public class Level {
     private final List<LevelListener> levelListeners = new ArrayList<>();
     // world folder to flush edited chunks into when they stream out; null = nowhere to write yet
     private volatile File saveDir;
+    // chunk-granular access to the world's Linear region files (32x32 chunks per file)
+    private final LinearRegionCache regions = new LinearRegionCache();
 
     public Level(long seed) {
         this.seed = seed;
@@ -126,69 +126,135 @@ public class Level {
         });
     }
 
+    /** True once every 4-neighbour of a chunk has block data, i.e. it can be meshed seamlessly. */
+    boolean neighborsLoaded(int cx, int cz) {
+        return chunks.containsKey(chunkKey(cx - 1, cz)) && chunks.containsKey(chunkKey(cx + 1, cz))
+            && chunks.containsKey(chunkKey(cx, cz - 1)) && chunks.containsKey(chunkKey(cx, cz + 1));
+    }
+
+    // the scan below is (2r+3)^2 map lookups; it only has to run when the player crosses a
+    // chunk border, plus a slow heartbeat so a chunk whose generation failed is retried
+    private int lastScanCx = Integer.MIN_VALUE, lastScanCz = Integer.MIN_VALUE, scanTicks = 0;
+
     public void update(float playerX, float playerZ, int renderDist) {
         int pcx = (int) Math.floor(playerX / WorldChunk.SIZE);
         int pcz = (int) Math.floor(playerZ / WorldChunk.SIZE);
-        // queue missing chunks for background generation, nearest first
-        List<long[]> wanted = new ArrayList<>();
-        for (int dx = -renderDist; dx <= renderDist; dx++)
-            for (int dz = -renderDist; dz <= renderDist; dz++) {
-                int cx = pcx + dx, cz = pcz + dz;
-                long key = chunkKey(cx, cz);
-                if (chunks.containsKey(key) || generating.contains(key)) continue;
-                wanted.add(new long[]{(long) dx * dx + (long) dz * dz, cx, cz});
-            }
-        wanted.sort((a, b) -> Long.compare(a[0], b[0]));
-        for (long[] w : wanted) {
-            int cx = (int) w[1], cz = (int) w[2];
-            long key = chunkKey(cx, cz);
-            if (!generating.add(key)) continue;
-            genPool.execute(() -> {
-                try {
-                    streamChunk(cx, cz);
-                } finally {
-                    generating.remove(key);
+        // block data reaches one ring past the meshed area: a chunk is only meshed once its
+        // four neighbours exist, so without the skirt the outermost ring would never build
+        int genDist = renderDist + 1;
+        long genDistSq = (long) genDist * genDist;
+        if (pcx != lastScanCx || pcz != lastScanCz || ++scanTicks >= 20) {
+            lastScanCx = pcx;
+            lastScanCz = pcz;
+            scanTicks = 0;
+            // queue missing chunks for background generation, nearest first
+            List<long[]> wanted = new ArrayList<>();
+            for (int dx = -genDist; dx <= genDist; dx++)
+                for (int dz = -genDist; dz <= genDist; dz++) {
+                    long d2 = (long) dx * dx + (long) dz * dz;
+                    // a disc, not a square: the corners of a square are past the fog anyway
+                    if (d2 > genDistSq) continue;
+                    int cx = pcx + dx, cz = pcz + dz;
+                    long key = chunkKey(cx, cz);
+                    if (chunks.containsKey(key) || generating.contains(key)) continue;
+                    wanted.add(new long[]{d2, cx, cz});
                 }
-            });
+            wanted.sort((a, b) -> Long.compare(a[0], b[0]));
+            for (long[] w : wanted) {
+                int cx = (int) w[1], cz = (int) w[2];
+                long key = chunkKey(cx, cz);
+                if (!generating.add(key)) continue;
+                genPool.execute(() -> {
+                    try {
+                        streamChunk(cx, cz);
+                    } catch (Throwable e) {
+                        // an exception here used to disappear into the executor and leave a
+                        // permanent hole in the world; log it once and let the scan retry
+                        if (!streamFailureLogged) {
+                            streamFailureLogged = true;
+                            System.err.println("chunk generation failed at " + cx + "," + cz);
+                            e.printStackTrace();
+                        }
+                    } finally {
+                        generating.remove(key);
+                    }
+                });
+            }
         }
         // unload far chunks
-        int unloadDist = renderDist + 2;
-        final File flushDir = saveDir;
-        chunks.entrySet().removeIf(e -> {
-            WorldChunk c = e.getValue();
-            if (Math.abs(c.cx - pcx) > unloadDist || Math.abs(c.cz - pcz) > unloadDist) {
-                // an edited chunk that is only dropped is lost for good: save() writes
-                // resident chunks, so it must reach disk before it leaves memory.
-                // Edited chunks are rare, so the write can stay on this thread; if it
-                // fails (full/read-only disk) the chunk stays loaded rather than
-                // taking the player's building down with it.
-                if (flushDir != null && c.modified && !writeChunk(flushDir, c)) return false;
-                c.freeGL();
-                return true;
-            }
-            return false;
-        });
+        long unloadDistSq = (long) (genDist + 2) * (genDist + 2);
+        List<WorldChunk> far = null;
+        for (WorldChunk c : chunks.values()) {
+            long ddx = c.cx - pcx, ddz = c.cz - pcz;
+            if (ddx * ddx + ddz * ddz <= unloadDistSq) continue;
+            if (far == null) far = new ArrayList<>();
+            far.add(c);
+        }
+        if (far == null) return;
+        // an edited chunk that is only dropped is lost for good: save() writes resident
+        // chunks, so it must reach disk before it leaves memory. One batch means one region
+        // rewrite even when a whole edited area streams out at once; a region that fails to
+        // write (full/read-only disk) keeps its chunks loaded rather than taking the
+        // player's building down with it.
+        java.util.Set<Long> failed = flushModified(far);
+        for (WorldChunk c : far) {
+            if (c.modified && failed.contains(LinearRegionCache.regionKeyOf(c.cx, c.cz))) continue;
+            chunks.remove(chunkKey(c.cx, c.cz));
+            c.freeGL();
+        }
     }
 
-    /** Background-thread chunk generation: create, generate, publish, then mesh + fix neighbours. */
+    /**
+     * Write every edited chunk in the list to its region file, batched by region. Returns
+     * the region keys that failed, or an empty set when there is nothing (or nowhere) to write.
+     */
+    private java.util.Set<Long> flushModified(Collection<WorldChunk> candidates) {
+        File dir = saveDir;
+        if (dir == null) return java.util.Set.of();
+        List<LinearRegionCache.Entry> batch = null;
+        for (WorldChunk c : candidates) {
+            if (!c.modified) continue;
+            if (batch == null) batch = new ArrayList<>();
+            batch.add(new LinearRegionCache.Entry(c.cx, c.cz, c.blocks.clone()));
+        }
+        if (batch == null) return java.util.Set.of();
+        java.util.Set<Long> failed = regions.writeBatch(dir, batch, (int) (System.currentTimeMillis() / 1000L));
+        for (WorldChunk c : candidates)
+            if (c.modified && !failed.contains(LinearRegionCache.regionKeyOf(c.cx, c.cz))) c.modified = false;
+        return failed;
+    }
+
+    private static volatile boolean streamFailureLogged = false;
+
+    /**
+     * Background-thread chunk generation: create, generate, publish. Meshing is left to the
+     * renderer's pump, which waits until all four neighbours have arrived — the old code
+     * meshed immediately and then re-meshed the whole column once per neighbour that showed
+     * up afterwards, i.e. up to five builds of every chunk in the world just to settle the
+     * seams.
+     */
     private void streamChunk(int cx, int cz) {
         long key = chunkKey(cx, cz);
         if (chunks.containsKey(key)) return;
         WorldChunk c = new WorldChunk(cx, cz, this);
         if (!readChunk(c)) generator.generate(c);
         wakeBorderWater(c);
-        if (chunks.putIfAbsent(key, c) != null) return; // lost the race, discard
-        // symmetric neighbour invalidation: whichever chunk publishes last sees the
-        // other present and re-meshes it, so borders converge to seamless either way
-        markNeighborDirty(cx - 1, cz);
-        markNeighborDirty(cx + 1, cz);
-        markNeighborDirty(cx, cz - 1);
-        markNeighborDirty(cx, cz + 1);
-        c.scheduleBuild();
+        chunks.putIfAbsent(key, c);
     }
 
     public Collection<WorldChunk> getLoadedChunks() {
         return chunks.values();
+    }
+
+    /**
+     * Tear a world down: stop generating for it and give every chunk's vertex memory back.
+     * A level that is merely dropped keeps its generator threads alive and its meshes
+     * reserved in the arena, so entering worlds in one session would leak both.
+     */
+    public void dispose() {
+        genPool.shutdownNow();
+        for (WorldChunk c : chunks.values()) c.freeGL();
+        chunks.clear();
     }
 
     public byte getBlock(int x, int y, int z) {
@@ -344,11 +410,32 @@ public class Level {
     private final java.util.Set<Long> fluidPending = java.util.concurrent.ConcurrentHashMap.newKeySet();
     private static final int MAX_FLOW = 7;
 
+    /** Told about every cell the simulation moves; the host uses it to broadcast the flow. */
+    public interface FluidSink { void fluidChanged(int x, int y, int z, int type); }
+
+    /**
+     * Off on a multiplayer client. Two copies of the simulation drift apart within seconds —
+     * they process cells in different orders on different tick counts — so the host runs the
+     * only one there is and the client just applies what it is told (see
+     * {@link #applyNetworkFluid}).
+     */
+    private volatile boolean simulateFluids = true;
+    private volatile FluidSink fluidSink;
+
+    public void setSimulateFluids(boolean on) {
+        simulateFluids = on;
+        if (!on) fluidPending.clear();   // nothing will ever drain it again
+    }
+
+    public void setFluidSink(FluidSink sink) { this.fluidSink = sink; }
+
     private static long packPos(int x, int y, int z) {
         return ((long) (x & 0x3FFFFFF) << 38) | ((long) (y & 0xFFF) << 26) | (z & 0x3FFFFFF);
     }
 
     public void scheduleFluid(int x, int y, int z) {
+        // a client never drains this set, so filling it would just leak
+        if (!simulateFluids) return;
         if (y < 0 || y >= sizeY) return;
         if (Tile.isWater(getBlock(x, y, z)) || getBlock(x, y, z) == 0)
             fluidPending.add(packPos(x, y, z));
@@ -375,11 +462,27 @@ public class Level {
         for (var listener : levelListeners) listener.tileChanged(x, y, z, false);
         if (Tile.isWater(type) || type == 0) fluidPending.add(packPos(x, y, z));
         scheduleFluidNeighbors(x, y, z);
+        FluidSink sink = fluidSink;
+        if (sink != null) sink.fluidChanged(x, y, z, type);
+    }
+
+    /**
+     * Apply one fluid cell the host's simulation moved. No scheduling and no modified flag:
+     * a client neither simulates water nor owns the world it is shown.
+     */
+    public void applyNetworkFluid(int x, int y, int z, byte type) {
+        if (y < 0 || y >= sizeY) return;
+        int cx = Math.floorDiv(x, WorldChunk.SIZE);
+        int cz = Math.floorDiv(z, WorldChunk.SIZE);
+        WorldChunk chunk = chunks.get(chunkKey(cx, cz));
+        if (chunk == null) return;
+        chunk.setBlock(x - cx * WorldChunk.SIZE, y, z - cz * WorldChunk.SIZE, type);
+        for (var listener : levelListeners) listener.tileChanged(x, y, z, false);
     }
 
     /** Advance water flow. Called a few times per second from the game tick. */
     public void tickFluids() {
-        if (fluidPending.isEmpty()) return;
+        if (!simulateFluids || fluidPending.isEmpty()) return;
         // process at most 64 cells per tick — matches MC Alpha's per-tick randomTick feel
         int limit = Math.min(64, fluidPending.size());
         var iter = fluidPending.iterator();
@@ -558,24 +661,7 @@ public class Level {
     }
 
     /**
-     * Write one chunk's blocks to its own file. Shared by save() and the unload flush.
-     * Returns false if the write failed — the unload path must then keep the chunk
-     * resident, because evicting it would discard the only copy of those edits.
-     */
-    private boolean writeChunk(File dir, WorldChunk chunk) {
-        File f = new File(dir, chunk.cx + "_" + chunk.cz + ".dat");
-        try (var dos = new DataOutputStream(new GZIPOutputStream(new FileOutputStream(f)))) {
-            dos.write(chunk.blocks);
-        } catch (Exception e) {
-            e.printStackTrace();
-            return false;
-        }
-        chunk.modified = false;
-        return true;
-    }
-
-    /**
-     * Restore a chunk's blocks from its save file, if it has one. A chunk that streams
+     * Restore a chunk's blocks from the save, if it is stored there. A chunk that streams
      * back in must come from disk: regenerating it from the seed would silently undo
      * every edit ever made there, and the next save() would then overwrite the file.
      * Returns false (leaving the chunk empty) when there is nothing usable to read.
@@ -583,91 +669,25 @@ public class Level {
     private boolean readChunk(WorldChunk chunk) {
         File dir = saveDir;
         if (dir == null) return false;
-        File f = new File(dir, chunk.cx + "_" + chunk.cz + ".dat");
-        if (!f.exists()) return false;
-        byte[] buf = chunk.blocks;
-        int off = 0;
-        try (var dis = new DataInputStream(new GZIPInputStream(new FileInputStream(f)))) {
-            int n;
-            while (off < buf.length && (n = dis.read(buf, off, buf.length - off)) > 0) off += n;
-        } catch (Exception e) {
-            e.printStackTrace();
-        }
-        if (off != buf.length) {
+        byte[] stored = regions.read(dir, chunk.cx, chunk.cz);
+        if (stored == null) stored = readLegacyChunk(dir, chunk.cx, chunk.cz);
+        if (stored == null) return false;
+        if (stored.length != chunk.blocks.length) {
             // incompatible save (e.g. old world height) -> hand a clean chunk to the generator
-            java.util.Arrays.fill(buf, (byte) 0);
+            java.util.Arrays.fill(chunk.blocks, (byte) 0);
             return false;
         }
+        System.arraycopy(stored, 0, chunk.blocks, 0, stored.length);
         chunk.calcLightDepths();
         return true;
     }
 
-    public void save(File dir) {
-        dir.mkdirs();
-        saveDir = dir;
-        // Save seed
-        try (var dos = new DataOutputStream(new GZIPOutputStream(new FileOutputStream(new File(dir, "seed.dat"))))) {
-            dos.writeLong(seed);
-        } catch (Exception e) {
-            e.printStackTrace();
-        }
-        // Only edited chunks are worth storing: terrain is a pure function of the seed,
-        // so writing generated chunks would bloat the save with data readChunk could
-        // reproduce for free. A chunk edited in an earlier session already has its file.
-        for (var chunk : chunks.values()) if (chunk.modified) writeChunk(dir, chunk);
-    }
-
-    public void load(File dir) {
-        saveDir = dir;
-        File seedFile = new File(dir, "seed.dat");
-        if (seedFile.exists()) {
-            try (var dis = new DataInputStream(new GZIPInputStream(new FileInputStream(seedFile)))) {
-                setSeed(dis.readLong());
-            } catch (Exception e) {
-                e.printStackTrace();
-            }
-        }
-        File[] files = dir.listFiles((d, name) -> name.matches("-?\\d+_-?\\d+\\.dat"));
-        if (files == null) return;
-        for (File f : files) {
-            String name = f.getName().replace(".dat", "");
-            String[] parts = name.split("_");
-            // handle negative coords: split on last _ before second number
-            try {
-                int cx, cz;
-                // find split point: second number may start with -
-                int sep = name.lastIndexOf('_');
-                cx = Integer.parseInt(name.substring(0, sep));
-                cz = Integer.parseInt(name.substring(sep + 1));
-                WorldChunk chunk = new WorldChunk(cx, cz, this);
-                byte[] buf = chunk.blocks;
-                int off = 0;
-                try (var dis = new DataInputStream(new GZIPInputStream(new FileInputStream(f)))) {
-                    int n;
-                    while (off < buf.length && (n = dis.read(buf, off, buf.length - off)) > 0) off += n;
-                }
-                if (off != buf.length) continue; // incompatible save (e.g. old world height) -> regenerate
-                chunk.calcLightDepths();
-                chunk.setDirty();
-                chunks.put(chunkKey(cx, cz), chunk);
-            } catch (Exception e) {
-                e.printStackTrace();
-            }
-        }
-        for (var listener : levelListeners) listener.allChanged();
-    }
-
     /**
-     * Block data for a chunk the world does NOT generate from its seed — i.e. one somebody
-     * edited. Returns null for untouched terrain, which a peer can reproduce from the seed
-     * alone and so never needs to be sent. Reads straight from the save file when the chunk
-     * is not resident, so serving a client does not drag the whole world into memory.
+     * Pre-Linear saves kept one gzip file per edited chunk. They are still read so old
+     * worlds keep their builds; the chunk moves into a region file the next time it is
+     * written, after which the stale .dat is ignored.
      */
-    public byte[] getStoredBlocks(int cx, int cz) {
-        WorldChunk c = chunks.get(chunkKey(cx, cz));
-        if (c != null && c.modified) return c.blocks.clone();
-        File dir = saveDir;
-        if (dir == null) return null;
+    private byte[] readLegacyChunk(File dir, int cx, int cz) {
         File f = new File(dir, cx + "_" + cz + ".dat");
         if (!f.exists()) return null;
         byte[] buf = new byte[WorldChunk.SIZE * WorldChunk.HEIGHT * WorldChunk.SIZE];
@@ -682,6 +702,95 @@ public class Level {
         return off == buf.length ? buf : null;
     }
 
+    /** Bring a stored chunk into memory at load time; ignored if the save has nothing usable. */
+    private void adoptStoredChunk(int cx, int cz) {
+        WorldChunk chunk = new WorldChunk(cx, cz, this);
+        if (!readChunk(chunk)) return;
+        chunk.setDirty();
+        chunks.put(chunkKey(cx, cz), chunk);
+    }
+
+    public void save(File dir) {
+        dir.mkdirs();
+        saveDir = dir;
+        // Save seed
+        try (var dos = new DataOutputStream(new GZIPOutputStream(new FileOutputStream(new File(dir, "seed.dat"))))) {
+            dos.writeLong(seed);
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+        // Only edited chunks are worth storing: terrain is a pure function of the seed,
+        // so writing generated chunks would bloat the save with data readChunk could
+        // reproduce for free. A chunk edited in an earlier session already has its file.
+        flushModified(chunks.values());
+    }
+
+    public void load(File dir) {
+        saveDir = dir;
+        File seedFile = new File(dir, "seed.dat");
+        if (seedFile.exists()) {
+            try (var dis = new DataInputStream(new GZIPInputStream(new FileInputStream(seedFile)))) {
+                setSeed(dis.readLong());
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+        }
+        for (int[] c : regions.storedChunks(dir)) adoptStoredChunk(c[0], c[1]);
+        // legacy per-chunk files, for the ones no region file covers yet
+        File[] files = dir.listFiles((d, name) -> name.matches("-?\\d+_-?\\d+\\.dat"));
+        if (files != null) {
+            for (File f : files) {
+                String name = f.getName().replace(".dat", "");
+                try {
+                    // handle negative coords: the second number may start with -
+                    int sep = name.lastIndexOf('_');
+                    int cx = Integer.parseInt(name.substring(0, sep));
+                    int cz = Integer.parseInt(name.substring(sep + 1));
+                    if (chunks.containsKey(chunkKey(cx, cz))) continue; // region file wins
+                    adoptStoredChunk(cx, cz);
+                } catch (Exception e) {
+                    e.printStackTrace();
+                }
+            }
+        }
+        for (var listener : levelListeners) listener.allChanged();
+    }
+
+    /**
+     * Block data for a chunk the world does NOT generate from its seed — i.e. one somebody
+     * edited. Returns null for untouched terrain, which a peer can reproduce from the seed
+     * alone and so never needs to be sent. Reads straight from the save file when the chunk
+     * is not resident, so serving a client does not drag the whole world into memory.
+     */
+    public byte[] getStoredBlocks(int cx, int cz) {
+        byte[] resident = getResidentModifiedBlocks(cx, cz);
+        if (resident != null) return resident;
+        File dir = saveDir;
+        if (dir == null) return null;
+        byte[] stored = regions.read(dir, cx, cz);
+        if (stored == null) stored = readLegacyChunk(dir, cx, cz);
+        if (stored == null) return null;
+        // clone: the cache still owns its copy, and the caller ships this over the wire
+        return stored.length == WorldChunk.SIZE * WorldChunk.HEIGHT * WorldChunk.SIZE ? stored.clone() : null;
+    }
+
+    /**
+     * Blocks of an edited chunk that is loaded right now, or null. Cheap — no disk, no
+     * decompression — so a caller that must snapshot a chunk at an exact moment (the host
+     * shipping one to a client, where a stale copy would undo the block changes already on
+     * their way) can do it on the game thread instead of racing it from another one.
+     */
+    public byte[] getResidentModifiedBlocks(int cx, int cz) {
+        WorldChunk c = chunks.get(chunkKey(cx, cz));
+        return c != null && c.modified ? c.blocks.clone() : null;
+    }
+
+    /** Whether that chunk is loaded and edited — the same test without copying 32 KiB. */
+    public boolean isEditedChunkResident(int cx, int cz) {
+        WorldChunk c = chunks.get(chunkKey(cx, cz));
+        return c != null && c.modified;
+    }
+
     /**
      * Overwrite one chunk with authoritative data from the host. Not marked modified: a
      * client never owns the world it is shown and must never write it to a save folder.
@@ -693,10 +802,11 @@ public class Level {
         chunk.invalidateEmitters();
         chunk.calcLightDepths();
         chunk.setDirty();
+        // only this chunk and the four whose border faces it changed: allChanged() here meant
+        // a joining client remeshed every loaded chunk up to four times per tick
         markNeighborDirty(cx - 1, cz);
         markNeighborDirty(cx + 1, cz);
         markNeighborDirty(cx, cz - 1);
         markNeighborDirty(cx, cz + 1);
-        for (var listener : levelListeners) listener.allChanged();
     }
 }

@@ -7,11 +7,10 @@ import com.mojang.rubydung.level.Tile;
  * and how a held tool changes mining.
  *
  * Ids 0..127 are blocks (see {@link Tile}); 128 and up are items. That split is what
- * {@link #isItem} tests, and it is why the hotbar and the collected-item tally are indexed
- * with {@code id & 0xFF} — a byte block id and an int item id have to land in the same table.
+ * {@link #isItem} tests, and it is why recipe tables are indexed with {@code id & 0xFF} —
+ * a byte block id and an int item id have to land in the same table.
  *
- * Tools have no durability. Adding it would mean per-slot state, and the inventory is a flat
- * count per id, so a tool here is simply owned or not owned.
+ * Tools have no durability; they simply stack one to a slot (see {@link #maxStack}).
  */
 public final class Items {
     private Items() {}
@@ -22,6 +21,9 @@ public final class Items {
     public static final int WOOD_SHOVEL = 135, STONE_SHOVEL = 136, IRON_SHOVEL = 137;
 
     public static boolean isItem(int id) { return (id & 0xFF) >= 128; }
+
+    /** Stack limit for one inventory slot: tools go one to a slot, everything else 64. */
+    public static int maxStack(int id) { return tier(id) > 0 ? 1 : 64; }
 
     /** Only blocks can be put back into the world. */
     public static boolean isPlaceable(int id) {

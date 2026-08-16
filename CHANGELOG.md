@@ -8,6 +8,89 @@ This project follows [Semantic Versioning](https://semver.org/) while in `0.x`:
 
 Do not bump versions for every commit; group changes into a release and tag once.
 
+## [0.6.0] - 2026-08-16
+
+A rendering rework, a new save format, and a multiplayer session that survives contact with
+a second player. Multiplayer is not compatible with 0.5.x: the protocol is at version 3 and
+a mismatched peer is told so during the handshake instead of misreading the stream.
+
+### Added
+- **Edited chunks are stored in Linear region files** (`r.<rx>.<rz>.linear`, 32x32 chunks
+  per file, whole body zstd-compressed). One file per chunk meant thousands of tiny files
+  per world and a filesystem call per chunk that streamed; a region is one read and one
+  write. `LinearRegionCache` keeps an LRU of decompressed regions and batches a flush by
+  region, so an autosave of 40 edited chunks in one region costs 14 ms instead of 900.
+  Pre-Linear saves are still read, and each such chunk moves into a region file the next
+  time it is written.
+- **A 36-slot inventory** — nine hotbar slots and three storage rows, with stacks, a stack
+  held on the cursor while rearranging, and tooltips. Saves at `player.dat` v4; v3 and
+  older files stored a hotbar id list and a flat per-id tally, and are converted on load.
+- **The host announces a peer that leaves** (`Packet.PLAYER_LEAVE`). Every other client used
+  to keep rendering a player who quit — nothing ever told them, and the position map they
+  render from only ever grew.
+- **Keepalive.** The host pings every second and drops a peer silent for 30 seconds; the
+  client treats the same silence as a dead session and returns to the menu. A half-open
+  socket — unplugged cable, killed VM — stays writable forever, so silence is the only
+  evidence there is.
+- **Clients report their render distance** (`Packet.CLIENT_INFO`), and the host pushes
+  edited chunks that far out instead of a fixed eight. Past that ring a client rendered
+  untouched terrain where somebody had built.
+- **Chunk payloads travel zstd-compressed**, the same way they are stored. 32 KiB of block
+  ids per chunk, several per tick per client, is a megabyte a second of mostly-identical
+  bytes.
+
+### Changed
+- **Chunk meshes live in device-local memory** in 32 MB arena buffers filled through a
+  per-frame staging ring, instead of host-visible buffers the GPU re-read across the bus
+  every frame. A vertex is 16 bytes rather than 44 — position as three uint16 in 1/2048 of
+  a block relative to the section origin, texture layer, RGBA8 colour, uv and both light
+  channels as unorm8 — and the section origin moved to a per-instance attribute so one
+  indirect draw covers a run of sections.
+- **terrain.png is a texture array**, one layer per tile, with mips and anisotropy. Mipping
+  the packed atlas averaged neighbouring tiles into each other and fringed distant blocks.
+- **shaderc and AWT are gone from the runtime.** Shaders are compiled ahead of time into
+  `resources/shaders/*.spv`; PNG decoding uses stb_image and the font atlas stb_truetype.
+  `java.awt.Font("SansSerif")` resolved to a different typeface per platform, so layouts
+  drifted between machines.
+- **Neither direction of the network blocks the game thread.** `Connection` owns a reader
+  thread and a writer thread with a bounded queue each. A blocking socket write has no
+  timeout in Java, so one client on bad wifi froze the host for as long as its TCP window
+  stayed full. A queue that stops draining is now a peer that cannot keep up, and the
+  connection is dropped instead of consuming memory without bound.
+- **The host runs the only fluid simulation.** Clients apply the cells it moves, batched
+  into one `Packet.SET_FLUID` per tick. Two independent simulations process different cells
+  on different tick counts and drift apart within seconds.
+- **Finding chunks to stream happens on a background thread**, since a chunk that is not
+  resident costs a region decompression, but the snapshot and the send stay on the game
+  thread.
+- **Peers are not trusted.** Per-client rate limits on block edits and chat, positions
+  checked for NaN and world bounds, at most 16 clients, and chat lines attributed by the
+  host from its own name table rather than by text the sender supplied — a client used to
+  format its own line and could claim to be anybody.
+- **The multiplayer menu is two screens instead of two screens with one name.** MULTIPLAYER
+  is now the hub that holds `HOST GAME`; the saved-server list it used to open is titled
+  SERVERS and is reached from `JOIN GAME`.
+- The packet size cap dropped from 4 MB to 128 KiB, and the handshake read — which happens
+  before there is any reason to trust the peer — from 128 MB to 64 bytes.
+
+### Fixed
+- **Chunk meshing ran the heap out of memory.** `buildSection` handed the tesselator's raw
+  backing array to the mesh, and that array is sized for the worst case the builder has
+  grown into: a section of a few hundred vertices pinned up to 704 KB until the render
+  thread got to its upload. Streaming a world at NORMAL exhausted a 4 GB heap; FAR had no
+  chance at all.
+- **Every chunk a client received remeshed the whole world.** `applyNetworkChunk` called
+  `allChanged()`, which dirties every loaded chunk — up to four times a tick while joining.
+  Only the chunk itself and the four whose border faces it changes are dirtied now.
+- **A chunk snapshot could wipe the updates already on their way.** A chunk copied on the
+  streaming thread is older than the block and fluid changes queued behind it; the client
+  applied those and then had them overwritten. Reading and queueing now happen on the thread
+  that broadcasts the updates, which is the only order the client replays them in.
+- **A NaN position from a peer poisoned everything downstream** — the chunk streamer's
+  arithmetic and every renderer that drew that player.
+- **`HOST GAME` was unreachable.** Both entry points opened the server list, and the hub
+  holding the button could only be reached by pressing BACK out of it.
+
 ## [0.5.1] - 2026-07-26
 
 ### Fixed

@@ -10,6 +10,10 @@ public class Settings {
     public int     fovIndex    = 0;
     public int     resIndex    = 1;   // index into RESOLUTIONS
     public boolean fullscreen  = false;
+    public int     guiScale    = 0;   // 0 = auto, otherwise the multiplier itself
+
+    public static final int      GUI_SCALE_MAX    = 4;
+    public static final String[] GUI_SCALE_LABELS = {"AUTO", "1X", "2X", "3X", "4X"};
 
     public static final float[]  FOV_VALUES  = {70, 80, 90, 100, 110};
     // render distance: chunk radius loaded around the player + matching fog end (blocks)
@@ -44,6 +48,7 @@ public class Settings {
             sensitivity= Math.clamp(Integer.parseInt(p.getProperty("sensitivity", "2")), 0, SENS_VALUES.length - 1);
             fovIndex   = Math.clamp(Integer.parseInt(p.getProperty("fovIndex",    "0")), 0, FOV_VALUES.length - 1);
             resIndex   = Math.clamp(Integer.parseInt(p.getProperty("resIndex",    "1")), 0, RESOLUTIONS.length - 1);
+            guiScale   = Math.clamp(Integer.parseInt(p.getProperty("guiScale",    "0")), 0, GUI_SCALE_MAX);
         } catch (Exception ignored) {}
     }
 
@@ -55,6 +60,7 @@ public class Settings {
         p.setProperty("sensitivity", String.valueOf(sensitivity));
         p.setProperty("fovIndex",    String.valueOf(fovIndex));
         p.setProperty("resIndex",    String.valueOf(resIndex));
+        p.setProperty("guiScale",    String.valueOf(guiScale));
         try (var w = new FileWriter(FILE)) { p.store(w, null); } catch (Exception ignored) {}
     }
 }

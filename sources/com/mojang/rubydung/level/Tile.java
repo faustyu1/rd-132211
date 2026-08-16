@@ -119,8 +119,9 @@ public class Tile {
     // Every material therefore reuses one of those two textures and is differentiated by a colour tint.
     private static final int TEX_GRASS = 0, TEX_STONE = 1;
 
-    // Width/height of one atlas tile in uv space, slightly under 1/16 so neighbours do not bleed in.
-    private static final float UV_SIZE = 0.0624375f;
+    // Tiles are separate layers of a texture array, so a face's uv simply runs 0..1 across
+    // its own layer. The old inset-by-a-hair atlas coordinates existed to keep neighbouring
+    // tiles from bleeding in; layers have no neighbours to bleed from, at any mip level.
 
     public static final Tile grass      = tinted(TEX_GRASS, 1.00f, 1.00f, 1.00f);
     public static final Tile dirt       = tinted(TEX_STONE, 0.52f, 0.38f, 0.24f);
@@ -168,9 +169,8 @@ public class Tile {
         return t;
     }
 
-    // Atlas u-range per face. Meshing asks for these once per emitted face, so they are
-    // resolved here instead of building a fresh coordinate array every time.
-    private final float uTop0, uTop1, uBottom0, uBottom1, uSide0, uSide1;
+    // Texture array layer per face.
+    private final int texTop, texBottom, texSide;
     // color tint (default white = no tint)
     float tr = 1f, tg = 1f, tb = 1f, ta = 1f;
     // vertical fill fraction (1 = full cube). <1 lowers the top surface (flowing water).
@@ -185,12 +185,9 @@ public class Tile {
     boolean translucent = false;
 
     private Tile(int texTop, int texBottom, int texSide) {
-        this.uTop0 = texTop / 16.0f;
-        this.uTop1 = this.uTop0 + UV_SIZE;
-        this.uBottom0 = texBottom / 16.0f;
-        this.uBottom1 = this.uBottom0 + UV_SIZE;
-        this.uSide0 = texSide / 16.0f;
-        this.uSide1 = this.uSide0 + UV_SIZE;
+        this.texTop = texTop;
+        this.texBottom = texBottom;
+        this.texSide = texSide;
     }
 
     /**
@@ -230,13 +227,13 @@ public class Tile {
      * torch-lit cave bright at midnight. The 0.8/0.6 side shading is a property of the face,
      * not of the light, so it stays multiplicative in the colour and survives both.
      */
-    private float faceLight(Tesselator t, Level level, int x, int y, int z, float shade) {
+    private float faceLight(ChunkTesselator t, Level level, int x, int y, int z, float shade) {
         t.light(level.getBrightness(x, y, z), Math.max(level.getBlockBrightness(x, y, z), glow));
         return shade;
     }
 
     public void render(
-        Tesselator t,
+        ChunkTesselator t,
         Level level,
         int layer,
         int x,
@@ -263,16 +260,16 @@ public class Tile {
             float a01 = ao(level, x, y - 1, z, -1, 0, 0, 0, 0, -1) * br,
                 a11 = ao(level, x, y - 1, z, 1, 0, 0, 0, 0, -1) * br;
             t.color(a00 * tr, a00 * tg, a00 * tb, ta);
-            t.tex(uBottom0, UV_SIZE);
+            t.tex(texBottom, 0f, 1f);
             t.vertex(x0, y0, z1);
             t.color(a01 * tr, a01 * tg, a01 * tb, ta);
-            t.tex(uBottom0, 0);
+            t.tex(texBottom, 0f, 0f);
             t.vertex(x0, y0, z0);
             t.color(a11 * tr, a11 * tg, a11 * tb, ta);
-            t.tex(uBottom1, 0);
+            t.tex(texBottom, 1f, 0f);
             t.vertex(x1, y0, z0);
             t.color(a10 * tr, a10 * tg, a10 * tb, ta);
-            t.tex(uBottom1, UV_SIZE);
+            t.tex(texBottom, 1f, 1f);
             t.vertex(x1, y0, z1);
         }
         // top face
@@ -283,16 +280,16 @@ public class Tile {
             float a00 = ao(level, x, y + 1, z, -1, 0, 0, 0, 0, -1) * br,
                 a01 = ao(level, x, y + 1, z, -1, 0, 0, 0, 0, 1) * br;
             t.color(a11 * tr, a11 * tg, a11 * tb, ta);
-            t.tex(uTop1, UV_SIZE);
+            t.tex(texTop, 1f, 1f);
             t.vertex(x1, y1, z1);
             t.color(a10 * tr, a10 * tg, a10 * tb, ta);
-            t.tex(uTop1, 0);
+            t.tex(texTop, 1f, 0f);
             t.vertex(x1, y1, z0);
             t.color(a00 * tr, a00 * tg, a00 * tb, ta);
-            t.tex(uTop0, 0);
+            t.tex(texTop, 0f, 0f);
             t.vertex(x0, y1, z0);
             t.color(a01 * tr, a01 * tg, a01 * tb, ta);
-            t.tex(uTop0, UV_SIZE);
+            t.tex(texTop, 0f, 1f);
             t.vertex(x0, y1, z1);
         }
         // south face (z-)
@@ -303,16 +300,16 @@ public class Tile {
             float a01 = ao(level, x, y, z - 1, -1, 0, 0, 0, -1, 0) * br,
                 a11 = ao(level, x, y, z - 1, 1, 0, 0, 0, -1, 0) * br;
             t.color(a00 * tr, a00 * tg, a00 * tb, ta);
-            t.tex(uSide1, 0);
+            t.tex(texSide, 1f, 0f);
             t.vertex(x0, y1, z0);
             t.color(a10 * tr, a10 * tg, a10 * tb, ta);
-            t.tex(uSide0, 0);
+            t.tex(texSide, 0f, 0f);
             t.vertex(x1, y1, z0);
             t.color(a11 * tr, a11 * tg, a11 * tb, ta);
-            t.tex(uSide0, UV_SIZE);
+            t.tex(texSide, 0f, 1f);
             t.vertex(x1, y0, z0);
             t.color(a01 * tr, a01 * tg, a01 * tb, ta);
-            t.tex(uSide1, UV_SIZE);
+            t.tex(texSide, 1f, 1f);
             t.vertex(x0, y0, z0);
         }
         // north face (z+)
@@ -323,16 +320,16 @@ public class Tile {
             float a01 = ao(level, x, y, z + 1, -1, 0, 0, 0, -1, 0) * br,
                 a11 = ao(level, x, y, z + 1, 1, 0, 0, 0, -1, 0) * br;
             t.color(a00 * tr, a00 * tg, a00 * tb, ta);
-            t.tex(uSide0, 0);
+            t.tex(texSide, 0f, 0f);
             t.vertex(x0, y1, z1);
             t.color(a01 * tr, a01 * tg, a01 * tb, ta);
-            t.tex(uSide0, UV_SIZE);
+            t.tex(texSide, 0f, 1f);
             t.vertex(x0, y0, z1);
             t.color(a11 * tr, a11 * tg, a11 * tb, ta);
-            t.tex(uSide1, UV_SIZE);
+            t.tex(texSide, 1f, 1f);
             t.vertex(x1, y0, z1);
             t.color(a10 * tr, a10 * tg, a10 * tb, ta);
-            t.tex(uSide1, 0);
+            t.tex(texSide, 1f, 0f);
             t.vertex(x1, y1, z1);
         }
         // west face (x-)
@@ -343,16 +340,16 @@ public class Tile {
             float a01 = ao(level, x - 1, y, z, 0, 0, -1, 0, -1, 0) * br,
                 a11 = ao(level, x - 1, y, z, 0, 0, 1, 0, -1, 0) * br;
             t.color(a10 * tr, a10 * tg, a10 * tb, ta);
-            t.tex(uSide1, 0);
+            t.tex(texSide, 1f, 0f);
             t.vertex(x0, y1, z1);
             t.color(a00 * tr, a00 * tg, a00 * tb, ta);
-            t.tex(uSide0, 0);
+            t.tex(texSide, 0f, 0f);
             t.vertex(x0, y1, z0);
             t.color(a01 * tr, a01 * tg, a01 * tb, ta);
-            t.tex(uSide0, UV_SIZE);
+            t.tex(texSide, 0f, 1f);
             t.vertex(x0, y0, z0);
             t.color(a11 * tr, a11 * tg, a11 * tb, ta);
-            t.tex(uSide1, UV_SIZE);
+            t.tex(texSide, 1f, 1f);
             t.vertex(x0, y0, z1);
         }
         // east face (x+)
@@ -363,16 +360,16 @@ public class Tile {
             float a01 = ao(level, x + 1, y, z, 0, 0, -1, 0, -1, 0) * br,
                 a11 = ao(level, x + 1, y, z, 0, 0, -1, 0, 1, 0) * br;
             t.color(a00 * tr, a00 * tg, a00 * tb, ta);
-            t.tex(uSide0, UV_SIZE);
+            t.tex(texSide, 0f, 1f);
             t.vertex(x1, y0, z1);
             t.color(a01 * tr, a01 * tg, a01 * tb, ta);
-            t.tex(uSide1, UV_SIZE);
+            t.tex(texSide, 1f, 1f);
             t.vertex(x1, y0, z0);
             t.color(a11 * tr, a11 * tg, a11 * tb, ta);
-            t.tex(uSide1, 0);
+            t.tex(texSide, 1f, 0f);
             t.vertex(x1, y1, z0);
             t.color(a10 * tr, a10 * tg, a10 * tb, ta);
-            t.tex(uSide0, 0);
+            t.tex(texSide, 0f, 0f);
             t.vertex(x1, y1, z1);
         }
     }
