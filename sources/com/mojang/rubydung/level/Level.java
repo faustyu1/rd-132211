@@ -410,11 +410,32 @@ public class Level {
     private final java.util.Set<Long> fluidPending = java.util.concurrent.ConcurrentHashMap.newKeySet();
     private static final int MAX_FLOW = 7;
 
+    /** Told about every cell the simulation moves; the host uses it to broadcast the flow. */
+    public interface FluidSink { void fluidChanged(int x, int y, int z, int type); }
+
+    /**
+     * Off on a multiplayer client. Two copies of the simulation drift apart within seconds —
+     * they process cells in different orders on different tick counts — so the host runs the
+     * only one there is and the client just applies what it is told (see
+     * {@link #applyNetworkFluid}).
+     */
+    private volatile boolean simulateFluids = true;
+    private volatile FluidSink fluidSink;
+
+    public void setSimulateFluids(boolean on) {
+        simulateFluids = on;
+        if (!on) fluidPending.clear();   // nothing will ever drain it again
+    }
+
+    public void setFluidSink(FluidSink sink) { this.fluidSink = sink; }
+
     private static long packPos(int x, int y, int z) {
         return ((long) (x & 0x3FFFFFF) << 38) | ((long) (y & 0xFFF) << 26) | (z & 0x3FFFFFF);
     }
 
     public void scheduleFluid(int x, int y, int z) {
+        // a client never drains this set, so filling it would just leak
+        if (!simulateFluids) return;
         if (y < 0 || y >= sizeY) return;
         if (Tile.isWater(getBlock(x, y, z)) || getBlock(x, y, z) == 0)
             fluidPending.add(packPos(x, y, z));
@@ -441,11 +462,27 @@ public class Level {
         for (var listener : levelListeners) listener.tileChanged(x, y, z, false);
         if (Tile.isWater(type) || type == 0) fluidPending.add(packPos(x, y, z));
         scheduleFluidNeighbors(x, y, z);
+        FluidSink sink = fluidSink;
+        if (sink != null) sink.fluidChanged(x, y, z, type);
+    }
+
+    /**
+     * Apply one fluid cell the host's simulation moved. No scheduling and no modified flag:
+     * a client neither simulates water nor owns the world it is shown.
+     */
+    public void applyNetworkFluid(int x, int y, int z, byte type) {
+        if (y < 0 || y >= sizeY) return;
+        int cx = Math.floorDiv(x, WorldChunk.SIZE);
+        int cz = Math.floorDiv(z, WorldChunk.SIZE);
+        WorldChunk chunk = chunks.get(chunkKey(cx, cz));
+        if (chunk == null) return;
+        chunk.setBlock(x - cx * WorldChunk.SIZE, y, z - cz * WorldChunk.SIZE, type);
+        for (var listener : levelListeners) listener.tileChanged(x, y, z, false);
     }
 
     /** Advance water flow. Called a few times per second from the game tick. */
     public void tickFluids() {
-        if (fluidPending.isEmpty()) return;
+        if (!simulateFluids || fluidPending.isEmpty()) return;
         // process at most 64 cells per tick — matches MC Alpha's per-tick randomTick feel
         int limit = Math.min(64, fluidPending.size());
         var iter = fluidPending.iterator();
@@ -726,8 +763,8 @@ public class Level {
      * is not resident, so serving a client does not drag the whole world into memory.
      */
     public byte[] getStoredBlocks(int cx, int cz) {
-        WorldChunk c = chunks.get(chunkKey(cx, cz));
-        if (c != null && c.modified) return c.blocks.clone();
+        byte[] resident = getResidentModifiedBlocks(cx, cz);
+        if (resident != null) return resident;
         File dir = saveDir;
         if (dir == null) return null;
         byte[] stored = regions.read(dir, cx, cz);
@@ -735,6 +772,23 @@ public class Level {
         if (stored == null) return null;
         // clone: the cache still owns its copy, and the caller ships this over the wire
         return stored.length == WorldChunk.SIZE * WorldChunk.HEIGHT * WorldChunk.SIZE ? stored.clone() : null;
+    }
+
+    /**
+     * Blocks of an edited chunk that is loaded right now, or null. Cheap — no disk, no
+     * decompression — so a caller that must snapshot a chunk at an exact moment (the host
+     * shipping one to a client, where a stale copy would undo the block changes already on
+     * their way) can do it on the game thread instead of racing it from another one.
+     */
+    public byte[] getResidentModifiedBlocks(int cx, int cz) {
+        WorldChunk c = chunks.get(chunkKey(cx, cz));
+        return c != null && c.modified ? c.blocks.clone() : null;
+    }
+
+    /** Whether that chunk is loaded and edited — the same test without copying 32 KiB. */
+    public boolean isEditedChunkResident(int cx, int cz) {
+        WorldChunk c = chunks.get(chunkKey(cx, cz));
+        return c != null && c.modified;
     }
 
     /**
@@ -748,10 +802,11 @@ public class Level {
         chunk.invalidateEmitters();
         chunk.calcLightDepths();
         chunk.setDirty();
+        // only this chunk and the four whose border faces it changed: allChanged() here meant
+        // a joining client remeshed every loaded chunk up to four times per tick
         markNeighborDirty(cx - 1, cz);
         markNeighborDirty(cx + 1, cz);
         markNeighborDirty(cx, cz - 1);
         markNeighborDirty(cx, cz + 1);
-        for (var listener : levelListeners) listener.allChanged();
     }
 }
